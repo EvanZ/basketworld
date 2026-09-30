@@ -15,6 +15,7 @@ from basketworld_jax.env.minimal import (
     MULTI_POSSESSION_SCHEMA_VERSION,
     GAME_PHASE_AWAITING_INBOUND,
     GAME_PHASE_AWAITING_CHECK,
+    GAME_PHASE_CHECK_SETUP,
     GAME_PHASE_LIVE,
     TEAM_A,
     TEAM_B,
@@ -155,6 +156,7 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "multi_possession_schema_version",
     "inbound_deadline_steps",
     "check_deadline_steps",
+    "check_setup_steps",
 }
 
 _JAX_STATIC_ONLY_ENV_DEFAULTS = {
@@ -193,6 +195,7 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "multi_possession_schema_version": MULTI_POSSESSION_SCHEMA_VERSION,
     "inbound_deadline_steps": 5,
     "check_deadline_steps": 5,
+    "check_setup_steps": 0,
 }
 
 _JAX_STATIC_ONLY_ENV_CASTS = {
@@ -231,6 +234,7 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "multi_possession_schema_version": "int",
     "inbound_deadline_steps": "int",
     "check_deadline_steps": "int",
+    "check_setup_steps": "int",
 }
 
 
@@ -1286,6 +1290,8 @@ def _build_native_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 "clearance_elapsed_steps": env_out.clearance_elapsed_steps.astype(jnp.int32),
                 "turnovers_before_clearance": env_out.turnover_before_clearance.astype(jnp.int8),
                 "check_opportunities": env_out.check_opportunity.astype(jnp.int8),
+                "check_setup_opportunities": env_out.check_setup_opportunity.astype(jnp.int8),
+                "check_setup_steps": env_out.check_setup_step.astype(jnp.int8),
                 "check_pickups": env_out.check_pickup.astype(jnp.int8),
                 "check_violations": env_out.check_violation.astype(jnp.int8),
                 "check_pickup_steps": env_out.check_pickup_steps.astype(jnp.int32),
@@ -1761,6 +1767,8 @@ def _init_eval_diagnostics() -> dict[str, Any]:
         },
         "checks": {
             "opportunities": 0,
+            "setup_opportunities": 0,
+            "setup_steps": 0,
             "pickups": 0,
             "violations": 0,
             "pickup_steps_total": 0,
@@ -2742,6 +2750,12 @@ def run_native_jax_evaluation(
                 check_diag["opportunities"] += int(
                     trace["check_opportunities"][t, idx]
                 )
+                check_diag["setup_opportunities"] += int(
+                    trace["check_setup_opportunities"][t, idx]
+                )
+                check_diag["setup_steps"] += int(
+                    trace["check_setup_steps"][t, idx]
+                )
                 check_diag["pickups"] += int(trace["check_pickups"][t, idx])
                 check_diag["violations"] += int(trace["check_violations"][t, idx])
                 check_diag["pickup_steps_total"] += int(
@@ -3500,6 +3514,10 @@ def run_native_jax_evaluation(
     )
     check_diag_final = eval_diagnostics.get("checks") or {}
     check_opportunity_count = int(check_diag_final.get("opportunities", 0) or 0)
+    check_setup_opportunity_count = int(
+        check_diag_final.get("setup_opportunities", 0) or 0
+    )
+    check_setup_steps_total = int(check_diag_final.get("setup_steps", 0) or 0)
     check_pickup_count = int(check_diag_final.get("pickups", 0) or 0)
     check_violation_count = int(check_diag_final.get("violations", 0) or 0)
     check_pickup_steps_total = int(
@@ -3513,6 +3531,11 @@ def run_native_jax_evaluation(
     check_diag_final["mean_pickup_steps"] = (
         float(check_pickup_steps_total / check_pickup_count)
         if check_pickup_count > 0
+        else 0.0
+    )
+    check_diag_final["mean_setup_steps"] = (
+        float(check_setup_steps_total / check_setup_opportunity_count)
+        if check_setup_opportunity_count > 0
         else 0.0
     )
     rebound_eligibility = dict(rebound_diag_final.get("eligibility", {}) or {})
@@ -3828,6 +3851,11 @@ def run_native_jax_evaluation(
             clearance_diag_final.get("turnovers_before_clearance", 0) or 0
         ),
         "check_opportunity_count": check_opportunity_count,
+        "check_setup_opportunity_count": check_setup_opportunity_count,
+        "check_setup_steps_total": check_setup_steps_total,
+        "check_setup_mean_executed_steps": float(
+            check_diag_final["mean_setup_steps"]
+        ),
         "check_pickup_count": check_pickup_count,
         "check_violation_count": check_violation_count,
         "check_pickup_rate": float(check_diag_final["pickup_rate"]),

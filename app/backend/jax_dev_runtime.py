@@ -23,6 +23,7 @@ from basketworld_jax.env.minimal import (
     TEAM_B,
     GAME_PHASE_AWAITING_INBOUND,
     GAME_PHASE_AWAITING_CHECK,
+    GAME_PHASE_CHECK_SETUP,
     GAME_PHASE_LIVE,
     MADE_BASKET_RESTART_BASELINE_INBOUND,
     MADE_BASKET_RESTART_CHECK,
@@ -99,6 +100,7 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "multi_possession_schema_version",
     "inbound_deadline_steps",
     "check_deadline_steps",
+    "check_setup_steps",
 }
 
 
@@ -138,6 +140,7 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "multi_possession_schema_version": MULTI_POSSESSION_SCHEMA_VERSION,
     "inbound_deadline_steps": 5,
     "check_deadline_steps": 5,
+    "check_setup_steps": 0,
 }
 
 _JAX_STATIC_ONLY_ENV_CASTS = {
@@ -176,6 +179,7 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "multi_possession_schema_version": "int",
     "inbound_deadline_steps": "int",
     "check_deadline_steps": "int",
+    "check_setup_steps": "int",
 }
 
 
@@ -536,6 +540,7 @@ class JaxDevRuntime:
         self._clearance_zone_cells_cache: tuple[tuple[int, int], ...] | None = None
         self._step_batch_runner = None
         self._fast_action_mask = None
+        self._fast_ep_by_player = None
         self._fast_episode_metadata_cache: dict[str, Any] | None = None
         self._fast_kernel_lock = threading.RLock()
         self._fast_kernel_generation = 0
@@ -577,6 +582,7 @@ class JaxDevRuntime:
         with self._fast_kernel_lock:
             self._step_batch_runner = None
             self._fast_action_mask = None
+            self._fast_ep_by_player = None
             self._fast_kernel_generation += 1
             self._fast_kernel_ready = False
             self._fast_kernel_warming = False
@@ -602,6 +608,7 @@ class JaxDevRuntime:
                 multi_possession_limit,
                 made_basket_restart_mode,
                 check_deadline_steps,
+                check_setup_steps,
             ):
                 # These game settings change transition values, not shapes.
                 # Keep them dynamic so in-game configuration reuses the
@@ -610,12 +617,21 @@ class JaxDevRuntime:
                     multi_possession_limit=multi_possession_limit,
                     made_basket_restart_mode=made_basket_restart_mode,
                     check_deadline_steps=check_deadline_steps,
+                    check_setup_steps=check_setup_steps,
                 )
                 output = step_batch_minimal(runtime_static, state, actions, rng_keys, jax, jnp)
                 # Fast Mode needs the next action mask only for a compact
                 # board payload.  Produce it in the compiled transition rather
                 # than launching another eager JAX program after every frame.
-                return output, build_action_masks_batch(runtime_static, output.state, jnp)
+                return (
+                    output,
+                    build_action_masks_batch(runtime_static, output.state, jnp),
+                    build_shot_profile_batch(
+                        runtime_static,
+                        output.state,
+                        jnp,
+                    )["expected_points"],
+                )
 
             self._step_batch_runner = jax.jit(_runner)
         return self._step_batch_runner
@@ -650,15 +666,17 @@ class JaxDevRuntime:
 
         def _warm() -> None:
             try:
-                _, next_mask = runner(
+                _, next_mask, next_ep = runner(
                     state,
                     actions,
                     keys,
                     self.static.multi_possession_limit,
                     self.static.made_basket_restart_mode,
                     self.static.check_deadline_steps,
+                    self.static.check_setup_steps,
                 )
                 self.jax.block_until_ready(next_mask)
+                self.jax.block_until_ready(next_ep)
             except Exception as exc:
                 with self._fast_kernel_lock:
                     if generation == self._fast_kernel_generation:
@@ -721,6 +739,7 @@ class JaxDevRuntime:
         self,
         mode: str,
         check_deadline_steps: int,
+        check_setup_steps: int = 0,
     ) -> None:
         """Update made-basket restart rules without rebuilding policy state."""
         if not self.multi_possession_enabled:
@@ -738,6 +757,9 @@ class JaxDevRuntime:
         normalized_deadline = int(check_deadline_steps)
         if normalized_deadline < 1:
             raise ValueError("The check deadline must be at least one step.")
+        normalized_setup = int(check_setup_steps)
+        if normalized_setup < 0:
+            raise ValueError("The check setup duration cannot be negative.")
         with self._fast_kernel_lock:
             self.static = self.static._replace(
                 made_basket_restart_mode=self.jnp.asarray(
@@ -748,11 +770,17 @@ class JaxDevRuntime:
                     normalized_deadline,
                     dtype=self.static.check_deadline_steps.dtype,
                 ),
+                check_setup_steps=self.jnp.asarray(
+                    normalized_setup,
+                    dtype=self.static.check_setup_steps.dtype,
+                ),
             )
             self.env_params["made_basket_restart_mode"] = normalized_mode
             self.env_params["check_deadline_steps"] = normalized_deadline
+            self.env_params["check_setup_steps"] = normalized_setup
             self.display_env.made_basket_restart_mode = normalized_mode
             self.display_env.check_deadline_steps = normalized_deadline
+            self.display_env.check_setup_steps = normalized_setup
             self._fast_action_mask = None
 
     def _team_ids(self, team_is_a: bool) -> list[int]:
@@ -1467,16 +1495,22 @@ class JaxDevRuntime:
         actions_batch = self.jnp.asarray(full_actions[None, :], dtype=self.jnp.int32)
         step_keys = self.jnp.asarray([step_key])
         if fast_mode and self.fast_kernel_status()["ready"]:
-            out, self._fast_action_mask = self._compiled_step_batch_minimal()(
+            (
+                out,
+                self._fast_action_mask,
+                self._fast_ep_by_player,
+            ) = self._compiled_step_batch_minimal()(
                 self.state,
                 actions_batch,
                 step_keys,
                 self.static.multi_possession_limit,
                 self.static.made_basket_restart_mode,
                 self.static.check_deadline_steps,
+                self.static.check_setup_steps,
             )
         else:
             self._fast_action_mask = None
+            self._fast_ep_by_player = None
             out = step_batch_minimal(
                 self.static,
                 self.state,
@@ -1614,6 +1648,7 @@ class JaxDevRuntime:
     def _start_self_play_locked(self, request: Any, game_state: Any) -> dict[str, Any]:
         fast_mode = bool(getattr(request, "fast_mode", False))
         self._fast_action_mask = None
+        self._fast_ep_by_player = None
         self._fast_episode_metadata_cache = None
         requested_seed = getattr(request, "template_seed", None)
         seed = (
@@ -2378,6 +2413,17 @@ class JaxDevRuntime:
                     else None,
                     "steps_remaining": _as_int(
                         _field0(next_state, "check_steps_remaining")
+                    ),
+                }
+            )
+        if prev_phase == GAME_PHASE_CHECK_SETUP:
+            check_team = _as_int(_field0(prev_state, "check_team"))
+            results["checks"].append(
+                {
+                    "team": "team_a" if check_team == TEAM_A else "team_b",
+                    "setup": True,
+                    "setup_steps_remaining": _as_int(
+                        _field0(next_state, "check_setup_steps_remaining")
                     ),
                 }
             )
@@ -3231,10 +3277,25 @@ class JaxDevRuntime:
             "inbound_reason": _field0(self.state, "inbound_reason"),
             "inbound_steps_remaining": _field0(self.state, "inbound_steps_remaining"),
             "check_team": _field0(self.state, "check_team"),
+            "check_setup_steps_remaining": _field0(
+                self.state, "check_setup_steps_remaining"
+            ),
             "check_steps_remaining": _field0(self.state, "check_steps_remaining"),
             "clearance_achieved": _field0(self.state, "clearance_achieved"),
             "offense_lane_steps": _field0(self.state, "offense_lane_steps"),
             "defense_lane_steps": _field0(self.state, "defense_lane_steps"),
+            # This is a live board value, not episode metadata.  It changes as
+            # players move between shot locations or gain/lose defender
+            # pressure, so Fast Mode must refresh it on every step.
+            "ep_by_player": (
+                self._fast_ep_by_player[0]
+                if self._fast_ep_by_player is not None
+                else build_shot_profile_batch(
+                    self.static,
+                    self.state,
+                    self.jnp,
+                )["expected_points"][0]
+            ),
         }
         if self._fast_action_mask is not None:
             device_values["action_mask"] = self._fast_action_mask[0]
@@ -3382,9 +3443,13 @@ class JaxDevRuntime:
                 "awaiting_inbound"
                 if game_phase == GAME_PHASE_AWAITING_INBOUND
                 else (
-                    "awaiting_check"
-                    if game_phase == GAME_PHASE_AWAITING_CHECK
-                    else "live"
+                    "check_setup"
+                    if game_phase == GAME_PHASE_CHECK_SETUP
+                    else (
+                        "awaiting_check"
+                        if game_phase == GAME_PHASE_AWAITING_CHECK
+                        else "live"
+                    )
                 )
             ),
             "inbound_team": "team_a" if inbound_team == TEAM_A else ("team_b" if inbound_team == TEAM_B else None),
@@ -3410,10 +3475,18 @@ class JaxDevRuntime:
             "check_steps_remaining": int(
                 np.asarray(host["check_steps_remaining"]).reshape(-1)[0]
             ),
+            "check_setup_steps_remaining": int(
+                np.asarray(host["check_setup_steps_remaining"]).reshape(-1)[0]
+            ),
             "check_deadline_steps": _int_from_static_field(
                 self.static,
                 "check_deadline_steps",
                 5,
+            ),
+            "check_setup_steps": _int_from_static_field(
+                self.static,
+                "check_setup_steps",
+                0,
             ),
             "legal_inbound_entry_positions": legal_inbound_entry_positions,
             "clearance_achieved": clearance_achieved,
@@ -3452,6 +3525,13 @@ class JaxDevRuntime:
                 int(pid): int(v)
                 for pid, v in enumerate(np.asarray(host["defense_lane_steps"]).reshape(-1).tolist())
             },
+            "ep_by_player": [
+                float(v)
+                for v in np.asarray(
+                    host["ep_by_player"],
+                    dtype=np.float32,
+                ).reshape(-1).tolist()
+            ],
             "pass_mode": self.display_env.pass_mode or "directional",
         }
         episode_metadata = self._fast_episode_metadata(game_state)
@@ -3683,10 +3763,15 @@ class JaxDevRuntime:
                 "awaiting_inbound"
                 if _as_int(_field0(self.state, "game_phase")) == GAME_PHASE_AWAITING_INBOUND
                 else (
-                    "awaiting_check"
+                    "check_setup"
                     if _as_int(_field0(self.state, "game_phase"))
-                    == GAME_PHASE_AWAITING_CHECK
-                    else "live"
+                    == GAME_PHASE_CHECK_SETUP
+                    else (
+                        "awaiting_check"
+                        if _as_int(_field0(self.state, "game_phase"))
+                        == GAME_PHASE_AWAITING_CHECK
+                        else "live"
+                    )
                 )
             ),
             "inbound_team": (
@@ -3716,10 +3801,18 @@ class JaxDevRuntime:
             "check_steps_remaining": _as_int(
                 _field0(self.state, "check_steps_remaining")
             ),
+            "check_setup_steps_remaining": _as_int(
+                _field0(self.state, "check_setup_steps_remaining")
+            ),
             "check_deadline_steps": _int_from_static_field(
                 self.static,
                 "check_deadline_steps",
                 5,
+            ),
+            "check_setup_steps": _int_from_static_field(
+                self.static,
+                "check_setup_steps",
+                0,
             ),
             "legal_inbound_entry_positions": legal_inbound_entry_positions,
             "clearance_achieved": bool(_as_bool(_field0(self.state, "clearance_achieved"))),

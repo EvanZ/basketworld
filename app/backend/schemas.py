@@ -42,6 +42,7 @@ class SetMultiPossessionLimitRequest(BaseModel):
         "direct_handoff",
     ] | None = None
     check_deadline_steps: int | None = Field(default=None, ge=1)
+    check_setup_steps: int | None = Field(default=None, ge=0)
 
 
 class TemplateBootstrapRequest(BaseModel):

@@ -252,6 +252,7 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "made_basket_restart_mode",
         "inbound_deadline_steps",
         "check_deadline_steps",
+        "check_setup_steps",
     }
 )
 JAX_ENV_MLFLOW_PARAM_KEYS = (
@@ -375,6 +376,7 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "made_basket_restart_mode",
     "inbound_deadline_steps",
     "check_deadline_steps",
+    "check_setup_steps",
 )
 
 
@@ -1025,6 +1027,15 @@ def parse_args(argv=None):
         help="Simulation steps allowed for the receiving team to collect a check ball.",
     )
     parser.add_argument(
+        "--check-setup-steps",
+        type=int,
+        default=0,
+        help=(
+            "Movement-only setup steps before the receiving team's check pickup "
+            "clock begins; zero preserves the immediate-check behavior."
+        ),
+    )
+    parser.add_argument(
         "--made-basket-restart-mode",
         choices=("baseline_inbound", "check", "direct_handoff"),
         default="baseline_inbound",
@@ -1423,6 +1434,8 @@ def validate_train_args(args) -> None:
             raise SystemExit("--inbound-deadline-steps must be >= 1.")
         if int(getattr(args, "check_deadline_steps", 5)) < 1:
             raise SystemExit("--check-deadline-steps must be >= 1.")
+        if int(getattr(args, "check_setup_steps", 0)) < 0:
+            raise SystemExit("--check-setup-steps must be >= 0.")
         if bool(getattr(args, "start_template_enabled", False)):
             raise SystemExit(
                 "--start-template-enabled is incompatible with --enable-multi-possession."
@@ -1722,6 +1735,7 @@ _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
     "multi_possession_schema_version": 1,
     "inbound_deadline_steps": 5,
     "check_deadline_steps": 5,
+    "check_setup_steps": 0,
 }
 
 
@@ -3474,6 +3488,12 @@ def _summarize_historical_match(
         "candidate_completed_possession_count": candidate_completed_possessions,
         "opponent_completed_possession_count": opponent_completed_possessions,
         "check_opportunity_count": _total("check_opportunities"),
+        "check_setup_opportunity_count": _total("check_setup_opportunities"),
+        "check_setup_steps_total": _total("check_setup_steps"),
+        "check_setup_mean_executed_steps": _rate(
+            _total("check_setup_steps"),
+            _total("check_setup_opportunities"),
+        ),
         "check_pickup_count": _total("check_pickups"),
         "check_violation_count": _total("check_violations"),
         "check_pickup_rate": _rate(

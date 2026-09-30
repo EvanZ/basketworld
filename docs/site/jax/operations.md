@@ -47,6 +47,14 @@ pretrained policy, continuation checkpoint, or starting templates. The two
 fixed-team cohorts feed one shared PPO update, and unfinished games continue
 across rollout and optimizer-update boundaries.
 
+Multi-possession attention checkpoints created before the stable-team token
+canonicalization fix in issue #37 must be retrained. Those checkpoints kept
+player tokens in stable Team A/Team B order while the action head selected a
+token half from the current offense/defense role. Team B offensive possessions
+therefore mapped logits from the wrong roster into Team B action slots. The
+checkpoint file format remains loadable, but its learned behavior and symmetric
+self-play results are not trustworthy for continued training or comparison.
+
 The launcher enables the established offense-only latent-intent stack: eight
 intents, attention embeddings, the learned selector, and the diversity
 objective. The team currently on offense receives its private intent context;
@@ -70,6 +78,16 @@ controls are disabled in this mode because the normal opening spawn occurs
 only once. Both stable teams receive neutral, distinct on-court locations;
 the 50/50 jump-ball result then assigns the opening ball-handler without
 rearranging either team.
+
+For top-of-key check restarts, `--check-setup-steps N` optionally inserts N
+movement-only dead-ball ticks before the existing pickup countdown. Both teams
+may reposition during setup, but neither may enter the protected ball cell;
+the shot clock, lane clocks, and `--check-deadline-steps` countdown remain
+paused. The default is `0`, which preserves the immediate-check behavior.
+`CHECK_SETUP_STEPS` exposes the same setting in the multi-possession launcher.
+Training and native evaluation report setup opportunities, executed setup
+steps, and mean executed setup duration separately from live-possession pace
+and spatial diagnostics.
 
 Native evaluation pairs reset seeds and swaps the Team A/Team B starter within
 each pair while preserving the same neutral opening positions. It reports game W/L/T, scores, margins,
@@ -203,3 +221,59 @@ Before a long run:
 6. budget for a new compilation when shape-bearing settings change;
 7. inspect early rollout, loss, entropy, reward-component, and opponent
    metrics before scaling the run.
+
+### Multi-possession rollout performance check
+
+Use the trainer scaffold to compare environment/compiler changes without
+creating checkpoints, MLflow runs, or policy-training artifacts. Keep the
+hardware idle, exclude compilation with warmup iterations, and compare the
+same command before and after the change:
+
+```bash
+python -m basketworld_jax.train.main \
+  --enable-multi-possession \
+  --multi-possession-limit 25 \
+  --multi-possession-reward-mode scoring_events \
+  --multi-possession-use-inbounds \
+  --made-basket-restart-mode check \
+  --inbound-deadline-steps 5 \
+  --check-deadline-steps 5 \
+  --check-setup-steps 5 \
+  --players 5 \
+  --court-rows 9 \
+  --court-cols 8 \
+  --shot-clock 24 \
+  --min-shot-clock 24 \
+  --illegal-defense-enabled true \
+  --offensive-three-seconds true \
+  --enable-pass-gating true \
+  --enable-rebounds \
+  --rebound-table-model-dir analytics/rebound_physics/outputs/dataset_9x8/fitted_catch_model \
+  --kernel-batch-size 512 \
+  --rollout-horizon 64 \
+  --policy-update-epochs 1 \
+  --ppo-minibatches 16 \
+  --policy-model attention \
+  --action-head-mode pointer_targeted \
+  --intent-embedding-enabled \
+  --intent-embedding-dim 16 \
+  --enable-intent-learning true \
+  --num-intents 8 \
+  --intent-commitment-steps 8 \
+  --warmup-iters 2 \
+  --benchmark-iters 10 \
+  --no-progress
+```
+
+The issue #39 reference on the local CPU backend used the same 512-by-64
+rollout shape. Before sharing movement resolution between check setup and the
+ordinary check phase, the three-iteration baseline produced 5,321 rollout
+states/sec with 6.16 seconds mean rollout latency. The first identical
+three-iteration optimized run produced 6,339 states/sec with 5.17 seconds
+latency; a longer ten-iteration confirmation produced 6,058 states/sec with
+5.41 seconds latency. This is a repeatable rollout improvement of roughly
+14-19%, depending on the comparison run.
+
+Performance work for this path must pass the exact parity regression tests.
+In particular, identical states, actions, and PRNG keys must preserve the full
+environment output tree, not merely aggregate scores or approximate metrics.

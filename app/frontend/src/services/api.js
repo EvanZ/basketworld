@@ -399,11 +399,15 @@ export async function setMultiPossessionLimit(
     multiPossessionLimit,
     madeBasketRestartMode = null,
     checkDeadlineSteps = null,
+    checkSetupSteps = null,
 ) {
     const payload = { multi_possession_limit: multiPossessionLimit };
     if (madeBasketRestartMode) payload.made_basket_restart_mode = madeBasketRestartMode;
     if (checkDeadlineSteps !== null && checkDeadlineSteps !== undefined) {
         payload.check_deadline_steps = checkDeadlineSteps;
+    }
+    if (checkSetupSteps !== null && checkSetupSteps !== undefined) {
+        payload.check_setup_steps = checkSetupSteps;
     }
     const response = await fetch(`${API_BASE_URL}/api/set_multi_possession_limit`, {
         method: 'POST',

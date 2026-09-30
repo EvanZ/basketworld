@@ -6,6 +6,7 @@ import { actionAnimationTiming, hexDistance } from '@/utils/actionAnimationTimin
 import { basketballRotationDegrees } from '@/utils/basketballAnimation';
 import { defensiveLaneViolationBannerPayload } from '@/utils/outcomeBanners';
 import { resolveRenderableState } from '@/utils/renderableState';
+import { stableBoardViewBox } from '@/utils/boardViewBox';
 
 const props = defineProps({
   gameHistory: {
@@ -2175,6 +2176,9 @@ const multiPossessionScoreboard = computed(() => {
     inboundStepsRemaining: Math.max(0, Number(state.inbound_steps_remaining ?? 0)),
     inboundDeadlineSteps: Math.max(1, Number(state.inbound_deadline_steps ?? 5)),
     checkActive: state.game_phase === 'awaiting_check',
+    checkSetupActive: state.game_phase === 'check_setup',
+    checkSetupStepsRemaining: Math.max(0, Number(state.check_setup_steps_remaining ?? 0)),
+    checkSetupSteps: Math.max(0, Number(state.check_setup_steps ?? 0)),
     checkStepsRemaining: Math.max(0, Number(state.check_steps_remaining ?? 0)),
     checkDeadlineSteps: Math.max(1, Number(state.check_deadline_steps ?? 5)),
   };
@@ -2189,6 +2193,9 @@ const clearanceRequiredBannerVisible = computed(() => {
     && state?.game_phase === 'live',
   );
 });
+const checkSetupBannerVisible = computed(() => (
+  currentGameState.value?.game_phase === 'check_setup'
+));
 const heldBallHorizontalOffset = computed(() => (
   clearanceRequiredBannerVisible.value ? HEX_RADIUS * 0.57 : -HEX_RADIUS * 0.57
 ));
@@ -2312,38 +2319,12 @@ function adjustShotClock(delta) {
 }
 
 const viewBox = computed(() => {
-    if (courtLayout.value.length === 0) return "-100 -100 200 200";
-    
-    const allX = courtLayout.value.map(h => h.x);
-    const allY = courtLayout.value.map(h => h.y);
-    // An inbounder is deliberately placed just beyond the baseline. Include
-    // that legal dead-ball area so it remains visible rather than clipped.
-    const state = currentGameState.value;
-    const contextCells = [
-      state?.inbound_position,
-      ...(Array.isArray(state?.legal_inbound_entry_positions)
-        ? state.legal_inbound_entry_positions
-        : []),
-    ];
-    for (const cell of contextCells) {
-      if (!Array.isArray(cell) || cell.length < 2) continue;
-      const { x, y } = axialToCartesian(Number(cell[0]), Number(cell[1]));
-      if (Number.isFinite(x) && Number.isFinite(y)) {
-        allX.push(x);
-        allY.push(y);
-      }
-    }
-    
-    const margin = props.minimalChrome ? HEX_RADIUS * 1.8 : HEX_RADIUS * 3;
-    const minX = Math.min(...allX) - margin;
-    const maxX = Math.max(...allX) + margin;
-    const minY = Math.min(...allY) - margin;
-    const maxY = Math.max(...allY) + margin;
-
-    const width = maxX - minX;
-    const height = maxY - minY;
-
-    return `${minX} ${minY} ${width} ${height}`;
+  return stableBoardViewBox({
+    courtLayout: courtLayout.value,
+    minimalChrome: props.minimalChrome,
+    hexRadius: HEX_RADIUS,
+    multiPossession: Boolean(currentGameState.value?.enable_multi_possession),
+  });
 });
 
 const inboundMarker = computed(() => {
@@ -2365,7 +2346,7 @@ const checkBallMarker = computed(() => {
   const state = currentGameState.value;
   if (
     !state?.enable_multi_possession
-    || state?.game_phase !== 'awaiting_check'
+    || !['awaiting_check', 'check_setup'].includes(state?.game_phase)
   ) return null;
   const pos = state.check_position;
   if (!Array.isArray(pos) || pos.length < 2) return null;
@@ -4760,7 +4741,7 @@ onBeforeUnmount(() => {
             :y="checkBallMarker.y - HEX_RADIUS * 0.62"
             text-anchor="middle"
             class="inbound-label"
-          >CHECK</text>
+          >{{ currentGameState?.game_phase === 'check_setup' ? 'SETUP' : 'CHECK' }}</text>
         </g>
 
         <!-- Draw the current players on top -->
@@ -5605,6 +5586,15 @@ onBeforeUnmount(() => {
             <span class="inbound-clock-digits">{{ multiPossessionScoreboard.inboundStepsRemaining }}</span>
           </span>
           <span
+            v-if="multiPossessionScoreboard.checkSetupActive"
+            class="inbound-clock-readout check-clock-readout"
+            :title="`Setup count: ${multiPossessionScoreboard.checkSetupStepsRemaining} of ${multiPossessionScoreboard.checkSetupSteps} steps remaining`"
+            aria-live="polite"
+          >
+            <span class="score-period-label">Setup</span>
+            <span class="inbound-clock-digits check-clock-digits">{{ multiPossessionScoreboard.checkSetupStepsRemaining }}</span>
+          </span>
+          <span
             v-if="multiPossessionScoreboard.checkActive"
             class="inbound-clock-readout check-clock-readout"
             :title="`Check count: ${multiPossessionScoreboard.checkStepsRemaining} of ${multiPossessionScoreboard.checkDeadlineSteps} steps remaining`"
@@ -5654,6 +5644,14 @@ onBeforeUnmount(() => {
         aria-live="polite"
       >
         Fast Mode Warming Up
+      </div>
+      <div
+        v-else-if="checkSetupBannerVisible"
+        class="clearance-required-banner"
+        role="status"
+        aria-live="polite"
+      >
+        Check Setup
       </div>
       <div
         v-else-if="clearanceRequiredBannerVisible"

@@ -26,6 +26,7 @@ from basketworld.envs.basketworld_env_v2 import Team
 from basketworld_jax.env.minimal import (
     GAME_PHASE_AWAITING_INBOUND,
     GAME_PHASE_AWAITING_CHECK,
+    GAME_PHASE_CHECK_SETUP,
     SHOT_TYPE_DUNK,
     TEAM_A,
     TEAM_B,
@@ -543,6 +544,44 @@ def test_jax_dev_runtime_fast_self_play_returns_board_state_with_value_overlay_o
     assert "pre_step_state_values" not in body
     assert "episode_parameters" not in state
     assert "offense_shooting_pct_by_player" in state
+    assert len(state["ep_by_player"]) == runtime.n_players
+    np.testing.assert_allclose(
+        state["ep_by_player"],
+        runtime.expected_points(),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+    # The compact payload must be live rather than episode metadata retained
+    # by the frontend's Fast Mode state merge.
+    player_id = 0
+    runtime.static = runtime.static._replace(
+        shot_pressure_enabled=jnp.asarray(0, dtype=jnp.int8),
+    )
+    positions = np.asarray(runtime.state.positions, dtype=np.int32).copy()
+    basket = np.asarray(runtime.static.basket_position, dtype=np.int32)
+    positions[0, player_id] = basket
+    runtime.state = runtime.state._replace(
+        positions=jnp.asarray(positions, dtype=jnp.int32),
+    )
+    runtime._fast_ep_by_player = None
+    near_ep = runtime._fast_game_state(game_state)["ep_by_player"][player_id]
+
+    cells = np.asarray(runtime.static.cell_coords, dtype=np.int32)
+    deltas = cells - basket[None, :]
+    distances = (
+        np.abs(deltas[:, 0])
+        + np.abs(deltas[:, 1])
+        + np.abs(deltas[:, 0] + deltas[:, 1])
+    ) // 2
+    positions[0, player_id] = cells[int(np.argmax(distances))]
+    runtime.state = runtime.state._replace(
+        positions=jnp.asarray(positions, dtype=jnp.int32),
+    )
+    runtime._fast_ep_by_player = None
+    far_ep = runtime._fast_game_state(game_state)["ep_by_player"][player_id]
+
+    assert near_ep != pytest.approx(far_ep)
 
 
 def _make_selector_runtime_and_state():
@@ -1478,6 +1517,7 @@ def test_jax_dev_runtime_serializes_check_restart_in_full_and_fast_modes():
             "multi_possession_limit": 5,
             "made_basket_restart_mode": "check",
             "check_deadline_steps": 4,
+            "check_setup_steps": 2,
         }
     )
     runtime.raw_model.spec = _FakeSpec(multi_possession_features=True)
@@ -1512,7 +1552,24 @@ def test_jax_dev_runtime_serializes_check_restart_in_full_and_fast_modes():
         ]
         assert state["check_steps_remaining"] == 3
         assert state["check_deadline_steps"] == 4
+        assert state["check_setup_steps"] == 2
+        assert state["check_setup_steps_remaining"] == 0
         assert state["ball_holder"] is None
+
+    runtime.state = runtime.state._replace(
+        game_phase=jnp.asarray([GAME_PHASE_CHECK_SETUP], dtype=jnp.int8),
+        check_setup_steps_remaining=jnp.asarray([2], dtype=jnp.int32),
+        check_steps_remaining=jnp.asarray([0], dtype=jnp.int32),
+    )
+    for compact in (False, True):
+        state = runtime.get_full_game_state(
+            game_state,
+            include_policy_probs=False,
+            compact=compact,
+        )
+        assert state["game_phase"] == "check_setup"
+        assert state["check_setup_steps_remaining"] == 2
+        assert state["check_steps_remaining"] == 0
 
 
 def test_out_of_bounds_inbounder_does_not_satisfy_defensive_lane_guarding():
@@ -1609,15 +1666,17 @@ def test_jax_dev_runtime_changes_check_restart_without_discarding_fast_kernel():
     runtime._fast_kernel_ready = True
     runtime._fast_kernel_generation = 7
 
-    runtime.set_made_basket_restart("check", 4)
+    runtime.set_made_basket_restart("check", 4, 2)
 
     assert runtime._step_batch_runner is cached_runner
     assert runtime.fast_kernel_status()["ready"] is True
     assert runtime._fast_kernel_generation == 7
     assert runtime.env_params["made_basket_restart_mode"] == "check"
     assert runtime.env_params["check_deadline_steps"] == 4
+    assert runtime.env_params["check_setup_steps"] == 2
     assert runtime.display_env.made_basket_restart_mode == "check"
     assert runtime.display_env.check_deadline_steps == 4
+    assert runtime.display_env.check_setup_steps == 2
 
 
 def test_limit_restart_reuses_fast_kernel_and_returns_fresh_game(monkeypatch):

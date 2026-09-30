@@ -71,6 +71,7 @@ GAME_PHASE_LIVE = 0
 GAME_PHASE_AWAITING_INBOUND = 1
 GAME_PHASE_INBOUND = GAME_PHASE_AWAITING_INBOUND
 GAME_PHASE_AWAITING_CHECK = 2
+GAME_PHASE_CHECK_SETUP = 3
 POSSESSION_END_NONE = 0
 POSSESSION_END_MADE_BASKET = 1
 POSSESSION_END_DEFENSIVE_REBOUND = 2
@@ -308,6 +309,7 @@ class KernelStatic(NamedTuple):
     inbound_deadline_steps: Any
     check_position: Any
     check_deadline_steps: Any
+    check_setup_steps: Any
 
 
 class KernelState(NamedTuple):
@@ -373,6 +375,7 @@ class KernelState(NamedTuple):
     inbound_reason: Any
     inbound_steps_remaining: Any
     check_team: Any
+    check_setup_steps_remaining: Any
     check_steps_remaining: Any
     check_steps_elapsed: Any
     clearance_achieved: Any
@@ -436,6 +439,8 @@ class StepBatchOutput(NamedTuple):
     clearance_elapsed_steps: Any
     turnover_before_clearance: Any
     check_opportunity: Any
+    check_setup_opportunity: Any
+    check_setup_step: Any
     check_pickup: Any
     check_violation: Any
     check_pickup_steps: Any
@@ -686,6 +691,7 @@ def snapshot_state_from_env(env) -> dict[str, np.ndarray | int]:
         "inbound_reason": POSSESSION_END_NONE,
         "inbound_steps_remaining": 0,
         "check_team": -1,
+        "check_setup_steps_remaining": 0,
         "check_steps_remaining": 0,
         "check_steps_elapsed": 0,
         "clearance_achieved": 1,
@@ -954,6 +960,13 @@ def stack_state_snapshots(
         check_team=xp.asarray(
             np.asarray([int(item.get("check_team", -1)) for item in snapshots], dtype=np.int8),
             dtype=xp.int8,
+        ),
+        check_setup_steps_remaining=xp.asarray(
+            np.asarray(
+                [int(item.get("check_setup_steps_remaining", 0)) for item in snapshots],
+                dtype=np.int32,
+            ),
+            dtype=xp.int32,
         ),
         check_steps_remaining=xp.asarray(
             np.asarray(
@@ -1650,6 +1663,10 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
             max(1, int(getattr(env, "check_deadline_steps", 5))),
             dtype=xp.int32,
         ),
+        check_setup_steps=xp.asarray(
+            max(0, int(getattr(env, "check_setup_steps", 0))),
+            dtype=xp.int32,
+        ),
     )
 
 
@@ -2044,9 +2061,8 @@ def build_action_masks_batch(static: KernelStatic, state: KernelState, jnp):
         move_masks,
     )
 
-    # During a check, the loose-ball cell is reserved for the receiving team.
-    # Defenders may move normally everywhere else, but can neither occupy nor
-    # win possession from this one protected cell.
+    # During setup nobody may enter the loose-ball cell. Once the pickup clock
+    # begins, that cell is reserved for the receiving team.
     player_ids = jnp.arange(n_players, dtype=jnp.int32)
     stable_team_a = jnp.any(
         player_ids[:, None] == static.offense_ids[None, :],
@@ -2061,10 +2077,17 @@ def build_action_masks_batch(static: KernelStatic, state: KernelState, jnp):
         neighbor_positions == static.check_position[None, None, None, :],
         axis=-1,
     )
-    check_forbidden = (
-        (state.game_phase[:, None, None] == GAME_PHASE_AWAITING_CHECK)
-        & active_defender[:, :, None]
+    setup_forbidden = (
+        (state.game_phase[:, None, None] == GAME_PHASE_CHECK_SETUP)
         & targets_check
+    )
+    check_forbidden = (
+        (
+            (state.game_phase[:, None, None] == GAME_PHASE_AWAITING_CHECK)
+            & active_defender[:, :, None]
+            & targets_check
+        )
+        | setup_forbidden
     )
     move_masks = move_masks * (~check_forbidden).astype(jnp.int8)
 
@@ -2814,11 +2837,19 @@ def _finalize_step_rewards_single(
         check_opportunity=(
             output.check_opportunity.astype(jnp.bool_)
             | (
-                (output.state.game_phase == GAME_PHASE_AWAITING_CHECK)
-                & (
-                    (previous_state.game_phase != GAME_PHASE_AWAITING_CHECK)
-                    | output.check_violation.astype(jnp.bool_)
+                (
+                    (output.state.game_phase == GAME_PHASE_AWAITING_CHECK)
+                    | (output.state.game_phase == GAME_PHASE_CHECK_SETUP)
                 )
+                & (previous_state.game_phase != GAME_PHASE_AWAITING_CHECK)
+                & (previous_state.game_phase != GAME_PHASE_CHECK_SETUP)
+            )
+        ).astype(jnp.int8),
+        check_setup_opportunity=(
+            output.check_setup_opportunity.astype(jnp.bool_)
+            | (
+                (output.state.game_phase == GAME_PHASE_CHECK_SETUP)
+                & (previous_state.game_phase != GAME_PHASE_CHECK_SETUP)
             )
         ).astype(jnp.int8),
     )
@@ -3219,15 +3250,26 @@ def build_multi_possession_observation_features_batch(
         state.check_steps_remaining.astype(jnp.float32)
         / jnp.maximum(static.check_deadline_steps.astype(jnp.float32), 1.0)
     )
+    setup_phase = (
+        state.game_phase == GAME_PHASE_CHECK_SETUP
+    ).astype(jnp.float32)
+    setup_countdown = (
+        state.check_setup_steps_remaining.astype(jnp.float32)
+        / jnp.maximum(static.check_setup_steps.astype(jnp.float32), 1.0)
+    )
     # Preserve the v2 observation width (and exact baseline-inbound values)
-    # for checkpoint compatibility.  This existing dead-ball phase slot now
-    # encodes 0=live, 1=inbound, 2=check; the countdown slot selects the
-    # matching normalized clock.
-    restart_phase = inbound_phase + (2.0 * check_phase)
+    # for checkpoint compatibility. This existing dead-ball phase slot now
+    # encodes 0=live, 1=inbound, 2=check, 3=check setup; the countdown slot
+    # selects the matching normalized clock.
+    restart_phase = inbound_phase + (2.0 * check_phase) + (3.0 * setup_phase)
     restart_countdown = jnp.where(
-        check_phase.astype(jnp.bool_),
-        check_countdown,
-        inbound_countdown,
+        setup_phase.astype(jnp.bool_),
+        setup_countdown,
+        jnp.where(
+            check_phase.astype(jnp.bool_),
+            check_countdown,
+            inbound_countdown,
+        ),
     )
     globals_vec = jnp.stack(
         [
@@ -3409,7 +3451,10 @@ def build_token_observation_components_batch(
 
     ball_pos = _safe_ball_holder_positions(state, jnp)
     ball_pos = jnp.where(
-        (state.game_phase == GAME_PHASE_AWAITING_CHECK)[:, None],
+        (
+            (state.game_phase == GAME_PHASE_AWAITING_CHECK)
+            | (state.game_phase == GAME_PHASE_CHECK_SETUP)
+        )[:, None],
         static.check_position[None, :],
         ball_pos,
     )
@@ -3417,6 +3462,7 @@ def build_token_observation_components_batch(
     ball_location_known = (
         (state.ball_holder >= 0)
         | (state.game_phase == GAME_PHASE_AWAITING_CHECK)
+        | (state.game_phase == GAME_PHASE_CHECK_SETUP)
     )
     dist_to_ball = jnp.where(
         ball_location_known[:, None],
@@ -3493,6 +3539,34 @@ def build_token_observation_components_batch(
     return players, globals_vec, role_flag
 
 
+def canonicalize_player_tokens_by_active_role(
+    static: KernelStatic,
+    state: KernelState,
+    player_tokens,
+    jnp,
+):
+    """Order tokens as current offense then current defense for policy heads.
+
+    Attention policies emit one action slot per controlled roster slot and
+    select the first or second half of the player tokens from the viewer's
+    current offense/defense role. Stable Team A/Team B token order is only
+    equivalent while Team A is on offense. Once Team B gains possession, the
+    active rosters must be swapped as complete, internally stable blocks so
+    that action slot ``i`` still describes controlled roster slot ``i``.
+
+    Raw observation components intentionally remain in stable player-ID order
+    for diagnostics. Only the packed policy observation is canonicalized.
+    """
+    offense_ids = _active_offense_ids_batch(static, state, jnp)
+    defense_ids = _active_defense_ids_batch(static, state, jnp)
+    token_order = jnp.concatenate([offense_ids, defense_ids], axis=1)
+    return jnp.take_along_axis(
+        player_tokens,
+        token_order[..., None],
+        axis=1,
+    )
+
+
 def build_token_observation_batch_with_role_flag(
     static: KernelStatic,
     state: KernelState,
@@ -3511,6 +3585,12 @@ def build_token_observation_batch_with_role_flag(
         rebound_win_prob_features=rebound_win_prob_features,
         rebound_target_observation_features=rebound_target_observation_features,
         multi_possession_features=multi_possession_features,
+    )
+    players = canonicalize_player_tokens_by_active_role(
+        static,
+        state,
+        players,
+        jnp,
     )
     return jnp.concatenate(
         [
@@ -3846,8 +3926,13 @@ def _resolve_movement_single(static: KernelStatic, state: KernelState, actions, 
         stable_team_a,
     )
     protected_check_entry = (
-        (state.game_phase == GAME_PHASE_AWAITING_CHECK)
-        & active_defender
+        (
+            (state.game_phase == GAME_PHASE_CHECK_SETUP)
+            | (
+                (state.game_phase == GAME_PHASE_AWAITING_CHECK)
+                & active_defender
+            )
+        )
         & jnp.all(proposed == static.check_position[None, :], axis=-1)
     )
     valid_move = (
@@ -4325,7 +4410,9 @@ def _finalize_possession_single(
         )
         & (~use_inbounds)
     )
-    awaiting_check = advance & (~game_done) & is_made_basket & made_restart_is_check
+    check_restart = advance & (~game_done) & is_made_basket & made_restart_is_check
+    check_setup = check_restart & (static.check_setup_steps > 0)
+    awaiting_check = check_restart & (~check_setup)
     awaiting_inbound = (
         advance
         & (~game_done)
@@ -4342,7 +4429,7 @@ def _finalize_possession_single(
         advance
         & (~game_done)
         & (~requires_inbound.astype(jnp.bool_))
-        & (~awaiting_check)
+        & (~check_restart)
     )
     check_violation_inbound_position = _select_technical_inbound_position_single(
         static,
@@ -4377,7 +4464,7 @@ def _finalize_possession_single(
         jnp,
     )
     boundary_positions = jnp.where(
-        awaiting_check,
+        check_restart,
         check_positions,
         jnp.where(
             awaiting_inbound,
@@ -4403,7 +4490,7 @@ def _finalize_possession_single(
         )
     ].astype(jnp.int32)
     next_ball_holder = jnp.where(
-        awaiting_check,
+        check_restart,
         jnp.asarray(-1, dtype=jnp.int32),
         jnp.where(
             awaiting_inbound,
@@ -4502,8 +4589,12 @@ def _finalize_possession_single(
             state.live_possession_steps,
         ),
         game_phase=jnp.where(
-            awaiting_check,
-            jnp.asarray(GAME_PHASE_AWAITING_CHECK, dtype=jnp.int8),
+            check_restart,
+            jnp.where(
+                check_setup,
+                jnp.asarray(GAME_PHASE_CHECK_SETUP, dtype=jnp.int8),
+                jnp.asarray(GAME_PHASE_AWAITING_CHECK, dtype=jnp.int8),
+            ),
             jnp.where(
                 awaiting_inbound,
                 jnp.asarray(GAME_PHASE_AWAITING_INBOUND, dtype=jnp.int8),
@@ -4547,12 +4638,21 @@ def _finalize_possession_single(
             ),
         ),
         check_team=jnp.where(
-            awaiting_check,
+            check_restart,
             effective_next_offense_team,
             jnp.where(
                 advance,
                 jnp.asarray(-1, dtype=jnp.int8),
                 state.check_team,
+            ),
+        ),
+        check_setup_steps_remaining=jnp.where(
+            check_setup,
+            static.check_setup_steps.astype(jnp.int32),
+            jnp.where(
+                advance,
+                jnp.asarray(0, dtype=jnp.int32),
+                state.check_setup_steps_remaining,
             ),
         ),
         check_steps_remaining=jnp.where(
@@ -4807,22 +4907,42 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             clearance_elapsed_steps=zero_steps,
             turnover_before_clearance=zero_flag,
             check_opportunity=zero_flag,
+            check_setup_opportunity=zero_flag,
+            check_setup_step=zero_flag,
             check_pickup=zero_flag,
             check_violation=zero_flag,
             check_pickup_steps=zero_steps,
         )
 
-    def _awaiting_check(_):
-        move_key, next_check_key = jax.random.split(key)
+    def _check_phase(_):
+        is_setup = state.game_phase == GAME_PHASE_CHECK_SETUP
+        check_move_key, next_check_key = jax.random.split(key)
+        move_key = jnp.where(is_setup, key, check_move_key)
         countdown_state = _replace_state(
             state,
             step_count=state.step_count + 1,
             shot_clock=state.shot_clock,
-            check_steps_remaining=jnp.maximum(
-                jnp.asarray(0, dtype=jnp.int32),
-                state.check_steps_remaining - 1,
+            check_setup_steps_remaining=jnp.where(
+                is_setup,
+                jnp.maximum(
+                    jnp.asarray(0, dtype=jnp.int32),
+                    state.check_setup_steps_remaining - 1,
+                ),
+                state.check_setup_steps_remaining,
             ),
-            check_steps_elapsed=state.check_steps_elapsed + 1,
+            check_steps_remaining=jnp.where(
+                is_setup,
+                state.check_steps_remaining,
+                jnp.maximum(
+                    jnp.asarray(0, dtype=jnp.int32),
+                    state.check_steps_remaining - 1,
+                ),
+            ),
+            check_steps_elapsed=jnp.where(
+                is_setup,
+                state.check_steps_elapsed,
+                state.check_steps_elapsed + 1,
+            ),
             offense_lane_steps=state.offense_lane_steps,
             defense_lane_steps=state.defense_lane_steps,
         )
@@ -4839,6 +4959,32 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             positions=positions_after,
             ball_holder=jnp.asarray(-1, dtype=jnp.int32),
         )
+
+        setup_complete = countdown_state.check_setup_steps_remaining <= 0
+        setup_state = _replace_state(
+            moved_state,
+            game_phase=jnp.where(
+                setup_complete,
+                jnp.asarray(GAME_PHASE_AWAITING_CHECK, dtype=jnp.int8),
+                jnp.asarray(GAME_PHASE_CHECK_SETUP, dtype=jnp.int8),
+            ),
+            check_steps_remaining=jnp.where(
+                setup_complete,
+                static.check_deadline_steps.astype(jnp.int32),
+                state.check_steps_remaining,
+            ),
+            check_steps_elapsed=jnp.where(
+                setup_complete,
+                jnp.asarray(0, dtype=jnp.int32),
+                state.check_steps_elapsed,
+            ),
+        )
+        setup_output = _already_done(None)._replace(
+            state=setup_state,
+            done=jnp.asarray(False),
+            check_setup_step=jnp.asarray(1, dtype=jnp.int8),
+        )
+
         active_offense_ids = _active_offense_ids_single(static, moved_state, jax)
         offense_positions = positions_after[active_offense_ids]
         on_check = jnp.all(
@@ -4923,7 +5069,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 check_violation=jnp.asarray(1, dtype=jnp.int8),
             )
 
-        return jax.lax.cond(
+        check_output = jax.lax.cond(
             picked_up,
             _pickup,
             lambda __: jax.lax.cond(
@@ -4932,6 +5078,12 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 lambda ___: base_output,
                 operand=None,
             ),
+            operand=None,
+        )
+        return jax.lax.cond(
+            is_setup,
+            lambda _: setup_output,
+            lambda _: check_output,
             operand=None,
         )
 
@@ -5419,6 +5571,8 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     & (~state.clearance_achieved.astype(jnp.bool_))
                 ).astype(jnp.int8),
                 check_opportunity=zero_flag,
+                check_setup_opportunity=zero_flag,
+                check_setup_step=zero_flag,
                 check_pickup=zero_flag,
                 check_violation=zero_flag,
                 check_pickup_steps=zero_steps,
@@ -6283,6 +6437,8 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     & (~state.clearance_achieved.astype(jnp.bool_))
                 ).astype(jnp.int8),
                 check_opportunity=zero_flag,
+                check_setup_opportunity=zero_flag,
+                check_setup_step=zero_flag,
                 check_pickup=zero_flag,
                 check_violation=zero_flag,
                 check_pickup_steps=zero_steps,
@@ -6297,8 +6453,9 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             state.game_phase == GAME_PHASE_AWAITING_INBOUND,
             _awaiting_inbound,
             lambda __: jax.lax.cond(
-                state.game_phase == GAME_PHASE_AWAITING_CHECK,
-                _awaiting_check,
+                (state.game_phase == GAME_PHASE_CHECK_SETUP)
+                | (state.game_phase == GAME_PHASE_AWAITING_CHECK),
+                _check_phase,
                 _run_active,
                 operand=None,
             ),
@@ -6949,6 +7106,7 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         inbound_reason=jnp.asarray(POSSESSION_END_NONE, dtype=jnp.int32),
         inbound_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
         check_team=jnp.asarray(-1, dtype=jnp.int8),
+        check_setup_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
         check_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
         check_steps_elapsed=jnp.asarray(0, dtype=jnp.int32),
         # This is finalized below from the jump-ball winner's actual cell.
@@ -7016,6 +7174,7 @@ def sample_state_batch(args, xp) -> tuple[KernelStatic, KernelState]:
         "made_basket_restart_mode",
         "inbound_deadline_steps",
         "check_deadline_steps",
+        "check_setup_steps",
     ):
         if hasattr(args, key):
             setattr(base_env, key, getattr(args, key))

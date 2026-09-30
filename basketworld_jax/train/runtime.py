@@ -81,6 +81,8 @@ HISTORICAL_MATCH_DIAGNOSTIC_KEYS = (
     "completed_possessions",
     "completed_possession_live_steps",
     "check_opportunities",
+    "check_setup_opportunities",
+    "check_setup_steps",
     "check_pickups",
     "check_violations",
     "check_pickup_steps",
@@ -1373,6 +1375,8 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                     0,
                 ),
                 check_opportunities=jnp.where(active_step, env_out.check_opportunity.astype(jnp.int8), 0),
+                check_setup_opportunities=jnp.where(active_step, env_out.check_setup_opportunity.astype(jnp.int8), 0),
+                check_setup_steps=jnp.where(active_step, env_out.check_setup_step.astype(jnp.int8), 0),
                 check_pickups=jnp.where(active_step, env_out.check_pickup.astype(jnp.int8), 0),
                 check_violations=jnp.where(active_step, env_out.check_violation.astype(jnp.int8), 0),
                 check_pickup_steps=jnp.where(active_step, env_out.check_pickup_steps.astype(jnp.int32), 0),
@@ -1843,6 +1847,8 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                     0,
                 ),
                 check_opportunities=jnp.where(active_step, env_out.check_opportunity.astype(jnp.int8), 0),
+                check_setup_opportunities=jnp.where(active_step, env_out.check_setup_opportunity.astype(jnp.int8), 0),
+                check_setup_steps=jnp.where(active_step, env_out.check_setup_step.astype(jnp.int8), 0),
                 check_pickups=jnp.where(active_step, env_out.check_pickup.astype(jnp.int8), 0),
                 check_violations=jnp.where(active_step, env_out.check_violation.astype(jnp.int8), 0),
                 check_pickup_steps=jnp.where(active_step, env_out.check_pickup_steps.astype(jnp.int32), 0),
@@ -2324,6 +2330,8 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                     0,
                 ),
                 check_opportunities=jnp.where(active_step, env_out.check_opportunity.astype(jnp.int8), 0),
+                check_setup_opportunities=jnp.where(active_step, env_out.check_setup_opportunity.astype(jnp.int8), 0),
+                check_setup_steps=jnp.where(active_step, env_out.check_setup_step.astype(jnp.int8), 0),
                 check_pickups=jnp.where(active_step, env_out.check_pickup.astype(jnp.int8), 0),
                 check_violations=jnp.where(active_step, env_out.check_violation.astype(jnp.int8), 0),
                 check_pickup_steps=jnp.where(active_step, env_out.check_pickup_steps.astype(jnp.int32), 0),
@@ -2588,6 +2596,8 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 clearance_elapsed_steps=env_out.clearance_elapsed_steps.astype(jnp.int32),
                 turnovers_before_clearance=env_out.turnover_before_clearance.astype(jnp.int8),
                 check_opportunities=env_out.check_opportunity.astype(jnp.int8),
+                check_setup_opportunities=env_out.check_setup_opportunity.astype(jnp.int8),
+                check_setup_steps=env_out.check_setup_step.astype(jnp.int8),
                 check_pickups=env_out.check_pickup.astype(jnp.int8),
                 check_violations=env_out.check_violation.astype(jnp.int8),
                 check_pickup_steps=env_out.check_pickup_steps.astype(jnp.int32),
@@ -2730,6 +2740,8 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 clearance_elapsed_steps=env_out.clearance_elapsed_steps.astype(jnp.int32),
                 turnovers_before_clearance=env_out.turnover_before_clearance.astype(jnp.int8),
                 check_opportunities=env_out.check_opportunity.astype(jnp.int8),
+                check_setup_opportunities=env_out.check_setup_opportunity.astype(jnp.int8),
+                check_setup_steps=env_out.check_setup_step.astype(jnp.int8),
                 check_pickups=env_out.check_pickup.astype(jnp.int8),
                 check_violations=env_out.check_violation.astype(jnp.int8),
                 check_pickup_steps=env_out.check_pickup_steps.astype(jnp.int32),
@@ -2821,6 +2833,8 @@ def _build_historical_match_step_diagnostics(
         0.0,
     )
     counters["check_opportunities"] = _count(env_out.check_opportunity)
+    counters["check_setup_opportunities"] = _count(env_out.check_setup_opportunity)
+    counters["check_setup_steps"] = _count(env_out.check_setup_step)
     counters["check_pickups"] = _count(env_out.check_pickup)
     counters["check_violations"] = _count(env_out.check_violation)
     counters["check_pickup_steps"] = jnp.where(
@@ -3358,6 +3372,8 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 clearance_elapsed_steps=env_out.clearance_elapsed_steps.astype(jnp.int32),
                 turnovers_before_clearance=env_out.turnover_before_clearance.astype(jnp.int8),
                 check_opportunities=env_out.check_opportunity.astype(jnp.int8),
+                check_setup_opportunities=env_out.check_setup_opportunity.astype(jnp.int8),
+                check_setup_steps=env_out.check_setup_step.astype(jnp.int8),
                 check_pickups=env_out.check_pickup.astype(jnp.int8),
                 check_violations=env_out.check_violation.astype(jnp.int8),
                 check_pickup_steps=env_out.check_pickup_steps.astype(jnp.int32),
@@ -3569,6 +3585,8 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                     env_out.turnover_before_clearance
                 ),
                 check_opportunities=_active_sum(env_out.check_opportunity),
+                check_setup_opportunities=_active_sum(env_out.check_setup_opportunity),
+                check_setup_steps=_active_sum(env_out.check_setup_step),
                 check_pickups=_active_sum(env_out.check_pickup),
                 check_violations=_active_sum(env_out.check_violation),
                 check_pickup_steps=_active_sum(env_out.check_pickup_steps),
@@ -3849,6 +3867,11 @@ def summarize_deploy_eval_outputs(
         "turnovers": int(turnovers),
         "turnovers_per_episode": _per_episode(turnovers),
         "check_opportunity_count": int(totals["check_opportunities"]),
+        "check_setup_opportunity_count": int(totals["check_setup_opportunities"]),
+        "check_setup_steps_total": int(totals["check_setup_steps"]),
+        "check_setup_mean_executed_steps": _rate(
+            totals["check_setup_steps"], totals["check_setup_opportunities"]
+        ),
         "check_pickup_count": int(totals["check_pickups"]),
         "check_violation_count": int(totals["check_violations"]),
         "check_pickup_rate": _rate(
@@ -4757,6 +4780,8 @@ def summarize_ppo_eligible_episode_metrics(
         "clearance_events": trajectory.clearance_events,
         "turnovers_before_clearance": trajectory.turnovers_before_clearance,
         "check_opportunities": trajectory.check_opportunities,
+        "check_setup_opportunities": trajectory.check_setup_opportunities,
+        "check_setup_steps": trajectory.check_setup_steps,
         "check_pickups": trajectory.check_pickups,
         "check_violations": trajectory.check_violations,
         "learner_turnovers": trajectory.learner_turnovers,
@@ -5294,6 +5319,15 @@ def summarize_training_step(
     check_opportunities = float(
         np.asarray(rollout_out.trajectory.check_opportunities, dtype=np.float32).sum()
     )
+    check_setup_opportunities = float(
+        np.asarray(
+            rollout_out.trajectory.check_setup_opportunities,
+            dtype=np.float32,
+        ).sum()
+    )
+    check_setup_steps = float(
+        np.asarray(rollout_out.trajectory.check_setup_steps, dtype=np.float32).sum()
+    )
     check_pickups = float(
         np.asarray(rollout_out.trajectory.check_pickups, dtype=np.float32).sum()
     )
@@ -5312,6 +5346,11 @@ def summarize_training_step(
             ),
             "turnovers_before_clearance_count": int(turnovers_before_clearance),
             "check_opportunity_count": int(check_opportunities),
+            "check_setup_opportunity_count": int(check_setup_opportunities),
+            "check_setup_steps_total": int(check_setup_steps),
+            "check_setup_mean_executed_steps": float(
+                check_setup_steps / max(1.0, check_setup_opportunities)
+            ),
             "check_pickup_count": int(check_pickups),
             "check_violation_count": int(check_violations),
             "check_pickup_rate": float(

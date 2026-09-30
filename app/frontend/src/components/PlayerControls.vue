@@ -578,6 +578,7 @@ const isMultiPossessionGame = computed(() => Boolean(props.gameState?.enable_mul
 const multiPossessionLimitInput = ref(25);
 const madeBasketRestartModeInput = ref('baseline_inbound');
 const checkDeadlineStepsInput = ref(5);
+const checkSetupStepsInput = ref(0);
 const normalizedMultiPossessionLimit = computed(() => {
   const value = Math.trunc(Number(multiPossessionLimitInput.value));
   return Number.isFinite(value) && value >= 1 ? value : 1;
@@ -589,6 +590,8 @@ const multiPossessionLimitIsCurrent = computed(() => (
   )
   && Math.trunc(Number(checkDeadlineStepsInput.value))
     === Number(props.gameState?.check_deadline_steps ?? 5)
+  && Math.trunc(Number(checkSetupStepsInput.value))
+    === Number(props.gameState?.check_setup_steps ?? 0)
 ));
 
 watch(
@@ -604,11 +607,16 @@ watch(
   () => [
     props.gameState?.made_basket_restart_mode,
     props.gameState?.check_deadline_steps,
+    props.gameState?.check_setup_steps,
   ],
-  ([mode, deadline]) => {
+  ([mode, deadline, setup]) => {
     madeBasketRestartModeInput.value = String(mode ?? 'baseline_inbound');
     const parsed = Math.trunc(Number(deadline));
     checkDeadlineStepsInput.value = Number.isFinite(parsed) && parsed >= 1 ? parsed : 5;
+    const parsedSetup = Math.trunc(Number(setup));
+    checkSetupStepsInput.value = Number.isFinite(parsedSetup) && parsedSetup >= 0
+      ? parsedSetup
+      : 0;
   },
   { immediate: true },
 );
@@ -619,6 +627,7 @@ function requestMultiPossessionLimitRestart() {
     multiPossessionLimit: normalizedMultiPossessionLimit.value,
     madeBasketRestartMode: madeBasketRestartModeInput.value,
     checkDeadlineSteps: Math.max(1, Math.trunc(Number(checkDeadlineStepsInput.value) || 5)),
+    checkSetupSteps: Math.max(0, Math.trunc(Number(checkSetupStepsInput.value) || 0)),
   });
 }
 
@@ -11524,6 +11533,20 @@ function offenseSkillDeltaLabel(idx) {
                 class="env-param-input"
                 type="number"
                 min="1"
+                step="1"
+                :disabled="multiPossessionRestarting || madeBasketRestartModeInput !== 'check'"
+              />
+            </div>
+            <div
+              class="param-item"
+              data-tooltip="Movement-only steps before the check pickup clock begins. Both teams may move, but nobody may enter or collect the protected ball cell. Set to zero to disable setup."
+            >
+              <span class="param-name">Pre-check setup:</span>
+              <input
+                v-model.number="checkSetupStepsInput"
+                class="env-param-input"
+                type="number"
+                min="0"
                 step="1"
                 :disabled="multiPossessionRestarting || madeBasketRestartModeInput !== 'check'"
               />

@@ -108,6 +108,7 @@ _JAX_RUNTIME_STATIC_ENV_KEYS = {
     "multi_possession_schema_version",
     "inbound_deadline_steps",
     "check_deadline_steps",
+    "check_setup_steps",
 }
 
 
@@ -275,6 +276,7 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "multi_possession_schema_version": int,
     "inbound_deadline_steps": int,
     "check_deadline_steps": int,
+    "check_setup_steps": int,
 }
 
 
@@ -1977,6 +1979,7 @@ def set_multi_possession_limit(request: SetMultiPossessionLimitRequest):
         if (
             request.made_basket_restart_mode is not None
             or request.check_deadline_steps is not None
+            or request.check_setup_steps is not None
         ):
             runtime.set_made_basket_restart(
                 request.made_basket_restart_mode
@@ -1988,6 +1991,11 @@ def set_multi_possession_limit(request: SetMultiPossessionLimitRequest):
                 ),
                 request.check_deadline_steps
                 or int(runtime.env_params.get("check_deadline_steps", 5)),
+                (
+                    request.check_setup_steps
+                    if request.check_setup_steps is not None
+                    else int(runtime.env_params.get("check_setup_steps", 0))
+                ),
             )
         runtime.reset()
         game_state.env = runtime.display_env

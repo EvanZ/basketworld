@@ -10,6 +10,12 @@ import { initGame, initTemplateSandbox, stepGame, saveEpisode, saveEpisodeFromPn
 import { resetStatsStorage } from './services/stats';
 import { startEpisodeGifExport } from './services/api';
 import { actionAnimationFrameCount, actionAnimationTiming, hexDistance } from './utils/actionAnimationTiming';
+import {
+  buildEpisodeFrameSelection,
+  fullEpisodeFrameRange,
+  normalizeEpisodeFrameRange,
+  updateEpisodeFrameBoundary,
+} from './utils/episodeFrameRange';
 
 function cloneState(state) {
   return state ? JSON.parse(JSON.stringify(state)) : null;
@@ -1354,6 +1360,71 @@ const BASE_STEP_DURATION_MS = 900;
 const gifStepDurationMs = ref(BASE_STEP_DURATION_MS);
 const gifWidthPx = ref(960);
 const gifAnimationDetail = ref('standard');
+const gifRangeStartFrame = ref(0);
+const gifRangeEndFrame = ref(0);
+
+function episodeStatesForExport() {
+  const stateSources = [
+    Array.isArray(replayStates.value) ? replayStates.value : [],
+    Array.isArray(gameHistory.value) ? gameHistory.value : [],
+    gameState.value ? [gameState.value] : [],
+  ];
+  return stateSources.reduce(
+    (best, candidate) => (candidate.length > best.length ? candidate : best),
+    [],
+  );
+}
+
+const episodeFrameCount = computed(() => episodeStatesForExport().length);
+const gifSelectedFrameCount = computed(() => {
+  const range = normalizeEpisodeFrameRange(
+    gifRangeStartFrame.value,
+    gifRangeEndFrame.value,
+    episodeFrameCount.value,
+  );
+  return range.selectedFrameCount;
+});
+const gifRangeTrackStyle = computed(() => {
+  const count = episodeFrameCount.value;
+  if (count <= 1) {
+    return { '--gif-range-start': '0%', '--gif-range-end': '100%' };
+  }
+  const denominator = count - 1;
+  const startPct = ((gifRangeStartFrame.value - 1) / denominator) * 100;
+  const endPct = ((gifRangeEndFrame.value - 1) / denominator) * 100;
+  return {
+    '--gif-range-start': `${Math.max(0, Math.min(100, startPct))}%`,
+    '--gif-range-end': `${Math.max(0, Math.min(100, endPct))}%`,
+  };
+});
+
+function applyGifFrameRange(range) {
+  gifRangeStartFrame.value = range.start;
+  gifRangeEndFrame.value = range.end;
+}
+
+function resetGifFrameRange(frameCount = episodeFrameCount.value) {
+  applyGifFrameRange(fullEpisodeFrameRange(frameCount));
+}
+
+watch(episodeFrameCount, (count, previousCount) => {
+  if (count <= 0) {
+    resetGifFrameRange(0);
+    return;
+  }
+  const wasFullRange = previousCount > 0
+    && gifRangeStartFrame.value === 1
+    && gifRangeEndFrame.value === previousCount;
+  if (previousCount <= 0 || count < previousCount || wasFullRange) {
+    resetGifFrameRange(count);
+    return;
+  }
+  applyGifFrameRange(normalizeEpisodeFrameRange(
+    gifRangeStartFrame.value,
+    gifRangeEndFrame.value,
+    count,
+  ));
+});
 
 const GIF_CAPTURE_DETAIL = Object.freeze({
   fast: Object.freeze({ movement: 2, action: 5, rebound: 7 }),
@@ -1457,6 +1528,7 @@ async function handleGameStarted(setupData) {
   // Reset manual stepping state
   isManualStepping.value = false;
   replayStates.value = [];
+  resetGifFrameRange(0);
   currentStepIndex.value = 0;
   isReplayPaused.value = false;
   
@@ -1542,6 +1614,7 @@ async function handleTemplateSandboxStarted(setupData = {}) {
   canReplay.value = false;
   isManualStepping.value = false;
   replayStates.value = [];
+  resetGifFrameRange(0);
   currentStepIndex.value = 0;
   isReplayPaused.value = false;
 
@@ -1758,6 +1831,7 @@ function handlePatchedGameState(newState) {
   isReplaying.value = false;
   isManualStepping.value = false;
   replayStates.value = [];
+  resetGifFrameRange(0);
   currentStepIndex.value = 0;
   gameState.value = newState;
   const clonedState = cloneState(newState);
@@ -3189,6 +3263,32 @@ function interpolateState(prevState, currState, t) {
 const isSavingEpisode = ref(false);
 const episodeSaveProgress = ref('');
 
+function previewGifRangeFrame(frameNumber) {
+  const states = episodeStatesForExport();
+  if (states.length === 0) return;
+
+  cancelReplayAnimation();
+  if (replayStates.value !== states) {
+    replayStates.value = states.map(cloneState);
+  }
+  isManualStepping.value = true;
+  applyReplayStateAtIndex(frameNumber - 1);
+}
+
+function handleGifRangeBoundaryInput(boundary, event) {
+  const range = updateEpisodeFrameBoundary(
+    {
+      start: gifRangeStartFrame.value,
+      end: gifRangeEndFrame.value,
+    },
+    boundary,
+    event?.target?.value,
+    episodeFrameCount.value,
+  );
+  applyGifFrameRange(range);
+  previewGifRangeFrame(boundary === 'start' ? range.start : range.end);
+}
+
 async function handleSaveEpisode() {
   if (isSavingEpisode.value) return;
   isSavingEpisode.value = true;
@@ -3204,22 +3304,23 @@ async function handleSaveEpisode() {
     // Check if we have episode states to render. Prefer the longest history so
     // self-play possessions that continue after offensive rebounds are not truncated
     // by a shorter/manual replay buffer.
-    const stateSources = [
-      Array.isArray(replayStates.value) ? replayStates.value : [],
-      Array.isArray(gameHistory.value) ? gameHistory.value : [],
-      gameState.value ? [gameState.value] : [],
-    ];
-    const states = stateSources.reduce(
-      (best, candidate) => (candidate.length > best.length ? candidate : best),
-      [],
-    );
+    const states = episodeStatesForExport();
     
     if (!states || states.length === 0) {
       alert('No episode states available to save');
       return;
     }
     
-    console.log(`[handleSaveEpisode] Generating ${states.length} frames...`);
+    const selection = buildEpisodeFrameSelection(
+      states,
+      gifRangeStartFrame.value,
+      gifRangeEndFrame.value,
+    );
+    applyGifFrameRange(selection.range);
+    console.log(
+      `[handleSaveEpisode] Generating episode frames ${selection.range.start}`
+      + `–${selection.range.end} of ${states.length}...`,
+    );
     
     // Capture binary PNGs and transfer bounded batches. This avoids both
     // base64 expansion and an HTTP round trip for every animation frame.
@@ -3234,9 +3335,10 @@ async function handleSaveEpisode() {
       await writer.appendBatch(pendingFrames);
       pendingFrames = [];
     };
-    for (let i = 0; i < states.length; i++) {
+    for (const entry of selection.entries) {
+      const i = entry.index;
       try {
-        episodeSaveProgress.value = `Saving step ${i + 1}/${states.length}`;
+        episodeSaveProgress.value = `Saving frame ${entry.frameNumber}/${states.length}`;
         // Update currentStepIndex so boardSelectedActions shows correct actions for this frame
         currentStepIndex.value = i;
         
@@ -3244,26 +3346,26 @@ async function handleSaveEpisode() {
         const tempHistory = states.slice(0, i + 1);
         gameHistory.value = tempHistory;
         
-        const previousState = i > 0 ? states[i - 1] : states[i];
-        const offsets = captureOffsetsForState(previousState, states[i]);
-        const stepDurationMs = gifPlaybackDurationForState(states[i]);
+        const previousState = entry.previousState;
+        const offsets = captureOffsetsForState(previousState, entry.state);
+        const stepDurationMs = gifPlaybackDurationForState(entry.state);
         const frameDurationMs = stepDurationMs / offsets.length;
-        const isFinalGameState = i === states.length - 1 && isCompletedMultiPossessionGame(states[i]);
+        const isFinalGameState = i === states.length - 1 && isCompletedMultiPossessionGame(entry.state);
 
         for (const offset of offsets) {
           // Capture uses explicit progress props while CSS transitions are
           // disabled. The offsets define the visual state and GIF timing; they
           // do not require waiting through the live animation in real time.
-          const moveDurationMs = movementAnimationDurationForState(states[i]);
+          const moveDurationMs = movementAnimationDurationForState(entry.state);
           const moveT = moveDurationMs > 0 ? Math.min(1, offset / moveDurationMs) : 1;
-          const reboundT = reboundProgressForStateOffset(states[i], offset);
+          const reboundT = reboundProgressForStateOffset(entry.state, offset);
           const isFinalCaptureFrame = isFinalGameState && offset === offsets[offsets.length - 1];
           moveProgressForCapture.value = moveT;
           reboundProgressForCapture.value = reboundT;
           // Keep terminal actions visible during their animation. End Game is
           // rendered only for the final one-second hold after that action.
           showEndGameOutcomeForCapture.value = isFinalCaptureFrame;
-          const interpState = interpolateState(previousState, states[i], moveT);
+          const interpState = interpolateState(previousState, entry.state, moveT);
           const tempHistory = [...states.slice(0, i), interpState];
           gameHistory.value = tempHistory;
           // Vue must commit the explicit visual state before it is cloned into
@@ -3293,7 +3395,7 @@ async function handleSaveEpisode() {
           }
         }
       } catch (err) {
-        throw new Error(`Could not capture step ${i + 1}: ${err.message}`);
+        throw new Error(`Could not capture frame ${entry.frameNumber}: ${err.message}`);
       }
     }
     
@@ -3430,6 +3532,7 @@ async function handleManualReplay(showAlert = false, keepCurrentView = true) {
     if (res.status === 'success' && Array.isArray(res.states) && res.states.length > 0) {
       // Store states for manual stepping
       replayStates.value = res.states.map(cloneState);
+      resetGifFrameRange(replayStates.value.length);
       isManualStepping.value = true;
       isReplayPaused.value = false;
       
@@ -3532,6 +3635,7 @@ async function handlePlayAgain() {
   // Reset manual stepping state
   isManualStepping.value = false;
   replayStates.value = [];
+  resetGifFrameRange(0);
   currentStepIndex.value = 0;
   isReplayPaused.value = false;
   isEvaluating.value = false;
@@ -3575,11 +3679,18 @@ async function handleMultiPossessionLimitRequested(requested, { forceRestart = f
       ?? 5,
   ));
   if (!Number.isFinite(checkDeadline) || checkDeadline < 1) return;
+  const checkSetup = Math.trunc(Number(
+    request.checkSetupSteps
+      ?? gameState.value.check_setup_steps
+      ?? 0,
+  ));
+  if (!Number.isFinite(checkSetup) || checkSetup < 0) return;
   if (
     !forceRestart
     && parsed === Number(gameState.value.multi_possession_limit)
     && restartMode === String(gameState.value.made_basket_restart_mode ?? 'baseline_inbound')
     && checkDeadline === Number(gameState.value.check_deadline_steps ?? 5)
+    && checkSetup === Number(gameState.value.check_setup_steps ?? 0)
   ) return;
 
   // This is an episode-length setting, not a policy or court change. Restart
@@ -3590,6 +3701,7 @@ async function handleMultiPossessionLimitRequested(requested, { forceRestart = f
     multiPossessionLimit: parsed,
     madeBasketRestartMode: restartMode,
     checkDeadlineSteps: checkDeadline,
+    checkSetupSteps: checkSetup,
   };
   stopSelfPlay();
   cancelReplayAnimation();
@@ -3606,12 +3718,18 @@ async function handleMultiPossessionLimitRequested(requested, { forceRestart = f
   selectedPlaybookIntent.value = null;
   gameHistory.value = [];
   replayStates.value = [];
+  resetGifFrameRange(0);
   currentStepIndex.value = 0;
   canReplay.value = false;
   isManualStepping.value = false;
   clearReboundPreview();
   try {
-    const response = await setMultiPossessionLimit(parsed, restartMode, checkDeadline);
+    const response = await setMultiPossessionLimit(
+      parsed,
+      restartMode,
+      checkDeadline,
+      checkSetup,
+    );
     if (sessionId !== gameSessionId) return;
     if (response.status !== 'success' || !response.state) {
       throw new Error(response.message || 'Failed to restart multi-possession game.');
@@ -4157,42 +4275,92 @@ onBeforeUnmount(() => {
             </div>
           </div>
         </div>
-        <div v-if="gameState.done || isManualStepping" class="save-episode-row">
-          <div class="gif-speed-control">
-            <label for="gif-speed-slider">GIF speed</label>
-            <input
-              id="gif-speed-slider"
-              type="range"
-              min="300"
-              max="2400"
-              step="100"
-              v-model.number="gifStepDurationMs"
-            />
-            <span class="gif-speed-label">{{ (gifStepDurationMs / 1000).toFixed(2) }}s / step</span>
+        <div v-if="gameState.done || isManualStepping" class="save-episode-panel">
+          <div class="save-episode-row">
+            <div class="gif-speed-control">
+              <label for="gif-speed-slider">GIF speed</label>
+              <input
+                id="gif-speed-slider"
+                type="range"
+                min="300"
+                max="2400"
+                step="100"
+                v-model.number="gifStepDurationMs"
+              />
+              <span class="gif-speed-label">{{ (gifStepDurationMs / 1000).toFixed(2) }}s / step</span>
+            </div>
+            <label class="gif-width-control" for="gif-width-input">
+              GIF width
+              <input
+                id="gif-width-input"
+                type="number"
+                min="240"
+                max="3840"
+                step="10"
+                v-model.number="gifWidthPx"
+              />
+              <span>px</span>
+            </label>
+            <label class="gif-detail-control" for="gif-detail-select">
+              Animation detail
+              <select id="gif-detail-select" v-model="gifAnimationDetail">
+                <option value="fast">Fast</option>
+                <option value="standard">Standard</option>
+                <option value="smooth">Smooth</option>
+              </select>
+            </label>
+            <button @click="handleSaveEpisode" class="save-episode-button" :disabled="isSavingEpisode">
+              {{ isSavingEpisode ? episodeSaveProgress : 'Save Episode' }}
+            </button>
           </div>
-          <label class="gif-width-control" for="gif-width-input">
-            GIF width
-            <input
-              id="gif-width-input"
-              type="number"
-              min="240"
-              max="3840"
-              step="10"
-              v-model.number="gifWidthPx"
-            />
-            <span>px</span>
-          </label>
-          <label class="gif-detail-control" for="gif-detail-select">
-            Animation detail
-            <select id="gif-detail-select" v-model="gifAnimationDetail">
-              <option value="fast">Fast</option>
-              <option value="standard">Standard</option>
-              <option value="smooth">Smooth</option>
-            </select>
-          </label>
-          <button @click="handleSaveEpisode" class="save-episode-button" :disabled="isSavingEpisode">
-            {{ isSavingEpisode ? episodeSaveProgress : 'Save Episode' }}
-          </button>
+          <div
+            v-if="episodeFrameCount > 0"
+            class="gif-frame-range-control"
+            role="group"
+            aria-label="GIF episode frame range"
+          >
+            <div class="gif-frame-range-header">
+              <span>Episode trim</span>
+              <strong>
+                Frames {{ gifRangeStartFrame }}–{{ gifRangeEndFrame }} of {{ episodeFrameCount }}
+                <small>({{ gifSelectedFrameCount }} selected)</small>
+              </strong>
+            </div>
+            <div class="gif-dual-range" :style="gifRangeTrackStyle">
+              <div class="gif-dual-range-track"></div>
+              <input
+                id="gif-range-start"
+                class="gif-range-input gif-range-start"
+                type="range"
+                min="1"
+                :max="episodeFrameCount"
+                step="1"
+                :value="gifRangeStartFrame"
+                :disabled="isSavingEpisode || episodeFrameCount <= 1"
+                :aria-valuetext="`Start frame ${gifRangeStartFrame} of ${episodeFrameCount}`"
+                aria-label="GIF start frame"
+                @input="handleGifRangeBoundaryInput('start', $event)"
+              />
+              <input
+                id="gif-range-end"
+                class="gif-range-input gif-range-end"
+                type="range"
+                min="1"
+                :max="episodeFrameCount"
+                step="1"
+                :value="gifRangeEndFrame"
+                :disabled="isSavingEpisode || episodeFrameCount <= 1"
+                :aria-valuetext="`End frame ${gifRangeEndFrame} of ${episodeFrameCount}`"
+                aria-label="GIF end frame"
+                @input="handleGifRangeBoundaryInput('end', $event)"
+              />
+            </div>
+            <div class="gif-frame-range-legend">
+              <label for="gif-range-start"><span class="gif-range-dot start"></span>Start {{ gifRangeStartFrame }}</label>
+              <span>Drag either handle to preview that frame</span>
+              <label for="gif-range-end"><span class="gif-range-dot end"></span>End {{ gifRangeEndFrame }}</label>
+            </div>
+          </div>
         </div>
         
         <div v-if="(isManualStepping || isReplaying) && canReplay" class="replay-controls">
@@ -4548,12 +4716,189 @@ header {
   to { transform: rotate(360deg); }
 }
 
+.save-episode-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.8rem;
+  width: 100%;
+}
+
 .save-episode-row {
   display: flex;
   align-items: center;
   gap: 0.9rem;
   justify-content: center;
   flex-wrap: wrap;
+}
+
+.gif-frame-range-control {
+  width: min(760px, calc(100% - 2rem));
+  padding: 0.7rem 1rem 0.65rem;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 14px;
+  background: rgba(8, 11, 19, 0.84);
+  color: var(--app-text-muted);
+}
+
+.gif-frame-range-header,
+.gif-frame-range-legend {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.gif-frame-range-header {
+  text-transform: uppercase;
+  letter-spacing: 0.075em;
+  font-size: 0.78rem;
+}
+
+.gif-frame-range-header strong {
+  color: var(--app-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.gif-frame-range-header small {
+  color: var(--app-text-muted);
+  font-size: 0.72rem;
+  font-weight: 500;
+}
+
+.gif-dual-range {
+  position: relative;
+  height: 34px;
+  margin: 0.35rem 2px 0.15rem;
+}
+
+.gif-dual-range-track {
+  position: absolute;
+  top: 50%;
+  right: 9px;
+  left: 9px;
+  height: 5px;
+  border-radius: 999px;
+  transform: translateY(-50%);
+  background: linear-gradient(
+    to right,
+    rgba(71, 85, 105, 0.75) 0 var(--gif-range-start),
+    var(--app-accent) var(--gif-range-start) var(--gif-range-end),
+    rgba(71, 85, 105, 0.75) var(--gif-range-end) 100%
+  );
+  box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.22);
+}
+
+.gif-range-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 34px;
+  margin: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  pointer-events: none;
+  background: transparent;
+}
+
+.gif-range-input::-webkit-slider-runnable-track {
+  height: 5px;
+  background: transparent;
+}
+
+.gif-range-input::-webkit-slider-thumb {
+  width: 18px;
+  height: 18px;
+  margin-top: -6.5px;
+  border: 2px solid #07111f;
+  border-radius: 50%;
+  appearance: none;
+  -webkit-appearance: none;
+  pointer-events: auto;
+  cursor: ew-resize;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.82), 0 0 10px currentColor;
+}
+
+.gif-range-start::-webkit-slider-thumb {
+  color: var(--app-accent);
+  background: var(--app-accent);
+  transform: translateY(-3px);
+}
+
+.gif-range-end::-webkit-slider-thumb {
+  color: #fbbf24;
+  background: #fbbf24;
+  transform: translateY(3px);
+}
+
+.gif-range-input::-moz-range-track {
+  height: 5px;
+  background: transparent;
+}
+
+.gif-range-input::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border: 2px solid #07111f;
+  border-radius: 50%;
+  pointer-events: auto;
+  cursor: ew-resize;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.82), 0 0 10px currentColor;
+}
+
+.gif-range-start::-moz-range-thumb {
+  color: var(--app-accent);
+  background: var(--app-accent);
+  transform: translateY(-3px);
+}
+
+.gif-range-end::-moz-range-thumb {
+  color: #fbbf24;
+  background: #fbbf24;
+  transform: translateY(3px);
+}
+
+.gif-range-input:focus-visible {
+  outline: 1px solid rgba(255, 255, 255, 0.82);
+  outline-offset: 3px;
+  border-radius: 999px;
+}
+
+.gif-range-input:disabled::-webkit-slider-thumb {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.gif-range-input:disabled::-moz-range-thumb {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.gif-frame-range-legend {
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.gif-frame-range-legend label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--app-text);
+  cursor: pointer;
+}
+
+.gif-range-dot {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+}
+
+.gif-range-dot.start {
+  background: var(--app-accent);
+}
+
+.gif-range-dot.end {
+  background: #fbbf24;
 }
 
 .gif-speed-control {
@@ -4642,6 +4987,7 @@ header {
 }
 
 .action-button:disabled,
+.save-episode-button:disabled,
 .replay-button:disabled,
 .step-button:disabled {
   opacity: 0.3;
@@ -4679,6 +5025,19 @@ header {
 
   .turn-self-play-speed-control input[type='range'] {
     width: min(15rem, 44vw);
+  }
+}
+
+@media (max-width: 640px) {
+  .gif-frame-range-header,
+  .gif-frame-range-legend {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .gif-frame-range-legend > span {
+    order: 3;
   }
 }
 

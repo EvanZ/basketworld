@@ -84,6 +84,8 @@ class TrajectoryBatch(NamedTuple):
     clearance_elapsed_steps: Any
     turnovers_before_clearance: Any
     check_opportunities: Any
+    check_setup_opportunities: Any
+    check_setup_steps: Any
     check_pickups: Any
     check_violations: Any
     check_pickup_steps: Any
@@ -209,6 +211,8 @@ class EvalTrace(NamedTuple):
     clearance_elapsed_steps: Any
     turnovers_before_clearance: Any
     check_opportunities: Any
+    check_setup_opportunities: Any
+    check_setup_steps: Any
     check_pickups: Any
     check_violations: Any
     check_pickup_steps: Any
@@ -279,6 +283,8 @@ class DeployEvalTotals(NamedTuple):
     clearance_elapsed_steps: Any
     turnovers_before_clearance: Any
     check_opportunities: Any
+    check_setup_opportunities: Any
+    check_setup_steps: Any
     check_pickups: Any
     check_violations: Any
     check_pickup_steps: Any

@@ -146,6 +146,7 @@ _EVAL_ENV_OVERRIDE_KEYS = {
     "made_basket_restart_mode",
     "inbound_deadline_steps",
     "check_deadline_steps",
+    "check_setup_steps",
 }
 
 
@@ -175,6 +176,14 @@ def _coerce_eval_env_override(key: str, value):
             return numeric
         except Exception:
             raise HTTPException(status_code=400, detail=f"{key} must be a positive integer.")
+    if key == "check_setup_steps":
+        try:
+            numeric = int(value)
+            if numeric < 0:
+                raise ValueError
+            return numeric
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"{key} must be a non-negative integer.")
     if key == "multi_possession_overtime_round_cap":
         try:
             numeric = int(value)
