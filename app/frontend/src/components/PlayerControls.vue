@@ -11733,7 +11733,10 @@ function offenseSkillDeltaLabel(idx) {
               </div>
             </div>
           </div>
-          <div class="param-category" v-if="props.gameState.offense_shooting_pct_by_player">
+          <div
+            class="param-category"
+            v-if="props.gameState.offense_shooting_pct_by_player && !isMultiPossessionGame"
+          >
             <h5>Sampled Player Skills (Offense)</h5>
             <div class="offense-skills-editor">
               <div class="offense-skills-row header">
