@@ -516,6 +516,14 @@ def test_jax_dev_runtime_fast_self_play_returns_board_state_with_value_overlay_o
     assert len(start["state"]["team_b_shooting_pct_by_player"]["layup"]) == runtime.n_players // 2
     assert start["state"]["episode_parameters"]["shot"] == start["state"]["shot_params"]
     assert start["state"]["episode_parameters"]["rebound"] == start["state"]["rebound_runtime"]
+    assert isinstance(start["state"]["play_name_map"], dict)
+    assert "intent_active_current" in start["state"]
+    assert "intent_index_current" in start["state"]
+    assert "current_play_name" in start["state"]
+    assert "intent_age" in start["state"]
+    assert "intent_commitment_remaining" in start["state"]
+    assert "selector_segment_index_current" in start["state"]
+    assert "selector_transition" in start["state"]
 
     # The production Fast Mode path uses a cached JIT kernel.  Disable JIT for
     # this serialization-focused test so CI does not spend minutes compiling
@@ -544,6 +552,13 @@ def test_jax_dev_runtime_fast_self_play_returns_board_state_with_value_overlay_o
     assert "pre_step_state_values" not in body
     assert "episode_parameters" not in state
     assert "offense_shooting_pct_by_player" in state
+    assert "intent_active_current" in state
+    assert "intent_index_current" in state
+    assert "current_play_name" in state
+    assert "intent_age" in state
+    assert "intent_commitment_remaining" in state
+    assert "selector_segment_index_current" in state
+    assert "selector_transition" in state
     assert len(state["ep_by_player"]) == runtime.n_players
     np.testing.assert_allclose(
         state["ep_by_player"],
@@ -1470,6 +1485,12 @@ def test_jax_dev_runtime_exposes_dynamic_multi_possession_game_context():
 
     state = runtime.get_full_game_state(game_state, include_policy_probs=False)
 
+    assert len(state["player_shooting_skills"]) == runtime.n_players
+    assert set(state["player_shooting_skills"]["0"]) == {
+        "layup",
+        "three_pt",
+        "dunk",
+    }
     assert state["enable_multi_possession"] is True
     assert state["multi_possession_limit"] == 5
     assert state["multi_possession_overtime_round_cap"] == 5

@@ -842,7 +842,15 @@ def _selector_segment_application_masks(
     jnp,
 ):
     active = state.intent_active.astype(jnp.bool_)
-    segment_start = active & (state.intent_age == 0)
+    live_phase = (
+        getattr(
+            state,
+            "game_phase",
+            jnp.full_like(state.intent_age, GAME_PHASE_LIVE),
+        )
+        == GAME_PHASE_LIVE
+    )
+    segment_start = active & (state.intent_age == 0) & live_phase
     # Game and possession starts both initialize a new offensive intent. Keep
     # them separate in metrics: continuous games create many possession
     # starts without ending the underlying episode.
@@ -851,18 +859,21 @@ def _selector_segment_application_masks(
     commitment_timeout = (
         multiselect_enabled
         & active
+        & live_phase
         & (state.intent_age > 0)
         & (state.intent_commitment_remaining <= 0)
     )
     completed_pass = (
         multiselect_enabled
         & active
+        & live_phase
         & jnp.asarray(completed_pass_boundary).astype(jnp.bool_)
         & (state.intent_age >= jnp.asarray(selector_min_play_steps, dtype=jnp.int32))
     )
     offensive_rebound = (
         multiselect_enabled
         & active
+        & live_phase
         & jnp.asarray(offensive_rebound_boundary).astype(jnp.bool_)
         & (state.intent_age >= jnp.asarray(selector_min_play_steps, dtype=jnp.int32))
     )
@@ -882,6 +893,26 @@ def _selector_segment_application_masks(
         used,
         applied,
         fallback_used,
+    )
+
+
+def _renew_unselected_intent_timeout(static, state, commitment_timeout, applied, jnp):
+    """Keep the current latent active when a timeout does not invoke the selector."""
+    renew = commitment_timeout.astype(jnp.bool_) & (~applied.astype(jnp.bool_))
+    return state._replace(
+        intent_active=jnp.where(
+            renew,
+            jnp.ones_like(state.intent_active),
+            state.intent_active,
+        ),
+        intent_commitment_remaining=jnp.where(
+            renew,
+            jnp.maximum(
+                jnp.asarray(1, dtype=jnp.int32),
+                static.intent_commitment_steps.astype(jnp.int32),
+            ),
+            state.intent_commitment_remaining,
+        ),
     )
 
 
@@ -908,9 +939,25 @@ def _maybe_apply_selector_segment_start(
     alpha = jnp.clip(jnp.asarray(selector_alpha, dtype=jnp.float32), 0.0, 1.0)
     multiselect_enabled = jnp.asarray(selector_multiselect_enabled).astype(jnp.bool_)
     should_run = static.enable_intent_learning.astype(jnp.bool_) & (alpha > 0.0)
+    live_commitment_timeout = (
+        multiselect_enabled
+        & state.intent_active.astype(jnp.bool_)
+        & (state.game_phase == GAME_PHASE_LIVE)
+        & (state.intent_age > 0)
+        & (state.intent_commitment_remaining <= 0)
+    )
 
     def _disabled(_):
-        return state, metrics
+        return (
+            _renew_unselected_intent_timeout(
+                static,
+                state,
+                live_commitment_timeout,
+                jnp.zeros_like(live_commitment_timeout, dtype=jnp.bool_),
+                jnp,
+            ),
+            metrics,
+        )
 
     def _enabled(_):
         batch_size = int(state.intent_index.shape[0])
@@ -970,6 +1017,13 @@ def _maybe_apply_selector_segment_start(
             jnp,
         )
         next_state = _where_state(applied, selected_state, state, jnp)
+        next_state = _renew_unselected_intent_timeout(
+            static,
+            next_state,
+            commitment_timeout,
+            applied,
+            jnp,
+        )
         return next_state, {
             "selector_used": used.astype(jnp.int8),
             "selector_applied": applied.astype(jnp.int8),

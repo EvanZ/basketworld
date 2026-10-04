@@ -65,17 +65,63 @@ const app = createApp({
       state.defensive_lane_steps = Object.fromEntries(state.defense_ids.map((id) => [id, 3]));
       state.enable_multi_possession = value !== 'legacy';
       const shooter = state.offense_ids[0];
+      const receiver = state.offense_ids[1];
+      const defender = state.defense_ids[0];
+      const preActionPositions = structuredClone(state.positions);
       if (value === 'clearance') state.clearance_required = true;
       if (value === 'made') state.last_action_results = { shots: { [shooter]: { success: true, is_three: false } } };
-      if (value === 'rebound') {
-        state.clearance_required = true;
+      if (value === 'pass') {
+        progress.value = 0.5;
+        state.ball_holder = receiver;
         state.last_action_results = {
-          shots: { [shooter]: { success: false, is_three: true } },
-          rebound: { defensive: true },
+          passes: { [shooter]: { success: true, target: receiver } },
+          pre_action_positions: preActionPositions,
         };
       }
-      if (['steal', 'turnover'].includes(value)) {
-        state.last_action_results = { turnovers: [{ reason: value === 'steal' ? 'steal' : 'defender_pressure' }] };
+      if (value === 'rebound') {
+        progress.value = 0.75;
+        state.clearance_required = true;
+        state.ball_holder = defender;
+        state.last_action_results = {
+          shots: { [shooter]: { success: false, is_three: true } },
+          rebound: {
+            attempt: true,
+            defensive: true,
+            winner: defender,
+            winner_team: 'defense',
+            target: preActionPositions[defender],
+          },
+          pre_action_positions: preActionPositions,
+        };
+        overlay.value = {
+          source: 'live_rebound_step',
+          sampled_winner: { player_id: defender, team: 'defense' },
+          sampled_target: {
+            q: preActionPositions[defender][0],
+            r: preActionPositions[defender][1],
+          },
+          target_cells: [],
+        };
+      }
+      if (value === 'steal') {
+        progress.value = 0.72;
+        state.ball_holder = defender;
+        state.last_action_results = {
+          passes: {
+            [shooter]: {
+              success: false,
+              target: receiver,
+              turnover: true,
+              reason: 'steal',
+              stolen_by: defender,
+            },
+          },
+          turnovers: [{ reason: 'steal', player_id: shooter, stolen_by: defender }],
+          pre_action_positions: preActionPositions,
+        };
+      }
+      if (value === 'turnover') {
+        state.last_action_results = { turnovers: [{ reason: 'defender_pressure' }] };
       }
       if (value === 'end') state.done = true;
       if (['terminal-shot-action', 'terminal-shot-title'].includes(value)) {
@@ -87,7 +133,7 @@ const app = createApp({
         progress.value = value === 'terminal-shot-action' ? 0.5 : 1;
         showEndGameOutcome.value = value === 'terminal-shot-title';
       }
-      overlay.value = null;
+      if (value !== 'rebound') overlay.value = null;
       history.value = [state];
       await nextTick();
       await new Promise((resolve) => setTimeout(resolve, 200));
@@ -134,7 +180,7 @@ const app = createApp({
               check(`Step ${index}, width ${narrow ? 440 : 640}`);
             }
             for (const fixture of [
-              'clearance', 'made', 'rebound', 'steal', 'turnover', 'inbound',
+              'clearance', 'made', 'pass', 'rebound', 'steal', 'turnover', 'inbound',
               'terminal-shot-action', 'terminal-shot-title', 'end',
             ]) {
               await selectVariant(fixture);
@@ -244,6 +290,7 @@ const app = createApp({
         h('option', { value: 'inbound' }, 'Inbound / double-digit scores / lane lights'),
         h('option', { value: 'clearance' }, 'Clearance only'),
         h('option', { value: 'made' }, 'Made 2pt'),
+        h('option', { value: 'pass' }, 'Completed pass hands'),
         h('option', { value: 'rebound' }, 'Missed 3pt / rebound / clearance'),
         h('option', { value: 'steal' }, 'Steal'),
         h('option', { value: 'turnover' }, 'Turnover'),
@@ -256,6 +303,10 @@ const app = createApp({
       h('button', { onClick: exportEpisode, disabled: busy.value }, 'Export full recorded episode'),
       h('button', { onClick: checkStableLayout, disabled: busy.value }, 'Check stable banner layout'),
       h('button', { onClick: () => { compact.value = !compact.value; }, disabled: busy.value }, 'Toggle compact width'),
+      h('button', {
+        onClick: () => { captureMode.value = !captureMode.value; },
+        disabled: busy.value,
+      }, captureMode.value ? 'Use live transitions' : 'Use deterministic capture'),
       h('div', { style: 'display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap' }, [
         h('div', { style: `width:${compact.value ? 440 : 640}px;flex:none` }, [
           h('p', 'Live board'),

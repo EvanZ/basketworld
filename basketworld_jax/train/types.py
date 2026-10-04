@@ -167,6 +167,9 @@ class PPOBatch(NamedTuple):
     old_selected_log_probs: Any
     old_values: Any
     advantages: Any
+    task_advantages: Any
+    intent_advantages: Any
+    intent_active_mask: Any
     returns: Any
     rebound_values: Any
     rebound_advantages: Any
@@ -353,6 +356,73 @@ def compute_gae_and_returns(rewards, values, dones, bootstrap_values, *, gamma: 
     return advantages, returns
 
 
+def compute_intent_segment_advantages(
+    trajectory: TrajectoryBatch,
+    intent_bonus,
+    training_mask,
+    *,
+    gamma: float,
+    jax,
+    jnp,
+):
+    """Return intrinsic returns whose credit cannot cross intent segments.
+
+    Task GAE intentionally spans an entire continuous game. Intent diversity is
+    different: a bonus earned under one latent must not train actions taken for
+    a later latent or while the learner is defending.  This scan therefore
+    treats every selector, possession/role, gate, and game boundary as terminal
+    for the intrinsic component only.
+    """
+    bonus = intent_bonus.astype(jnp.float32)
+    active = (
+        (trajectory.policy_intent_gate.astype(jnp.float32) > 0.5)
+        & (trajectory.training_role.astype(jnp.float32) > 0.0)
+        & (training_mask.astype(jnp.float32) > 0.5)
+    )
+    next_active = jnp.concatenate(
+        [active[1:], jnp.zeros_like(active[:1])],
+        axis=0,
+    )
+    labels = trajectory.policy_intent_index.astype(jnp.int32)
+    next_labels = jnp.concatenate([labels[1:], labels[-1:]], axis=0)
+    roles = trajectory.training_role.astype(jnp.float32)
+    next_roles = jnp.concatenate([roles[1:], roles[-1:]], axis=0)
+    next_selector_applied = jnp.concatenate(
+        [
+            trajectory.selector_applied[1:].astype(jnp.bool_),
+            jnp.ones_like(trajectory.selector_applied[-1:], dtype=jnp.bool_),
+        ],
+        axis=0,
+    )
+    continuation = (
+        active
+        & next_active
+        & (labels == next_labels)
+        & (roles == next_roles)
+        & (~next_selector_applied)
+        & (~trajectory.possession_ended.astype(jnp.bool_))
+        & (~trajectory.dones.astype(jnp.bool_))
+    )
+    gamma_t = jnp.asarray(float(gamma), dtype=jnp.float32)
+
+    def _scan_step(carry, scan_inputs):
+        bonus_t, continue_t, active_t = scan_inputs
+        intrinsic_return = jnp.where(
+            active_t,
+            bonus_t + (gamma_t * continue_t.astype(jnp.float32) * carry),
+            jnp.zeros_like(carry),
+        )
+        return intrinsic_return, intrinsic_return
+
+    initial = jnp.zeros_like(bonus[0], dtype=jnp.float32)
+    _, returns_rev = jax.lax.scan(
+        _scan_step,
+        initial,
+        (bonus[::-1], continuation[::-1], active[::-1]),
+    )
+    return returns_rev[::-1], active.astype(jnp.float32), continuation.astype(jnp.float32)
+
+
 def build_trajectory_training_masks(trajectory: TrajectoryBatch, trainer_config: TrainerConfig, jax, jnp):
     active_mask = trajectory.active_mask.astype(jnp.float32)
     if not bool(getattr(trainer_config, "ppo_completed_episodes_only", False)):
@@ -397,8 +467,15 @@ def build_trajectory_training_masks(trajectory: TrajectoryBatch, trainer_config:
         completed_episode_count.astype(jnp.float32),
     )
 
-def build_ppo_batch(rollout: RolloutOutput, trainer_config: TrainerConfig, jax, jnp) -> PPOBatch:
-    advantages, returns = compute_gae_and_returns(
+def build_ppo_batch(
+    rollout: RolloutOutput,
+    trainer_config: TrainerConfig,
+    jax,
+    jnp,
+    *,
+    intent_bonus=None,
+) -> PPOBatch:
+    task_advantages, returns = compute_gae_and_returns(
         rollout.trajectory.rewards,
         rollout.trajectory.values,
         rollout.trajectory.dones,
@@ -414,18 +491,31 @@ def build_ppo_batch(rollout: RolloutOutput, trainer_config: TrainerConfig, jax, 
         jax,
         jnp,
     )
-    flat_advantages = advantages.reshape(-1)
+    flat_advantages = task_advantages.reshape(-1)
     flat_active_mask = active_mask.reshape(-1).astype(jnp.float32)
     flat_loss_weights = loss_weights.reshape(-1).astype(jnp.float32)
     adv_norm_den = jnp.maximum(jnp.sum(flat_active_mask), 1.0)
     adv_mean = jnp.sum(flat_advantages * flat_active_mask) / adv_norm_den
     adv_var = jnp.sum(jnp.square(flat_advantages - adv_mean) * flat_active_mask) / adv_norm_den
-    normalized_advantages = (advantages - adv_mean) / jnp.sqrt(jnp.maximum(adv_var, 1.0e-8))
-    normalized_advantages = jnp.where(
+    normalized_task_advantages = (task_advantages - adv_mean) / jnp.sqrt(jnp.maximum(adv_var, 1.0e-8))
+    normalized_task_advantages = jnp.where(
         active_mask.astype(jnp.bool_),
-        normalized_advantages,
-        jnp.zeros_like(normalized_advantages),
+        normalized_task_advantages,
+        jnp.zeros_like(normalized_task_advantages),
     )
+    if intent_bonus is None:
+        intent_advantages = jnp.zeros_like(normalized_task_advantages, dtype=jnp.float32)
+        intent_active_mask = jnp.zeros_like(active_mask, dtype=jnp.float32)
+    else:
+        intent_advantages, intent_active_mask, _ = compute_intent_segment_advantages(
+            rollout.trajectory,
+            intent_bonus,
+            active_mask,
+            gamma=float(trainer_config.gamma),
+            jax=jax,
+            jnp=jnp,
+        )
+    combined_advantages = normalized_task_advantages + intent_advantages
     rebound_aux_mask = (
         rollout.trajectory.rebound_aux_mask.astype(jnp.float32)
         * active_mask.astype(jnp.float32)
@@ -496,7 +586,10 @@ def build_ppo_batch(rollout: RolloutOutput, trainer_config: TrainerConfig, jax, 
             int(rollout.trajectory.selected_log_probs.shape[-1]),
         ),
         old_values=rollout.trajectory.values.reshape(-1),
-        advantages=normalized_advantages.reshape(-1),
+        advantages=combined_advantages.reshape(-1),
+        task_advantages=normalized_task_advantages.reshape(-1),
+        intent_advantages=intent_advantages.reshape(-1),
+        intent_active_mask=intent_active_mask.reshape(-1),
         returns=returns.reshape(-1),
         rebound_values=rollout.trajectory.rebound_values.reshape(-1),
         rebound_advantages=normalized_rebound_advantages.reshape(-1),

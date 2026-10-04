@@ -1682,6 +1682,43 @@ const offenseSkillRows = computed(() => {
   }));
 });
 
+const sampledShootingSkillRows = computed(() => {
+  const liveSkills = props.gameState?.player_shooting_skills;
+  if (!liveSkills || typeof liveSkills !== 'object') return [];
+  const stableUserIds = Array.isArray(props.gameState?.user_player_ids)
+    ? props.gameState.user_player_ids.map(Number)
+    : [];
+  const stableAiIds = Array.isArray(props.gameState?.ai_player_ids)
+    ? props.gameState.ai_player_ids.map(Number)
+    : [];
+  const userSet = new Set(stableUserIds);
+  const aiSet = new Set(stableAiIds);
+  const orderedIds = stableUserIds.length || stableAiIds.length
+    ? [...stableUserIds, ...stableAiIds]
+    : [...allPlayerIds.value].map(Number).sort((a, b) => a - b);
+
+  return orderedIds.flatMap((playerId) => {
+    const raw = liveSkills?.[String(playerId)] ?? liveSkills?.[playerId];
+    if (!raw || typeof raw !== 'object') return [];
+    const layup = Number(raw.layup);
+    const threePt = Number(raw.three_pt);
+    const dunk = Number(raw.dunk);
+    if (![layup, threePt, dunk].some(Number.isFinite)) return [];
+    return [{
+      playerId,
+      team: userSet.has(playerId) ? 'Player' : (aiSet.has(playerId) ? 'AI' : 'Unknown'),
+      layup: Number.isFinite(layup) ? layup : null,
+      threePt: Number.isFinite(threePt) ? threePt : null,
+      dunk: Number.isFinite(dunk) ? dunk : null,
+    }];
+  });
+});
+
+function formatSampledShootingSkill(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? `${(numeric * 100).toFixed(1)}%` : 'N/A';
+}
+
 const sampledReboundSkillRows = computed(() => {
   if (!props.gameState?.player_rebound_skills) return [];
   const liveSkills = props.gameState.player_rebound_skills || {};
@@ -11747,6 +11784,30 @@ function offenseSkillDeltaLabel(idx) {
               </div>
             </div>
           </div>
+          <div class="param-category" v-if="sampledShootingSkillRows.length">
+            <h5>Sampled Shooting Skills (Episode)</h5>
+            <div class="offense-skills-editor">
+              <div class="offense-skills-row header sampled-shooting-skills-row">
+                <span>Player</span>
+                <span>Team</span>
+                <span>Layup</span>
+                <span>3PT</span>
+                <span>Dunk</span>
+              </div>
+              <div
+                class="offense-skills-row sampled-shooting-skills-row"
+                v-for="row in sampledShootingSkillRows"
+                :key="`sampled-shooting-skill-${row.playerId}`"
+                data-tooltip="Per-episode shooting skills sampled at game creation. These remain fixed while Player and AI alternate between offense and defense."
+              >
+                <span class="skills-player">Player {{ row.playerId }}</span>
+                <span class="param-value" :class="`skill-team-${row.team.toLowerCase()}`">{{ row.team }}</span>
+                <span class="param-value">{{ formatSampledShootingSkill(row.layup) }}</span>
+                <span class="param-value">{{ formatSampledShootingSkill(row.threePt) }}</span>
+                <span class="param-value">{{ formatSampledShootingSkill(row.dunk) }}</span>
+              </div>
+            </div>
+          </div>
           <div class="param-category" v-if="sampledReboundSkillRows.length">
             <h5>Current Rebounding Skills</h5>
             <div class="offense-skills-editor">
@@ -14360,6 +14421,18 @@ function offenseSkillDeltaLabel(idx) {
 
 .offense-skills-row.sampled-rebound-skills-row {
   grid-template-columns: 0.9fr 1fr 1fr 1fr;
+}
+
+.offense-skills-row.sampled-shooting-skills-row {
+  grid-template-columns: 0.9fr 0.75fr repeat(3, 1fr);
+}
+
+.skill-team-player {
+  color: #60a5fa;
+}
+
+.skill-team-ai {
+  color: #f87171;
 }
 
 .offense-skills-row.header {

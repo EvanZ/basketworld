@@ -49,9 +49,9 @@ from basketworld_jax.models import (
     init_actor_critic_params,
 )
 from basketworld_jax.intent import (
-    apply_intent_bonus_to_rollout,
     build_intent_discriminator_spec,
     build_intent_discriminator_update_runner,
+    build_intent_policy_sensitivity_runner,
     build_intent_sample_dump,
     build_intent_step_features_from_rollout,
     compute_intent_beta,
@@ -506,6 +506,15 @@ def parse_args(argv=None):
         help="Embedding dimension for runtime intent conditioning in the JAX attention policy.",
     )
     parser.add_argument(
+        "--intent-conditioning-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplier applied to the learned intent-conditioning delta. "
+            "Values above one strengthen initial and learned policy sensitivity."
+        ),
+    )
+    parser.add_argument(
         "--intent-sample-dump-size",
         type=int,
         default=2048,
@@ -519,8 +528,8 @@ def parse_args(argv=None):
         type=int,
         default=None,
         help=(
-            "JAX-only update-count warmup for intent diversity. When set, the "
-            "discriminator and diversity bonus are skipped until this PPO update."
+            "JAX-only update-count warmup for the intent-diversity bonus. "
+            "The discriminator still pretrains during this period."
         ),
     )
     parser.add_argument(
@@ -1564,6 +1573,8 @@ def validate_train_args(args) -> None:
             )
     if int(getattr(args, "intent_embedding_dim", 16)) < 1:
         raise SystemExit("--intent-embedding-dim must be >= 1.")
+    if float(getattr(args, "intent_conditioning_scale", 1.0)) < 0.0:
+        raise SystemExit("--intent-conditioning-scale must be >= 0.")
     for key in ("ent_coef", "ent_coef_start", "ent_coef_end"):
         value = getattr(args, key, None)
         if value is not None and float(value) < 0.0:
@@ -1639,14 +1650,22 @@ def validate_train_args(args) -> None:
             raise SystemExit("--intent-diversity-enabled requires --intent-embedding-enabled.")
         encoder_type = str(getattr(args, "intent_disc_encoder_type", "mlp_mean"))
         if encoder_type not in {"mlp_mean", "set_step"}:
-            raise SystemExit("JAX intent discriminator supports --intent-disc-encoder-type mlp_mean or set_step.")
+            raise SystemExit(
+                "JAX intent discriminator supports --intent-disc-encoder-type "
+                "mlp_mean or set_step."
+            )
         if encoder_type == "set_step":
             if str(getattr(args, "policy_model", "mlp")) != "attention":
-                raise SystemExit("--intent-disc-encoder-type set_step requires --policy-model attention.")
+                raise SystemExit(
+                    f"--intent-disc-encoder-type {encoder_type} requires --policy-model attention."
+                )
             hidden_dim = int(getattr(args, "intent_disc_hidden_dim", 128))
             num_heads = int(getattr(args, "attention_num_heads", 4))
             if hidden_dim % num_heads != 0:
-                raise SystemExit("--intent-disc-hidden-dim must be divisible by --attention-num-heads for set_step.")
+                raise SystemExit(
+                    "--intent-disc-hidden-dim must be divisible by "
+                    f"--attention-num-heads for {encoder_type}."
+                )
         if not bool(getattr(args, "intent_disc_current_policy_only", True)):
             raise SystemExit("JAX intent discriminator currently requires --intent-disc-current-policy-only true.")
         if int(getattr(args, "intent_disc_batch_size", 256)) < 1:
@@ -2074,6 +2093,9 @@ def _build_policy_spec(args, static, flat_obs_np: np.ndarray, action_masks_np: n
         pass_action_end=int(PASS_ACTION_END),
         intent_embedding_enabled=bool(getattr(args, "intent_embedding_enabled", False)),
         intent_embedding_dim=int(getattr(args, "intent_embedding_dim", 16)),
+        intent_conditioning_scale=float(
+            getattr(args, "intent_conditioning_scale", 1.0)
+        ),
         num_intents=int(getattr(args, "num_intents", 8)),
         intent_selector_enabled=bool(getattr(args, "intent_selector_enabled", False)),
         intent_selector_hidden_dim=int(getattr(args, "intent_selector_hidden_dim", 64)),
@@ -2901,6 +2923,7 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/pass_action_end": int(spec.pass_action_end),
         "jax/intent_embedding_enabled": bool(spec.intent_embedding_enabled),
         "jax/intent_embedding_dim": int(spec.intent_embedding_dim),
+        "jax/intent_conditioning_scale": float(spec.intent_conditioning_scale),
         "jax/num_intents": int(spec.num_intents),
         "jax/intent_selector_enabled": bool(spec.intent_selector_enabled),
         "jax/intent_selector_hidden_dim": int(spec.intent_selector_hidden_dim),
@@ -3089,6 +3112,15 @@ def _log_mlflow_params(mlflow, args, trainer_config: TrainerConfig, spec: ActorC
         "jax/intent_disc_eval_holdout_fraction": float(getattr(args, "intent_disc_eval_holdout_fraction", 0.25)),
         "jax/intent_sample_dump_size": int(getattr(args, "intent_sample_dump_size", 2048)),
         "jax/disc_eval_batch_output": bool(getattr(args, "disc_eval_batch_output", False)),
+        "jax/intent_policy_sensitivity_enabled": bool(
+            getattr(args, "intent_policy_sensitivity_enabled", True)
+        ),
+        "jax/intent_policy_sensitivity_sample_states": int(
+            getattr(args, "intent_policy_sensitivity_sample_states", 32)
+        ),
+        "jax/intent_policy_sensitivity_log_every_rollouts": int(
+            getattr(args, "intent_policy_sensitivity_log_every_rollouts", 4)
+        ),
     }
     for key, value in _jax_env_config_from_args(args).items():
         params[f"jax/env/{key}"] = value
@@ -4396,6 +4428,173 @@ def _build_reward_component_arrays(rollout, static, task_reward_scale: float, jn
     }
 
 
+def _summarize_intent_intrinsic_advantages(
+    ppo_batches,
+    role_rollouts,
+    *,
+    jax,
+) -> dict[str, float]:
+    """Describe intrinsic PPO credit and the boundaries that terminate it."""
+    task_parts = []
+    intent_parts = []
+    active_parts = []
+    continuation_count = 0
+    boundary_counts = {
+        "selector": 0,
+        "possession": 0,
+        "game": 0,
+        "intent": 0,
+        "role_or_gate": 0,
+    }
+    for ppo_batch, rollout in zip(ppo_batches, role_rollouts, strict=True):
+        task_parts.append(
+            np.asarray(jax.device_get(ppo_batch.task_advantages), dtype=np.float32)
+        )
+        intent_parts.append(
+            np.asarray(jax.device_get(ppo_batch.intent_advantages), dtype=np.float32)
+        )
+        active_flat = (
+            np.asarray(jax.device_get(ppo_batch.intent_active_mask), dtype=np.float32)
+            > 0.5
+        )
+        active_parts.append(active_flat)
+
+        trajectory = rollout.trajectory
+        active = active_flat.reshape(trajectory.policy_intent_gate.shape)
+        labels = np.asarray(jax.device_get(trajectory.policy_intent_index), dtype=np.int32)
+        roles = np.asarray(jax.device_get(trajectory.training_role), dtype=np.float32)
+        next_active = np.concatenate(
+            [active[1:], np.zeros_like(active[:1], dtype=bool)],
+            axis=0,
+        )
+        next_labels = np.concatenate([labels[1:], labels[-1:]], axis=0)
+        next_roles = np.concatenate([roles[1:], roles[-1:]], axis=0)
+        next_selector = np.concatenate(
+            [
+                np.asarray(jax.device_get(trajectory.selector_applied[1:]), dtype=bool),
+                np.ones_like(
+                    np.asarray(jax.device_get(trajectory.selector_applied[-1:])),
+                    dtype=bool,
+                ),
+            ],
+            axis=0,
+        )
+        possession_end = np.asarray(
+            jax.device_get(trajectory.possession_ended),
+            dtype=bool,
+        )
+        game_end = np.asarray(jax.device_get(trajectory.dones), dtype=bool)
+        continuation = (
+            active
+            & next_active
+            & (labels == next_labels)
+            & (roles == next_roles)
+            & (~next_selector)
+            & (~possession_end)
+            & (~game_end)
+        )
+        continuation_count += int(np.sum(continuation))
+        boundary_counts["selector"] += int(np.sum(active & next_selector))
+        boundary_counts["possession"] += int(np.sum(active & possession_end))
+        boundary_counts["game"] += int(np.sum(active & game_end))
+        boundary_counts["intent"] += int(np.sum(active & (labels != next_labels)))
+        boundary_counts["role_or_gate"] += int(
+            np.sum(active & ((~next_active) | (roles != next_roles)))
+        )
+
+    task = np.concatenate(task_parts) if task_parts else np.zeros((0,), dtype=np.float32)
+    intent = (
+        np.concatenate(intent_parts) if intent_parts else np.zeros((0,), dtype=np.float32)
+    )
+    active = np.concatenate(active_parts) if active_parts else np.zeros((0,), dtype=bool)
+    active_task = task[active]
+    active_intent = intent[active]
+    active_count = int(active_intent.size)
+    task_abs = float(np.sum(np.abs(active_task)))
+    intent_abs = float(np.sum(np.abs(active_intent)))
+    metrics = {
+        "intent_intrinsic_advantage_active_count": float(active_count),
+        "intent_intrinsic_advantage_mean": (
+            float(np.mean(active_intent)) if active_count else 0.0
+        ),
+        "intent_intrinsic_advantage_std": (
+            float(np.std(active_intent)) if active_count else 0.0
+        ),
+        "intent_intrinsic_advantage_abs_mean": (
+            float(np.mean(np.abs(active_intent))) if active_count else 0.0
+        ),
+        "intent_intrinsic_advantage_magnitude_fraction": (
+            intent_abs / max(task_abs + intent_abs, 1.0e-12)
+        ),
+        "intent_intrinsic_continuation_count": float(continuation_count),
+        "intent_intrinsic_boundary_count": float(active_count - continuation_count),
+        "intent_intrinsic_segment_mean_steps": (
+            float(active_count) / float(max(active_count - continuation_count, 1))
+        ),
+    }
+    for name, count in boundary_counts.items():
+        metrics[f"intent_intrinsic_boundary_{name}_count"] = float(count)
+    return metrics
+
+
+def _summarize_intent_behavior_by_label(
+    rollout,
+    training_mask,
+    *,
+    num_intents: int,
+    jax,
+) -> dict[str, float]:
+    """Log rollout events by latent so behavior collapse is visible directly."""
+    trajectory = rollout.trajectory
+    labels = np.asarray(
+        jax.device_get(trajectory.policy_intent_index),
+        dtype=np.int32,
+    )
+    active = (
+        np.asarray(jax.device_get(trajectory.policy_intent_gate), dtype=np.float32)
+        > 0.5
+    ) & (
+        np.asarray(jax.device_get(trajectory.training_role), dtype=np.float32) > 0.0
+    ) & (
+        np.asarray(jax.device_get(training_mask), dtype=np.float32) > 0.5
+    )
+    events = {
+        "pass_attempt_rate": trajectory.pass_attempts,
+        "completed_pass_rate": trajectory.completed_passes,
+        "turnover_rate": trajectory.turnovers,
+        "shot_attempt_rate": trajectory.shot_attempts,
+        "shot_make_rate": trajectory.shot_makes,
+        "shot_two_rate": trajectory.shot_twos,
+        "shot_three_rate": trajectory.shot_threes,
+    }
+    event_arrays = {
+        name: np.asarray(jax.device_get(value), dtype=np.float32)
+        for name, value in events.items()
+    }
+    actions = np.asarray(jax.device_get(trajectory.actions), dtype=np.int32)
+    total_active = max(int(np.sum(active)), 1)
+    metrics: dict[str, float] = {}
+    for intent_idx in range(int(num_intents)):
+        intent_mask = active & (labels == intent_idx)
+        count = int(np.sum(intent_mask))
+        denom = max(count, 1)
+        metrics[f"intent_behavior_active_count_by_intent/{intent_idx}"] = float(count)
+        metrics[f"intent_behavior_active_share_by_intent/{intent_idx}"] = (
+            float(count) / float(total_active)
+        )
+        for name, values in event_arrays.items():
+            metrics[f"intent_behavior_{name}_by_intent/{intent_idx}"] = (
+                float(np.sum(values * intent_mask)) / float(denom)
+            )
+        selected_actions = actions[intent_mask]
+        action_count = max(int(selected_actions.size), 1)
+        for action_idx in range(int(trajectory.action_mask.shape[-1])):
+            metrics[
+                f"intent_behavior_action_prob_by_intent/{intent_idx}/action_{action_idx}"
+            ] = float(np.sum(selected_actions == action_idx)) / float(action_count)
+    return metrics
+
+
 def _opponent_deterministic_episode_prob_for_update(args, update_index: int) -> float:
     start_raw = getattr(args, "opponent_deterministic_episode_prob_start", None)
     end_raw = getattr(args, "opponent_deterministic_episode_prob_end", None)
@@ -5113,10 +5312,23 @@ def run_training_loop(args) -> dict[str, Any]:
             seed=int(args.policy_seed) + 7_001,
         )
         initial_intent_disc_opt_state = intent_disc_transform.init(initial_intent_disc_params)
+        intent_policy_sensitivity_runner = (
+            build_intent_policy_sensitivity_runner(
+                jax,
+                jnp,
+                spec,
+                sample_count=int(
+                    getattr(args, "intent_policy_sensitivity_sample_states", 32)
+                ),
+            )
+            if bool(getattr(args, "intent_policy_sensitivity_enabled", True))
+            else None
+        )
     else:
         intent_disc_runner = None
         initial_intent_disc_params = None
         initial_intent_disc_opt_state = None
+        intent_policy_sensitivity_runner = None
     checkpoint_dir = str(args.checkpoint_dir).strip()
     resume_checkpoint = str(args.resume_checkpoint).strip()
     continuation_checkpoint_info = _prepare_continuation_checkpoint(args)
@@ -5707,9 +5919,28 @@ def run_training_loop(args) -> dict[str, Any]:
                 )
                 intent_disc_metrics = {
                     "intent_bonus_beta": float(intent_beta),
-                    "intent_disc_skipped_warmup": 1.0 if float(intent_beta) <= 0.0 else 0.0,
+                    "intent_disc_skipped_warmup": 0.0,
+                    "intent_bonus_skipped_warmup": (
+                        1.0 if float(intent_beta) <= 0.0 else 0.0
+                    ),
                 }
-                if float(intent_beta) > 0.0:
+                sensitivity_every = max(
+                    1,
+                    int(
+                        getattr(
+                            args,
+                            "intent_policy_sensitivity_log_every_rollouts",
+                            4,
+                        )
+                    ),
+                )
+                should_measure_sensitivity = (
+                    intent_policy_sensitivity_runner is not None
+                    and int(update_idx) % sensitivity_every == 0
+                )
+                intent_rollout = None
+                intent_training_mask = None
+                if should_measure_sensitivity:
                     intent_rollout = concatenate_rollout_outputs(
                         [role_rollouts[role] for role in TRAINING_ROLES],
                         jnp,
@@ -5720,7 +5951,48 @@ def run_training_loop(args) -> dict[str, Any]:
                         jax,
                         jnp,
                     )
-                    intent_features, intent_labels, intent_active_mask = build_intent_step_features_from_rollout(
+                    sensitivity_active_mask = (
+                        (intent_rollout.trajectory.policy_intent_gate > 0.5)
+                        & (intent_rollout.trajectory.training_role > 0.0)
+                        & (intent_training_mask > 0.5)
+                    )
+                    raw_sensitivity_metrics = intent_policy_sensitivity_runner(
+                        params,
+                        intent_rollout.trajectory.flat_obs,
+                        intent_rollout.trajectory.action_mask,
+                        sensitivity_active_mask,
+                    )
+                    block_until_ready_tree(raw_sensitivity_metrics)
+                    intent_disc_metrics.update(
+                        {
+                            key: float(np.asarray(value))
+                            for key, value in raw_sensitivity_metrics.items()
+                        }
+                    )
+                # Pretrain the state-only q(z | s_(t+1)) even while the policy bonus is in
+                # warmup.  At beta == 0 the computed bonus is exactly zero, but
+                # the classifier is ready to provide a useful signal when the
+                # bonus schedule starts.
+                if intent_disc_enabled:
+                    if intent_rollout is None:
+                        intent_rollout = concatenate_rollout_outputs(
+                            [role_rollouts[role] for role in TRAINING_ROLES],
+                            jnp,
+                        )
+                    if intent_training_mask is None:
+                        intent_training_mask, _, _ = build_trajectory_training_masks(
+                            intent_rollout.trajectory,
+                            trainer_config,
+                            jax,
+                            jnp,
+                        )
+                    (
+                        intent_features,
+                        intent_labels,
+                        intent_active_mask,
+                        intent_segment_ids,
+                        intent_age,
+                    ) = build_intent_step_features_from_rollout(
                         intent_rollout,
                         intent_disc_spec,
                         jnp,
@@ -5733,6 +6005,8 @@ def run_training_loop(args) -> dict[str, Any]:
                         intent_features,
                         intent_labels,
                         intent_active_mask,
+                        intent_segment_ids,
+                        intent_age,
                         params_key,
                     )
                     block_until_ready_tree(
@@ -5758,11 +6032,6 @@ def run_training_loop(args) -> dict[str, Any]:
                         role_bonus = intent_bonus[
                             :, batch_offset : batch_offset + role_batch_size
                         ]
-                        role_rollouts[role] = apply_intent_bonus_to_rollout(
-                            role_rollouts[role],
-                            role_bonus,
-                            jnp,
-                        )
                         role_reward_components[role] = {
                             **role_reward_components[role],
                             "intent_bonus": role_bonus.astype(jnp.float32),
@@ -5802,6 +6071,8 @@ def run_training_loop(args) -> dict[str, Any]:
                             features=intent_features,
                             labels=intent_labels,
                             active_mask=intent_active_mask,
+                            segment_ids=intent_segment_ids,
+                            intent_age=intent_age,
                             bonus=intent_bonus,
                             rollout=intent_rollout,
                             spec=intent_disc_spec,
@@ -5812,9 +6083,59 @@ def run_training_loop(args) -> dict[str, Any]:
                         )
 
             role_ppo_batches = [
-                build_ppo_batch(role_rollouts[role], trainer_config, jax, jnp)
+                build_ppo_batch(
+                    role_rollouts[role],
+                    trainer_config,
+                    jax,
+                    jnp,
+                    intent_bonus=role_reward_components[role]["intent_bonus"],
+                )
                 for role in TRAINING_ROLES
             ]
+            should_log_intent_rollout_diagnostics = (
+                int(update_idx) == int(args.num_updates)
+                or int(update_idx) % max(1, int(args.log_every_updates)) == 0
+            )
+            if intent_disc_enabled and should_log_intent_rollout_diagnostics:
+                intent_disc_metrics.update(
+                    _summarize_intent_intrinsic_advantages(
+                        role_ppo_batches,
+                        [role_rollouts[role] for role in TRAINING_ROLES],
+                        jax=jax,
+                    )
+                )
+                if intent_rollout is None:
+                    intent_rollout = concatenate_rollout_outputs(
+                        [role_rollouts[role] for role in TRAINING_ROLES],
+                        jnp,
+                    )
+                if intent_training_mask is None:
+                    intent_training_mask, _, _ = build_trajectory_training_masks(
+                        intent_rollout.trajectory,
+                        trainer_config,
+                        jax,
+                        jnp,
+                    )
+                intent_disc_metrics.update(
+                    _summarize_intent_behavior_by_label(
+                        intent_rollout,
+                        intent_training_mask,
+                        num_intents=int(args.num_intents),
+                        jax=jax,
+                    )
+                )
+            if latest_intent_sample_payload is not None:
+                for key, value in intent_disc_metrics.items():
+                    if key.startswith(
+                        (
+                            "intent_policy_sensitivity_",
+                            "intent_intrinsic_",
+                        )
+                    ):
+                        latest_intent_sample_payload[f"metric_{key}"] = np.asarray(
+                            [float(value)],
+                            dtype=np.float32,
+                        )
             ppo_batch = concatenate_ppo_batches(role_ppo_batches, jnp)
             rollout_out = concatenate_rollout_outputs(
                 [role_rollouts[role] for role in TRAINING_ROLES],

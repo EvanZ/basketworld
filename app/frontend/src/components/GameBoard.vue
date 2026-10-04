@@ -4,6 +4,11 @@ import { getShotProbability, getPassStealProbabilities, renderGifFromPngs } from
 import { captureBoardPng, captureBoardPngBlob } from '@/utils/boardCapture';
 import { actionAnimationTiming, hexDistance } from '@/utils/actionAnimationTiming';
 import { basketballRotationDegrees } from '@/utils/basketballAnimation';
+import {
+  interactionHandDuration,
+  interactionHandOpacity,
+  interactionHandPairPose,
+} from '@/utils/interactionHands';
 import { defensiveLaneViolationBannerPayload } from '@/utils/outcomeBanners';
 import { resolveRenderableState } from '@/utils/renderableState';
 import { stableBoardViewBox } from '@/utils/boardViewBox';
@@ -436,6 +441,10 @@ let passFlashSerial = 0;
 const passFlashNowMs = ref(0);
 const passFlashRaf = ref(null);
 const passFlashTimeout = ref(null);
+const liveInteractionHandFlashes = ref([]);
+const liveInteractionHandNowMs = ref(0);
+const liveInteractionHandRaf = ref(null);
+let liveInteractionHandSerial = 0;
 const reboundFlash = ref(null);
 const reboundFlashNowMs = ref(0);
 const reboundFlashRaf = ref(null);
@@ -448,6 +457,11 @@ const shotFlashTimeout = ref(null);
 const shotAttemptBanner = ref(null);
 let shotAttemptBannerSerial = 0;
 let shotAttemptBannerTimeout = null;
+const PLAY_CALL_BADGE_DURATION_MS = 1400;
+const playCallBadge = ref(null);
+let playCallBadgeSerial = 0;
+let playCallBadgeTimeout = null;
+let lastPlayCallKey = null;
 const lastShotAnimationKey = ref(null);
 const shotJumpPlayerId = ref(null);
 const shotJumpTimeout = ref(null);
@@ -811,6 +825,87 @@ const currentGameState = computed(() => {
   }
   return cloned;
 });
+
+function playCallName(state, intentIndex) {
+  const explicit = typeof state?.current_play_name === 'string'
+    ? state.current_play_name.trim()
+    : '';
+  if (explicit) return explicit;
+  const map = state?.play_name_map;
+  const mapped = map && typeof map === 'object'
+    ? (map[String(intentIndex)] ?? map[intentIndex])
+    : null;
+  if (typeof mapped === 'string' && mapped.trim()) return mapped.trim();
+  return `Play ${intentIndex}`;
+}
+
+function clearPlayCallBadge() {
+  if (playCallBadgeTimeout !== null) {
+    clearTimeout(playCallBadgeTimeout);
+    playCallBadgeTimeout = null;
+  }
+  playCallBadge.value = null;
+}
+
+function showPlayCallBadge(state, intentIndex) {
+  clearPlayCallBadge();
+  const offense = String(state?.offense_label || '').toLowerCase();
+  const team = offense === 'user' ? 'player' : (offense === 'ai' ? 'ai' : 'offense');
+  const serial = ++playCallBadgeSerial;
+  playCallBadge.value = {
+    key: `play-call-${serial}`,
+    team,
+    teamLabel: team === 'player' ? 'Player Play' : (team === 'ai' ? 'AI Play' : 'Offense Play'),
+    name: playCallName(state, intentIndex),
+  };
+  playCallBadgeTimeout = setTimeout(() => {
+    if (playCallBadge.value?.key === `play-call-${serial}`) {
+      playCallBadge.value = null;
+    }
+    playCallBadgeTimeout = null;
+  }, PLAY_CALL_BADGE_DURATION_MS);
+}
+
+watch(
+  () => ({
+    active: Boolean(currentGameState.value?.intent_active_current),
+    intentIndex: Number(currentGameState.value?.intent_index_current),
+    segmentIndex: Number(currentGameState.value?.selector_segment_index_current ?? 0),
+    transition: currentGameState.value?.selector_transition ?? null,
+    offenseTeam: currentGameState.value?.offense_team ?? null,
+    episodeKey: currentGameState.value?.replay_session_id ?? 'episode',
+    state: currentGameState.value,
+  }),
+  (call) => {
+    const transitionIntent = Number(call.transition?.intent_index);
+    const intentIndex = Number.isFinite(transitionIntent)
+      ? transitionIntent
+      : call.intentIndex;
+    const hasTransition = Boolean(call.transition)
+      && Number.isFinite(transitionIntent);
+    if ((!call.active && !hasTransition) || !Number.isFinite(intentIndex)) {
+      lastPlayCallKey = null;
+      clearPlayCallBadge();
+      return;
+    }
+    const reason = call.transition?.reason || 'active';
+    const key = `${call.episodeKey}:${call.offenseTeam || 'offense'}:${call.segmentIndex}:${intentIndex}:${reason}`;
+    if (key === lastPlayCallKey) return;
+    lastPlayCallKey = key;
+    showPlayCallBadge(call.state, intentIndex);
+  },
+  { immediate: true },
+);
+
+watch(
+  () => props.gameHistory.length,
+  (length) => {
+    if (length === 0) {
+      lastPlayCallKey = null;
+      clearPlayCallBadge();
+    }
+  },
+);
 
 // Derive directly from the visible state as well as the timed latch below.
 // That makes the result readable on the shot frame even if a rapid self-play
@@ -3450,6 +3545,7 @@ function capturePassFlashFromState(state) {
     : {};
   let passerId = null;
   let receiverId = null;
+  let kind = 'pass';
 
   for (const [rawPasserId, pass] of Object.entries(passes)) {
     const target = Number(pass?.target);
@@ -3471,6 +3567,7 @@ function capturePassFlashFromState(state) {
     if (intercepted) {
       passerId = Number(intercepted.player_id);
       receiverId = Number(intercepted.stolen_by);
+      kind = 'steal';
     }
   }
 
@@ -3489,6 +3586,7 @@ function capturePassFlashFromState(state) {
     flashKey: `capture-pass-${passerId}-${receiverId}`,
     passerId,
     receiverId,
+    kind,
     x1: start.x,
     y1: start.y,
     x2: end.x,
@@ -3639,7 +3737,7 @@ function clearPassFlash() {
   passFlash.value = null;
 }
 
-function triggerPassFlash(passerId, receiverId, start, end, distance) {
+function triggerPassFlash(passerId, receiverId, start, end, distance, kind = 'pass') {
   if (passFlashTimeout.value) {
     clearTimeout(passFlashTimeout.value);
     passFlashTimeout.value = null;
@@ -3653,6 +3751,7 @@ function triggerPassFlash(passerId, receiverId, start, end, distance) {
     startedAtMs,
     passerId,
     receiverId,
+    kind,
     x1: start.x,
     y1: start.y,
     x2: end.x,
@@ -3662,6 +3761,20 @@ function triggerPassFlash(passerId, receiverId, start, end, distance) {
     labelX: (start.x + end.x) / 2,
     labelY: (start.y + end.y) / 2 - HEX_RADIUS * 0.6,
   };
+  triggerLiveInteractionHands('pass', [
+    {
+      playerId: Number(passerId),
+      kind: 'pass-release',
+      label: 'Releasing pass',
+      phase: 'release',
+    },
+    {
+      playerId: Number(receiverId),
+      kind: kind === 'steal' ? 'steal' : 'pass-catch',
+      label: kind === 'steal' ? 'Stealing pass' : 'Receiving pass',
+      phase: 'catch',
+    },
+  ], timing.durationMs);
   if (!props.disableTransitions) {
     startPassFlashClock();
   }
@@ -3724,6 +3837,18 @@ function triggerReboundFlash(state, startDelayMs = 0) {
     startedAtMs: reboundFlashNowMs.value + delayMs,
     durationMs: timing.durationMs,
   };
+  const results = state?.last_action_results;
+  const rebound = results?.rebound
+    || (Array.isArray(results?.rebounds) ? results.rebounds[0] : null);
+  const winnerId = Number(rebound?.winner ?? rebound?.winner_player_id ?? rebound?.player_id);
+  if (Number.isFinite(winnerId)) {
+    triggerLiveInteractionHands('rebound', [{
+      playerId: winnerId,
+      kind: 'rebound-catch',
+      label: 'Catching rebound',
+      phase: 'catch',
+    }], timing.durationMs, delayMs);
+  }
   if (!props.disableTransitions) {
     startReboundFlashClock();
   }
@@ -3918,6 +4043,175 @@ const shotBallOutline = computed(() => {
   };
 });
 
+function stopLiveInteractionHandClock() {
+  if (liveInteractionHandRaf.value !== null) {
+    cancelAnimationFrame(liveInteractionHandRaf.value);
+    liveInteractionHandRaf.value = null;
+  }
+}
+
+function clearLiveInteractionHands() {
+  stopLiveInteractionHandClock();
+  liveInteractionHandFlashes.value = [];
+}
+
+function startLiveInteractionHandClock() {
+  if (props.disableTransitions || liveInteractionHandRaf.value !== null) return;
+  const tick = (timestamp) => {
+    liveInteractionHandNowMs.value = timestamp;
+    const active = liveInteractionHandFlashes.value.filter(
+      (flash) => timestamp < flash.startedAtMs + flash.durationMs,
+    );
+    if (active.length !== liveInteractionHandFlashes.value.length) {
+      liveInteractionHandFlashes.value = active;
+    }
+    if (active.length && !props.disableTransitions) {
+      liveInteractionHandRaf.value = requestAnimationFrame(tick);
+    } else {
+      liveInteractionHandRaf.value = null;
+    }
+  };
+  liveInteractionHandRaf.value = requestAnimationFrame(tick);
+}
+
+function triggerLiveInteractionHands(source, entries, actionDurationMs, startDelayMs = 0) {
+  if (props.disableTransitions || !Array.isArray(entries) || !entries.length) return;
+  const now = performance.now();
+  const delayMs = Math.max(0, Number(startDelayMs) || 0);
+  const normalizedEntries = entries.filter(
+    (entry) => Number.isFinite(Number(entry?.playerId)),
+  );
+  if (!normalizedEntries.length) return;
+
+  liveInteractionHandNowMs.value = now;
+  liveInteractionHandFlashes.value = [
+    ...liveInteractionHandFlashes.value.filter((flash) => flash.source !== source),
+    {
+      key: `${source}-${++liveInteractionHandSerial}`,
+      source,
+      startedAtMs: now + delayMs,
+      durationMs: interactionHandDuration(actionDurationMs),
+      entries: normalizedEntries,
+    },
+  ];
+  startLiveInteractionHandClock();
+}
+
+// Contextual hands share the exact progress values used by each ball flight.
+// As a result, the timer-driven board and deterministic GIF frames render the
+// same release/catch poses without serializing any cosmetic-only state.
+const activeInteractionHands = computed(() => {
+  const interactions = [];
+  const addInteraction = (interaction) => {
+    if (!Number.isFinite(Number(interaction?.playerId))) return;
+    if (!(Number(interaction?.opacity) > 0.01)) return;
+    const existingIndex = interactions.findIndex(
+      (entry) => Number(entry.playerId) === Number(interaction.playerId),
+    );
+    if (existingIndex < 0) {
+      interactions.push(interaction);
+      return;
+    }
+    // A player can rebound their own miss while the shot flash is fading.
+    // Render one readable gesture, preferring whichever is most visible.
+    if (Number(interaction.opacity) >= Number(interactions[existingIndex].opacity)) {
+      interactions.splice(existingIndex, 1, interaction);
+    }
+  };
+
+  // Live action durations are distance-gated and can be only a few hundred
+  // milliseconds. Keep the cosmetic hand gesture on its own clock so it stays
+  // readable without slowing the ball flight or self-play loop.
+  if (!props.disableTransitions) {
+    const now = Number(liveInteractionHandNowMs.value || performance.now());
+    for (const flash of liveInteractionHandFlashes.value) {
+      const elapsed = now - Number(flash.startedAtMs);
+      if (elapsed < 0) continue;
+      const progress = Math.max(0, Math.min(1, elapsed / Number(flash.durationMs || 1)));
+      for (const entry of flash.entries) {
+        addInteraction({
+          ...entry,
+          key: `${flash.key}-${entry.phase}-${entry.playerId}`,
+          progress,
+          opacity: interactionHandOpacity(entry.phase, progress),
+        });
+      }
+    }
+    return interactions;
+  }
+
+  const pass = activePassFlash.value;
+  if (pass) {
+    const progress = passFlashProgress.value;
+    addInteraction({
+      key: `pass-release-${pass.flashKey}`,
+      playerId: Number(pass.passerId),
+      kind: 'pass-release',
+      label: 'Releasing pass',
+      progress,
+      opacity: interactionHandOpacity('release', progress),
+    });
+    addInteraction({
+      key: `${pass.kind === 'steal' ? 'steal' : 'pass-catch'}-${pass.flashKey}`,
+      playerId: Number(pass.receiverId),
+      kind: pass.kind === 'steal' ? 'steal' : 'pass-catch',
+      label: pass.kind === 'steal' ? 'Stealing pass' : 'Receiving pass',
+      progress,
+      opacity: interactionHandOpacity('catch', progress),
+    });
+  }
+
+  const shot = activeShotFlash.value;
+  if (shot) {
+    const progress = shotFlashProgress.value;
+    addInteraction({
+      key: `shot-release-${shot.flashKey}`,
+      playerId: Number(shot.shooterId),
+      kind: 'shot-release',
+      label: 'Releasing shot',
+      progress,
+      opacity: interactionHandOpacity('release', progress),
+    });
+  }
+
+  const rebound = reboundResultOverlay.value;
+  if (rebound && showReboundTargetOverlay.value) {
+    const progress = reboundProjectileProgress.value;
+    addInteraction({
+      key: `rebound-catch-${rebound.playerId}`,
+      playerId: Number(rebound.playerId),
+      kind: 'rebound-catch',
+      label: 'Catching rebound',
+      progress,
+      opacity: interactionHandOpacity('catch', progress),
+    });
+  }
+
+  return interactions;
+});
+
+function interactionHandsForPlayer(player) {
+  if (!player) return [];
+  const center = getPlayerRenderCenter(player);
+  return activeInteractionHands.value
+    .filter((interaction) => Number(interaction.playerId) === Number(player.id))
+    .map((interaction) => ({
+      ...interaction,
+      pose: interactionHandPairPose({
+        center,
+        kind: interaction.kind,
+        playerRadius: HEX_RADIUS,
+        progress: interaction.progress,
+      }),
+    }));
+}
+
+function interactionHandPairTransform(handPair) {
+  const pose = handPair?.pose;
+  if (!pose) return '';
+  return `translate(${pose.x} ${pose.y})`;
+}
+
 function stopShotFlashClock() {
   if (shotFlashRaf.value !== null) {
     cancelAnimationFrame(shotFlashRaf.value);
@@ -3995,6 +4289,12 @@ function triggerShotFlash(shooterId, start, end, success, isDunk = false, distan
     durationMs: timing.durationMs,
     distance,
   };
+  triggerLiveInteractionHands('shot', [{
+    playerId: Number(shooterId),
+    kind: 'shot-release',
+    label: 'Releasing shot',
+    phase: 'release',
+  }], timing.durationMs);
   if (!props.disableTransitions) {
     startShotFlashClock();
   }
@@ -4012,6 +4312,7 @@ watch(
   (state) => {
     if (!state) {
       clearPassFlash();
+      clearLiveInteractionHands();
       return;
     }
 
@@ -4028,7 +4329,7 @@ watch(
     for (const [passerId, passResult] of Object.entries(passes)) {
       const targetId = Number(passResult?.target);
       if (passResult && passResult.success && Number.isFinite(targetId)) {
-        passAnimation = { passerId: Number(passerId), receiverId: targetId };
+        passAnimation = { passerId: Number(passerId), receiverId: targetId, kind: 'pass' };
         break;
       }
     }
@@ -4048,6 +4349,7 @@ watch(
         passAnimation = {
           passerId: Number(stealTurnover.player_id),
           receiverId: Number(stealTurnover.stolen_by),
+          kind: 'steal',
         };
       }
     }
@@ -4059,7 +4361,7 @@ watch(
         const turnoverFlag = Boolean(passResult.turnover) || String(passResult.reason || '').toLowerCase() === 'steal';
         const stolenBy = Number(passResult.stolen_by);
         if (turnoverFlag && Number.isFinite(stolenBy)) {
-          passAnimation = { passerId: Number(passerId), receiverId: stolenBy };
+          passAnimation = { passerId: Number(passerId), receiverId: stolenBy, kind: 'steal' };
           break;
         }
       }
@@ -4086,6 +4388,7 @@ watch(
       start,
       end,
       hexDistance(passerPos, receiverPos),
+      passAnimation.kind,
     );
   },
   { immediate: true }
@@ -4098,6 +4401,7 @@ watch(
       stopPassFlashClock();
       stopShotFlashClock();
       stopReboundFlashClock();
+      clearLiveInteractionHands();
       return;
     }
     if (passFlash.value) {
@@ -4108,6 +4412,9 @@ watch(
     }
     if (reboundFlash.value) {
       startReboundFlashClock();
+    }
+    if (liveInteractionHandFlashes.value.length) {
+      startLiveInteractionHandClock();
     }
   }
 );
@@ -4245,10 +4552,12 @@ onBeforeUnmount(() => {
   window.removeEventListener('mousemove', onGlobalMouseMove);
   window.removeEventListener('mouseup', onGlobalMouseUp);
   clearPassFlash();
+  clearLiveInteractionHands();
   clearReboundFlash();
   clearShotFlash();
   clearShotJump();
   clearShotAttemptBanner();
+  clearPlayCallBadge();
 });
 
 </script>
@@ -4869,6 +5178,54 @@ onBeforeUnmount(() => {
                 class="player-uniform-piece"
               />
               <path d="M 0 0.25 L 0 0.56" class="player-uniform-detail" />
+            </g>
+            <!-- Side-mounted jazz hands appear only while this player is
+                 releasing or catching the animated basketball. Keeping the
+                 paths in the player group makes shot-jump transforms carry
+                 the hands with the shooter and keeps SVG/GIF capture alike. -->
+            <g
+              v-for="handPair in interactionHandsForPlayer(player)"
+              :key="handPair.key"
+              :class="['interaction-hand-pair', `interaction-hands-${handPair.kind}`]"
+              :transform="interactionHandPairTransform(handPair)"
+              :opacity="handPair.opacity"
+              :style="{ '--interaction-hand-cuff': playerUniformColor(player) }"
+              aria-hidden="true"
+            >
+              <g
+                class="interaction-hand interaction-hand-left"
+                :transform="`translate(${-handPair.pose.sideOffset} ${handPair.pose.verticalOffset}) rotate(${handPair.pose.leftBaseAngleDeg - handPair.pose.jazzAngleDeg}) scale(${-handPair.pose.handScale} ${handPair.pose.handScale})`"
+              >
+                <path
+                  d="M -0.66 -0.36 L -0.20 -0.36 L -0.20 0.36 L -0.66 0.36 Z"
+                  class="interaction-hand-cuff"
+                />
+                <path
+                  d="M -0.36 -0.36 C -0.22 -0.48 -0.04 -0.61 0.25 -0.91 C 0.36 -1.03 0.55 -0.98 0.60 -0.84 C 0.64 -0.73 0.58 -0.62 0.47 -0.49 L 0.32 -0.31 L 0.88 -0.59 C 1.03 -0.66 1.18 -0.59 1.22 -0.45 C 1.26 -0.32 1.17 -0.20 1.02 -0.16 L 0.52 -0.04 L 1.13 -0.10 C 1.28 -0.11 1.39 0 1.39 0.14 C 1.39 0.29 1.27 0.38 1.13 0.36 L 0.52 0.28 L 1.02 0.38 C 1.17 0.41 1.24 0.55 1.20 0.68 C 1.15 0.82 0.99 0.86 0.86 0.80 L 0.37 0.58 L 0.69 0.78 C 0.81 0.86 0.83 1.01 0.75 1.12 C 0.66 1.24 0.50 1.23 0.39 1.13 L -0.02 0.72 C -0.18 0.57 -0.30 0.42 -0.36 0.27 Z"
+                  class="interaction-hand-silhouette"
+                />
+                <path
+                  d="M 0.12 -0.25 C 0.27 -0.13 0.34 0.03 0.32 0.22 M 0.12 0.38 C 0.25 0.43 0.35 0.51 0.43 0.63"
+                  class="interaction-hand-detail"
+                />
+              </g>
+              <g
+                class="interaction-hand interaction-hand-right"
+                :transform="`translate(${handPair.pose.sideOffset} ${handPair.pose.verticalOffset}) rotate(${handPair.pose.rightBaseAngleDeg + handPair.pose.jazzAngleDeg}) scale(${handPair.pose.handScale})`"
+              >
+                <path
+                  d="M -0.66 -0.36 L -0.20 -0.36 L -0.20 0.36 L -0.66 0.36 Z"
+                  class="interaction-hand-cuff"
+                />
+                <path
+                  d="M -0.36 -0.36 C -0.22 -0.48 -0.04 -0.61 0.25 -0.91 C 0.36 -1.03 0.55 -0.98 0.60 -0.84 C 0.64 -0.73 0.58 -0.62 0.47 -0.49 L 0.32 -0.31 L 0.88 -0.59 C 1.03 -0.66 1.18 -0.59 1.22 -0.45 C 1.26 -0.32 1.17 -0.20 1.02 -0.16 L 0.52 -0.04 L 1.13 -0.10 C 1.28 -0.11 1.39 0 1.39 0.14 C 1.39 0.29 1.27 0.38 1.13 0.36 L 0.52 0.28 L 1.02 0.38 C 1.17 0.41 1.24 0.55 1.20 0.68 C 1.15 0.82 0.99 0.86 0.86 0.80 L 0.37 0.58 L 0.69 0.78 C 0.81 0.86 0.83 1.01 0.75 1.12 C 0.66 1.24 0.50 1.23 0.39 1.13 L -0.02 0.72 C -0.18 0.57 -0.30 0.42 -0.36 0.27 Z"
+                  class="interaction-hand-silhouette"
+                />
+                <path
+                  d="M 0.12 -0.25 C 0.27 -0.13 0.34 0.03 0.32 0.22 M 0.12 0.38 C 0.25 0.43 0.35 0.51 0.43 0.63"
+                  class="interaction-hand-detail"
+                />
+              </g>
             </g>
             <text 
               v-if="minimalChrome && getPlayerDisplayName(player.id)"
@@ -5636,7 +5993,7 @@ onBeforeUnmount(() => {
         ></span>
       </div>
     </section>
-    <div v-if="multiPossessionScoreboard || fastSelfPlayWarming" class="board-banner-area">
+    <div v-if="multiPossessionScoreboard || fastSelfPlayWarming || playCallBadge" class="board-banner-area">
       <div
         v-if="fastSelfPlayWarming"
         class="fast-mode-warming-banner"
@@ -5679,6 +6036,17 @@ onBeforeUnmount(() => {
         <span v-if="visibleShotAttemptBanner.reboundText" class="shot-attempt-rebound">
           {{ visibleShotAttemptBanner.reboundText }}
         </span>
+      </div>
+      <div
+        v-else-if="playCallBadge"
+        :key="playCallBadge.key"
+        class="play-call-banner"
+        :class="playCallBadge.team"
+        role="status"
+        aria-live="polite"
+      >
+        <span class="play-call-team">{{ playCallBadge.teamLabel }}</span>
+        <span>{{ playCallBadge.name }}</span>
       </div>
     </div>
     <div class="shot-clock-wrapper" v-if="!hideClockOverlays && !hasShotCounts && !multiPossessionScoreboard">
@@ -5849,6 +6217,49 @@ onBeforeUnmount(() => {
   pointer-events: none;
 }
 
+.play-call-banner {
+  position: relative;
+  z-index: 13;
+  align-self: center;
+  grid-row: 2;
+  min-width: 11.5rem;
+  margin: 0;
+  padding: 0.3rem 1rem 0.36rem;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.97);
+  box-shadow: 0 0 12px rgba(251, 191, 36, 0.62);
+  color: #fbbf24;
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 0.55rem;
+  font-size: 0.84rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  line-height: 1;
+  text-align: center;
+  text-transform: uppercase;
+  animation: shot-attempt-banner-enter 0.16s ease-out both;
+  pointer-events: none;
+}
+
+.play-call-banner.player {
+  color: #60a5fa;
+  box-shadow: 0 0 12px rgba(96, 165, 250, 0.62);
+}
+
+.play-call-banner.ai {
+  color: #fb7185;
+  box-shadow: 0 0 12px rgba(251, 113, 133, 0.62);
+}
+
+.play-call-team {
+  color: rgba(226, 232, 240, 0.78);
+  font-size: 0.65rem;
+  letter-spacing: 0.11em;
+}
+
 .clearance-required-banner {
   position: relative;
   z-index: 13;
@@ -5921,7 +6332,8 @@ onBeforeUnmount(() => {
 
 /* Export supplies explicit animation progress. Do not capture the first,
    almost-transparent instant of the unrelated CSS banner entrance. */
-.no-move-transitions .shot-attempt-banner {
+.no-move-transitions .shot-attempt-banner,
+.no-move-transitions .play-call-banner {
   animation: none;
 }
 
@@ -6502,6 +6914,67 @@ onBeforeUnmount(() => {
   stroke-linejoin: round;
   stroke-linecap: round;
 }
+.interaction-hand-pair {
+  pointer-events: none;
+  filter: drop-shadow(0 0 2px rgba(2, 6, 23, 0.92));
+  transition: transform 0.26s ease, opacity 0.08s linear;
+}
+.interaction-hands-steal,
+.interaction-hands-rebound-catch {
+  filter:
+    drop-shadow(0 0 2px rgba(2, 6, 23, 0.92))
+    drop-shadow(0 0 3px rgba(251, 191, 36, 0.72));
+}
+.interaction-hand-cuff {
+  fill: var(--interaction-hand-cuff, #64748b);
+  stroke: rgba(248, 250, 252, 0.96);
+  stroke-width: 0.09;
+  stroke-linejoin: round;
+}
+.interaction-hand-palm {
+  fill: #fed7aa;
+  stroke: #7c2d12;
+  stroke-width: 0.10;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+.interaction-hand-silhouette {
+  fill: #fed7aa;
+  stroke: #7c2d12;
+  stroke-width: 0.10;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.interaction-hand-finger-outline,
+.interaction-hand-finger,
+.interaction-hand-thumb-outline,
+.interaction-hand-thumb {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.interaction-hand-finger-outline,
+.interaction-hand-thumb-outline {
+  stroke: #7c2d12;
+  stroke-width: 0.32;
+}
+.interaction-hand-finger,
+.interaction-hand-thumb {
+  stroke: #fed7aa;
+  stroke-width: 0.20;
+}
+.interaction-hand-thumb-outline {
+  stroke-width: 0.38;
+}
+.interaction-hand-thumb {
+  stroke-width: 0.24;
+}
+.interaction-hand-detail {
+  fill: none;
+  stroke: #9a3412;
+  stroke-width: 0.065;
+  stroke-linecap: round;
+}
 .check-ball-glyph,
 .held-basketball,
 .flight-basketball,
@@ -6861,6 +7334,7 @@ onBeforeUnmount(() => {
 .no-move-transitions .player-defense,
 .no-move-transitions .player-ai,
 .no-move-transitions .player-uniform-glyph,
+.no-move-transitions .interaction-hand-pair,
 .no-move-transitions .player-name-text,
 .no-move-transitions .player-index-text,
 .no-move-transitions .player-text,

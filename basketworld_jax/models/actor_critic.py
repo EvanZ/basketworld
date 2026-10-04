@@ -37,6 +37,7 @@ class ActorCriticSpec:
     pass_action_end: int = PASS_ACTION_END
     intent_embedding_enabled: bool = False
     intent_embedding_dim: int = 16
+    intent_conditioning_scale: float = 1.0
     num_intents: int = 8
     intent_selector_enabled: bool = False
     intent_selector_hidden_dim: int = 64
@@ -68,6 +69,7 @@ def build_actor_critic_spec(
     pass_action_end: int = PASS_ACTION_END,
     intent_embedding_enabled: bool = False,
     intent_embedding_dim: int = 16,
+    intent_conditioning_scale: float = 1.0,
     num_intents: int = 8,
     intent_selector_enabled: bool = False,
     intent_selector_hidden_dim: int = 64,
@@ -98,6 +100,7 @@ def build_actor_critic_spec(
         raise ValueError("Pointer-targeted JAX action head currently requires --policy-model attention.")
     intent_embedding_enabled = bool(intent_embedding_enabled)
     intent_embedding_dim = int(intent_embedding_dim)
+    intent_conditioning_scale = float(intent_conditioning_scale)
     num_intents = int(num_intents)
     intent_selector_enabled = bool(intent_selector_enabled)
     intent_selector_hidden_dim = int(intent_selector_hidden_dim)
@@ -107,6 +110,8 @@ def build_actor_critic_spec(
         raise ValueError("JAX intent selector requires --policy-model attention.")
     if intent_embedding_enabled and intent_embedding_dim <= 0:
         raise ValueError("--intent-embedding-dim must be >= 1.")
+    if intent_conditioning_scale < 0.0:
+        raise ValueError("--intent-conditioning-scale must be >= 0.")
     if intent_selector_enabled and intent_selector_hidden_dim <= 0:
         raise ValueError("--intent-selector-hidden-dim must be >= 1.")
     if num_intents <= 0:
@@ -157,6 +162,7 @@ def build_actor_critic_spec(
         pass_action_end=int(pass_action_end),
         intent_embedding_enabled=bool(intent_embedding_enabled),
         intent_embedding_dim=int(intent_embedding_dim),
+        intent_conditioning_scale=float(intent_conditioning_scale),
         num_intents=int(num_intents),
         intent_selector_enabled=bool(intent_selector_enabled),
         intent_selector_hidden_dim=int(intent_selector_hidden_dim),
@@ -367,7 +373,15 @@ def build_actor_critic_module(spec: ActorCriticSpec):
             is_offense = role_flag[:, 0:1] > 0.0
             delta = jnp.where(is_offense, offense_delta, defense_delta)
             gate = jnp.clip(intent_gate, 0.0, 1.0)
-            return token_hidden + (gate[:, None, None] * delta[:, None, :])
+            conditioning_scale = jnp.asarray(
+                float(spec.intent_conditioning_scale),
+                dtype=jnp.float32,
+            )
+            return token_hidden + (
+                gate[:, None, None]
+                * conditioning_scale
+                * delta[:, None, :]
+            )
 
         def _select_training_player_tokens(self, player_tokens, role_flag):
             if int(spec.token_player_count) == int(spec.training_player_count):

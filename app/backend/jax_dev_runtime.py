@@ -824,7 +824,9 @@ class JaxDevRuntime:
         # it must never reassign visual or policy ownership.  This is done in
         # the runtime, not only the setup form, because a policy swap can also
         # refresh the kernel's static environment configuration.
-        if bool(getattr(self.raw_model.spec, "multi_possession_features", False)):
+        if self.multi_possession_enabled or bool(
+            getattr(self.raw_model.spec, "multi_possession_features", False)
+        ):
             self.user_team = Team.OFFENSE
             self.display_env.training_team = Team.OFFENSE
 
@@ -1616,6 +1618,11 @@ class JaxDevRuntime:
         )
         state_payload["actions_taken"] = actions_taken
         state_payload["actions_taken_meta"] = actions_taken_meta
+        # Keep the selector event beside the state that it produced.  The UI
+        # renders from its state history, so relying only on the response-level
+        # field makes short-lived play calls easy to miss (and impossible to
+        # recover during replay/capture).
+        state_payload["selector_transition"] = copy.deepcopy(selector_transition)
         if active_replay_session_id:
             state_payload["replay_session_id"] = active_replay_session_id
         self._append_episode_state(game_state, state_payload)
@@ -1704,6 +1711,9 @@ class JaxDevRuntime:
             include_state_values=True,
             compact=fast_mode,
             include_episode_metadata=fast_mode,
+        )
+        state_payload["selector_transition"] = copy.deepcopy(
+            self._last_selector_transition
         )
         state_payload["replay_session_id"] = replay_session_id
         self._append_episode_state(game_state, state_payload)
@@ -2427,7 +2437,7 @@ class JaxDevRuntime:
                     ),
                 }
             )
-        if _as_bool(out.possession_ended[0]):
+        if _as_bool(getattr(out, "possession_ended", np.asarray([0]))[0]):
             reason = _as_int(out.possession_end_reason[0])
             reason_map = {
                 POSSESSION_END_MADE_BASKET: "made_basket",
@@ -2454,7 +2464,7 @@ class JaxDevRuntime:
                     "awaiting_check": bool(next_phase == GAME_PHASE_AWAITING_CHECK),
                 }
             )
-        if _as_bool(out.clearance_event[0]):
+        if _as_bool(getattr(out, "clearance_event", np.asarray([0]))[0]):
             results["clearance"] = {
                 "achieved": True,
                 "elapsed_steps": _as_int(out.clearance_elapsed_steps[0]),
@@ -3284,6 +3294,16 @@ class JaxDevRuntime:
             "clearance_achieved": _field0(self.state, "clearance_achieved"),
             "offense_lane_steps": _field0(self.state, "offense_lane_steps"),
             "defense_lane_steps": _field0(self.state, "defense_lane_steps"),
+            # Play-call state is only a handful of scalars. Keep it in the
+            # compact payload so Fast Mode can show live selector changes
+            # without restoring policy probabilities or inspector tensors.
+            "intent_active": _field0(self.state, "intent_active"),
+            "intent_index": _field0(self.state, "intent_index"),
+            "intent_age": _field0(self.state, "intent_age"),
+            "intent_commitment_remaining": _field0(
+                self.state,
+                "intent_commitment_remaining",
+            ),
             # This is a live board value, not episode metadata.  It changes as
             # players move between shot locations or gain/lose defender
             # pressure, so Fast Mode must refresh it on every step.
@@ -3343,6 +3363,12 @@ class JaxDevRuntime:
         )
         game_phase = int(np.asarray(host["game_phase"]).reshape(-1)[0])
         clearance_achieved = bool(np.asarray(host["clearance_achieved"]).reshape(-1)[0])
+        intent_active = bool(np.asarray(host["intent_active"]).reshape(-1)[0])
+        intent_index = int(np.asarray(host["intent_index"]).reshape(-1)[0])
+        intent_age = int(np.asarray(host["intent_age"]).reshape(-1)[0])
+        intent_commitment_remaining = int(
+            np.asarray(host["intent_commitment_remaining"]).reshape(-1)[0]
+        )
         overtime_round = int(np.asarray(host["overtime_round"]).reshape(-1)[0])
         overtime_possessions_completed = int(
             np.asarray(host["overtime_possessions_completed"]).reshape(-1)[0]
@@ -3357,6 +3383,7 @@ class JaxDevRuntime:
             np.asarray(host["episode_overtime_round_cap"]).reshape(-1)[0]
         )
         clearance_zone_cells = self._clearance_zone_cells()
+        play_map = self._play_name_map(game_state)
         inbound_reason_map = {
             POSSESSION_END_MADE_BASKET: "made_basket",
             POSSESSION_END_DEFENSIVE_REBOUND: "defensive_rebound",
@@ -3496,6 +3523,22 @@ class JaxDevRuntime:
                 and game_phase == GAME_PHASE_LIVE
             ),
             "clearance_zone_cells": clearance_zone_cells,
+            "enable_intent_learning": bool(self.display_env.enable_intent_learning),
+            "num_intents": int(self.display_env.num_intents or 0),
+            "play_name_map": play_map,
+            "intent_active_current": intent_active,
+            "intent_index_current": intent_index,
+            "current_play_name": lookup_play_name(play_map, intent_index),
+            "intent_age": intent_age,
+            "intent_commitment_remaining": intent_commitment_remaining,
+            "selector_segment_index_current": int(
+                getattr(game_state, "selector_segment_index", 0) or 0
+            ),
+            "selector_last_boundary_reason": getattr(
+                game_state,
+                "selector_last_boundary_reason",
+                None,
+            ),
             "last_action_results": copy.deepcopy(self.last_action_results),
             "basket_position": tuple(int(v) for v in np.asarray(self.static.basket_position).tolist()),
             "court_width": int(self.display_env.court_width),
@@ -3558,6 +3601,9 @@ class JaxDevRuntime:
         compact: bool = False,
         include_episode_metadata: bool = False,
     ) -> dict[str, Any]:
+        self._canonicalize_multi_possession_ownership()
+        if self.multi_possession_enabled:
+            game_state.user_team = self.user_team
         if compact:
             return self._fast_game_state(
                 game_state,
@@ -3581,6 +3627,24 @@ class JaxDevRuntime:
             self.jax.device_get(_field0(self.state, "rebound_skill_specialist")),
             dtype=np.float32,
         )
+        shooting_skills = self.jax.device_get(
+            {
+                "layup": _field0(self.state, "layup_pct"),
+                "three_pt": _field0(self.state, "three_pt_pct"),
+                "dunk": _field0(self.state, "dunk_pct"),
+            }
+        )
+        layup_pct = np.asarray(shooting_skills["layup"], dtype=np.float32)
+        three_pt_pct = np.asarray(shooting_skills["three_pt"], dtype=np.float32)
+        dunk_pct = np.asarray(shooting_skills["dunk"], dtype=np.float32)
+        player_shooting_skills = {
+            str(pid): {
+                "layup": float(layup_pct[pid]),
+                "three_pt": float(three_pt_pct[pid]),
+                "dunk": float(dunk_pct[pid]),
+            }
+            for pid in range(self.n_players)
+        }
         player_rebound_skills = {str(pid): float(rebound_skill[int(pid)]) for pid in range(int(rebound_skill.shape[0]))}
         player_rebound_skill_specialists = {
             str(pid): bool(rebound_skill_specialist[int(pid)] > 0.0)
@@ -3863,6 +3927,7 @@ class JaxDevRuntime:
             "obs_tokens_version": 1,
             "last_action_results": copy.deepcopy(self.last_action_results),
             "episode_rebounds": copy.deepcopy(self.episode_rebounds),
+            "player_shooting_skills": player_shooting_skills,
             "player_rebound_skills": player_rebound_skills,
             "player_rebound_skill_specialists": player_rebound_skill_specialists,
             # Preserve legacy field names for the board, while making them the

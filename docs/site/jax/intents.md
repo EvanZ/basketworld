@@ -90,9 +90,13 @@ rollout observations, then applies:
 3. multi-head self-attention with dropout;
 4. an intent classifier.
 
-The discriminator predicts the active intent from rollout states. Alternative
-flat encoders can combine truncated observations, actions, and event features,
-but `set_step` matches the entity structure of the current attention policy.
+The discriminator predicts the active intent from the aligned post-transition
+state produced by intent-conditioned behavior. The production `set_step` path
+is deliberately state-only: it does not receive selected actions, pass/shot or
+outcome events, or the intent ID itself. This keeps play discovery focused on
+the spatial and basketball-state consequences of coordinated behavior rather
+than immediate action signatures. The set encoder matches the entity structure
+of the current attention policy.
 
 Training uses active intent samples, a train/holdout split, cross-entropy, and
 multiple updates per rollout. Diagnostics include loss, top-1 accuracy,

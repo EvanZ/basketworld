@@ -61,6 +61,7 @@ esac
 # The possession quota is per team. Training begins with short games and
 # linearly grows to the final quota; completed games keep the quota they had at
 # reset. A zero overtime cap follows each episode's active possession limit.
+# Play discovery stays state-only: classify aligned post-action states, never action/event labels.
 exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --run-train-loop \
   --enable-multi-possession \
@@ -151,6 +152,7 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --action-head-mode pointer_targeted \
   --intent-embedding-enabled \
   --intent-embedding-dim 16 \
+  --intent-conditioning-scale 5.0 \
   --enable-intent-learning true \
   --enable-defense-intent-learning false \
   --defense-intent-null-prob 1.0 \
@@ -191,6 +193,9 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --intent-disc-current-policy-only true \
   --intent-disc-include-shot-clock false \
   --intent-disc-include-pressure-exposure false \
+  --intent-policy-sensitivity-enabled true \
+  --intent-policy-sensitivity-sample-states 64 \
+  --intent-policy-sensitivity-log-every-rollouts 10 \
   --disc-eval-batch-output true \
   --intent-sample-dump-size 4096 \
   --task-reward-scale-start 0.1 \

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -12,14 +13,21 @@ from basketworld_jax.env import (
     TOKEN_OBS_ROLE_FLAG_DIM,
 )
 from basketworld_jax.env.minimal import (
+    GAME_PHASE_AWAITING_CHECK,
+    GAME_PHASE_LIVE,
     ReboundDiagnosticTotals,
     build_rebound_diagnostics,
 )
 from basketworld_jax.intent.discriminator import (
     IntentDiscriminatorSpec,
+    build_intent_discriminator_update_runner,
+    build_intent_policy_sensitivity_runner,
+    build_intent_sample_dump,
     build_intent_step_features_from_rollout,
+    build_segment_grouped_holdout_weights,
+    init_intent_discriminator_params,
 )
-from basketworld_jax.models import ActorCriticSpec
+from basketworld_jax.models import ActorCriticSpec, init_actor_critic_params
 from basketworld_jax.train.types import (
     DeployEvalOutput,
     DeployEvalTotals,
@@ -28,6 +36,7 @@ from basketworld_jax.train.types import (
     TrainerConfig,
     TrajectoryBatch,
     build_ppo_batch,
+    compute_intent_segment_advantages,
     limit_selector_batch_samples,
 )
 from basketworld_jax.train.main import (
@@ -50,6 +59,7 @@ from basketworld_jax.train.main import (
     _multi_possession_curriculum_enabled,
     _multi_possession_limit_for_update,
     _selector_learning_rate_for_args,
+    _summarize_intent_intrinsic_advantages,
     _task_reward_scale_for_update,
     build_trainer_config,
     parse_args,
@@ -61,6 +71,7 @@ from basketworld_jax.train.runtime import (
     _apply_selector_update_param_scope,
     _mask_selector_update_grads,
     _merge_selector_update_params,
+    _renew_unselected_intent_timeout,
     _selector_segment_application_masks,
     summarize_deploy_eval_outputs,
     summarize_learner_rebound_metrics,
@@ -1193,7 +1204,7 @@ def test_intent_discriminator_uses_training_mask_for_active_samples():
     )
     training_mask = jnp.asarray([[1, 0], [0, 1], [1, 1]], dtype=jnp.float32)
 
-    _, _, active_mask = build_intent_step_features_from_rollout(
+    _, _, active_mask, _, _ = build_intent_step_features_from_rollout(
         rollout,
         spec,
         jnp,
@@ -1258,6 +1269,422 @@ def test_completed_episode_ppo_weights_sum_episode_losses():
     np.testing.assert_array_equal(np.asarray(ppo_batch.active_mask), [1.0, 1.0, 0.0, 0.0])
     np.testing.assert_array_equal(np.asarray(ppo_batch.loss_weights), [1.0, 1.0, 0.0, 0.0])
     np.testing.assert_array_equal(np.asarray(ppo_batch.loss_denominator), [1.0, 1.0, 1.0, 1.0])
+
+
+def test_intent_segment_advantages_stop_at_intent_role_and_possession_boundaries():
+    jax = pytest.importorskip("jax")
+    jnp = jax.numpy
+
+    time_steps = 6
+    zeros = jnp.zeros((time_steps, 1), dtype=jnp.float32)
+    trajectory_data = {field: zeros for field in TrajectoryBatch._fields}
+    trajectory_data.update(
+        {
+            "active_mask": jnp.ones((time_steps, 1), dtype=jnp.float32),
+            "policy_intent_index": jnp.asarray([[0], [0], [1], [1], [1], [2]], dtype=jnp.int32),
+            "policy_intent_gate": jnp.ones((time_steps, 1), dtype=jnp.float32),
+            "training_role": jnp.asarray([[1], [1], [1], [-1], [1], [1]], dtype=jnp.float32),
+            "selector_applied": jnp.asarray([[1], [0], [1], [0], [0], [1]], dtype=jnp.int8),
+            "possession_ended": jnp.asarray([[0], [0], [0], [0], [1], [0]], dtype=jnp.int8),
+            "dones": jnp.zeros((time_steps, 1), dtype=jnp.int8),
+        }
+    )
+    trajectory = TrajectoryBatch(**trajectory_data)
+
+    advantages, active, continuation = compute_intent_segment_advantages(
+        trajectory,
+        jnp.ones((time_steps, 1), dtype=jnp.float32),
+        jnp.ones((time_steps, 1), dtype=jnp.float32),
+        gamma=1.0,
+        jax=jax,
+        jnp=jnp,
+    )
+
+    np.testing.assert_array_equal(np.asarray(active[:, 0]), [1, 1, 1, 0, 1, 1])
+    np.testing.assert_array_equal(np.asarray(continuation[:, 0]), [1, 0, 0, 0, 0, 0])
+    np.testing.assert_allclose(np.asarray(advantages[:, 0]), [2, 1, 1, 0, 1, 1])
+
+
+def test_intent_bonus_does_not_change_game_value_returns():
+    jax = pytest.importorskip("jax")
+    jnp = jax.numpy
+
+    time_steps = 2
+    player_count = 1
+    zeros = jnp.zeros((time_steps, 1), dtype=jnp.float32)
+    trajectory_data = {field: zeros for field in TrajectoryBatch._fields}
+    trajectory_data.update(
+        {
+            "active_mask": jnp.ones((time_steps, 1), dtype=jnp.float32),
+            "flat_obs": jnp.zeros((time_steps, 1, 3), dtype=jnp.float32),
+            "policy_intent_index": jnp.zeros((time_steps, 1), dtype=jnp.int32),
+            "policy_intent_gate": jnp.ones((time_steps, 1), dtype=jnp.float32),
+            "training_role": jnp.ones((time_steps, 1), dtype=jnp.float32),
+            "action_mask": jnp.ones((time_steps, 1, player_count, 2), dtype=jnp.float32),
+            "actions": jnp.zeros((time_steps, 1, player_count), dtype=jnp.int32),
+            "selected_log_probs": jnp.zeros((time_steps, 1, player_count), dtype=jnp.float32),
+            "values": zeros,
+            "rewards": jnp.asarray([[1.0], [2.0]], dtype=jnp.float32),
+            "possession_ended": jnp.asarray([[1], [0]], dtype=jnp.int8),
+            "dones": jnp.asarray([[0], [1]], dtype=jnp.int8),
+        }
+    )
+    rollout = RolloutOutput(
+        trajectory=TrajectoryBatch(**trajectory_data),
+        final_state=None,
+        bootstrap_values=jnp.zeros((1,), dtype=jnp.float32),
+        final_selector_values=jnp.zeros((1,), dtype=jnp.float32),
+        final_flat_obs=jnp.zeros((1, 3), dtype=jnp.float32),
+        final_action_mask=None,
+    )
+    config = TrainerConfig(
+        kernel_batch_size=1,
+        rollout_horizon=time_steps,
+        num_updates=1,
+        gamma=1.0,
+        gae_lambda=1.0,
+        ppo_clip_range=0.2,
+        value_coef=0.5,
+        entropy_coef=0.0,
+        learning_rate=1e-3,
+        policy_update_epochs=1,
+    )
+
+    task_only = build_ppo_batch(rollout, config, jax, jnp)
+    with_intent = build_ppo_batch(
+        rollout,
+        config,
+        jax,
+        jnp,
+        intent_bonus=jnp.full((time_steps, 1), 100.0, dtype=jnp.float32),
+    )
+
+    np.testing.assert_allclose(np.asarray(task_only.returns), [3.0, 2.0])
+    np.testing.assert_allclose(np.asarray(with_intent.returns), np.asarray(task_only.returns))
+    np.testing.assert_allclose(
+        np.asarray(with_intent.task_advantages),
+        np.asarray(task_only.task_advantages),
+    )
+    np.testing.assert_allclose(
+        np.asarray(with_intent.intent_advantages),
+        [100.0, 100.0],
+    )
+    intrinsic_metrics = _summarize_intent_intrinsic_advantages(
+        [with_intent],
+        [rollout],
+        jax=jax,
+    )
+    assert intrinsic_metrics["intent_intrinsic_advantage_active_count"] == 2.0
+    assert intrinsic_metrics["intent_intrinsic_boundary_count"] == 2.0
+    assert intrinsic_metrics["intent_intrinsic_boundary_possession_count"] == 1.0
+    assert intrinsic_metrics["intent_intrinsic_boundary_game_count"] == 1.0
+    assert intrinsic_metrics["intent_intrinsic_advantage_magnitude_fraction"] > 0.9
+
+
+def test_set_step_discriminator_is_state_only_and_uses_aligned_post_action_state():
+    jax = pytest.importorskip("jax")
+    jnp = jax.numpy
+
+    time_steps = 3
+    player_count = 1
+    token_count = 2
+    token_dim = 2
+    global_dim = 1
+    action_dim = 3
+    flat_obs = jnp.asarray(
+        [
+            [[0, 1, 2, 3, 10, 1]],
+            [[4, 5, 6, 7, 11, 1]],
+            [[8, 9, 10, 11, 12, 1]],
+        ],
+        dtype=jnp.float32,
+    )
+    zeros = jnp.zeros((time_steps, 1), dtype=jnp.float32)
+    trajectory_data = {field: zeros for field in TrajectoryBatch._fields}
+    trajectory_data.update(
+        {
+            "active_mask": jnp.ones((time_steps, 1), dtype=jnp.float32),
+            "flat_obs": flat_obs,
+            "policy_intent_index": jnp.ones((time_steps, 1), dtype=jnp.int32),
+            "policy_intent_gate": jnp.ones((time_steps, 1), dtype=jnp.float32),
+            "training_role": jnp.ones((time_steps, 1), dtype=jnp.float32),
+            "intent_age": jnp.asarray([[0], [1], [2]], dtype=jnp.int32),
+            "selector_applied": jnp.asarray([[1], [0], [0]], dtype=jnp.int8),
+            "actions": jnp.asarray([[[2]], [[1]], [[0]]], dtype=jnp.int32),
+            "pass_attempts": jnp.asarray([[1], [0], [1]], dtype=jnp.float32),
+            "shot_attempts": jnp.asarray([[0], [1], [0]], dtype=jnp.float32),
+            "shot_makes": jnp.asarray([[0], [1], [0]], dtype=jnp.float32),
+            "dones": jnp.asarray([[0], [0], [1]], dtype=jnp.int8),
+            "possession_ended": jnp.asarray([[0], [1], [0]], dtype=jnp.int8),
+        }
+    )
+    rollout = RolloutOutput(
+        trajectory=TrajectoryBatch(**trajectory_data),
+        final_state=None,
+        bootstrap_values=jnp.zeros((1,), dtype=jnp.float32),
+        final_selector_values=jnp.zeros((1,), dtype=jnp.float32),
+        final_flat_obs=jnp.asarray([[12, 13, 14, 15, 13, 1]], dtype=jnp.float32),
+        final_action_mask=None,
+    )
+    spec = IntentDiscriminatorSpec(
+        encoder_type="set_step",
+        input_dim=1,
+        hidden_dim=8,
+        num_intents=2,
+        learning_rate=3e-4,
+        batch_size=8,
+        updates_per_rollout=1,
+        beta_target=0.01,
+        warmup_updates=0,
+        ramp_updates=1,
+        warmup_steps=0,
+        ramp_steps=1,
+        bonus_clip=2.0,
+        eval_holdout_fraction=0.25,
+        dropout=0.0,
+        max_obs_dim=6,
+        action_dim_per_player=action_dim,
+        training_player_count=player_count,
+        token_player_count=token_count,
+        token_dim=token_dim,
+        global_dim=global_dim,
+        set_heads=1,
+        set_cls_tokens=1,
+        include_shot_clock=True,
+        include_pressure_exposure=True,
+    )
+
+    features, labels, active, segment_ids, intent_age = build_intent_step_features_from_rollout(
+        rollout,
+        spec,
+        jnp,
+        training_mask=jnp.ones((time_steps, 1), dtype=jnp.float32),
+    )
+
+    np.testing.assert_array_equal(np.asarray(labels[:, 0]), [1, 1, 1])
+    np.testing.assert_array_equal(np.asarray(active[:, 0]), [True, False, False])
+    np.testing.assert_array_equal(np.asarray(segment_ids[:, 0]), [1, 1, 2])
+    np.testing.assert_array_equal(np.asarray(intent_age[:, 0]), [0, 1, 2])
+    assert set(features) == {"players", "globals", "role_flag"}
+    np.testing.assert_array_equal(np.asarray(features["players"][0, 0]), [[4, 5], [6, 7]])
+    np.testing.assert_array_equal(np.asarray(features["players"][2, 0]), [[12, 13], [14, 15]])
+
+    altered_trajectory = rollout.trajectory._replace(
+        actions=jnp.asarray([[[0]], [[2]], [[1]]], dtype=jnp.int32),
+        pass_attempts=jnp.asarray([[0], [1], [0]], dtype=jnp.float32),
+        shot_attempts=jnp.asarray([[1], [0], [1]], dtype=jnp.float32),
+        shot_makes=jnp.asarray([[1], [0], [1]], dtype=jnp.float32),
+    )
+    altered_features, _, altered_active, _, _ = build_intent_step_features_from_rollout(
+        rollout._replace(trajectory=altered_trajectory),
+        spec,
+        jnp,
+        training_mask=jnp.ones((time_steps, 1), dtype=jnp.float32),
+    )
+    for key in features:
+        np.testing.assert_array_equal(np.asarray(features[key]), np.asarray(altered_features[key]))
+    np.testing.assert_array_equal(np.asarray(active), np.asarray(altered_active))
+    params = init_intent_discriminator_params(jax, jnp, spec, seed=4)
+    payload = build_intent_sample_dump(
+        params=params,
+        features=features,
+        labels=labels,
+        active_mask=active,
+        segment_ids=segment_ids,
+        intent_age=intent_age,
+        bonus=jnp.zeros_like(active, dtype=jnp.float32),
+        rollout=rollout,
+        spec=spec,
+        jax=jax,
+        jnp=jnp,
+        update_index=1,
+        max_samples=8,
+    )
+    assert payload["intent_segment_id"].shape == (1,)
+    assert "next_players" not in payload
+    assert "action_tokens" not in payload
+    assert "events" not in payload
+    assert payload["summary_action_prob_by_intent"].shape == (2, action_dim)
+    assert payload["summary_intent_active_count"].tolist() == [0, 1]
+
+
+def test_intent_discriminator_holdout_keeps_segments_together():
+    jax = pytest.importorskip("jax")
+    jnp = jax.numpy
+
+    active = jnp.ones((6,), dtype=jnp.float32)
+    segment_ids = jnp.asarray([1, 1, 2, 2, 3, 3], dtype=jnp.int32)
+    train, holdout = build_segment_grouped_holdout_weights(
+        active,
+        segment_ids,
+        jax.random.PRNGKey(91),
+        holdout_fraction=0.5,
+        jax=jax,
+        jnp=jnp,
+    )
+    train = np.asarray(train)
+    holdout = np.asarray(holdout)
+
+    np.testing.assert_array_equal(train + holdout, np.ones((6,), dtype=np.float32))
+    for segment_id in (1, 2, 3):
+        rows = np.asarray(segment_ids) == segment_id
+        assert np.unique(train[rows]).size == 1
+        assert np.unique(holdout[rows]).size == 1
+
+
+def test_intent_policy_sensitivity_runner_compares_all_intents():
+    jax = pytest.importorskip("jax")
+    jnp = jax.numpy
+    spec = ActorCriticSpec(
+        flat_obs_dim=9,
+        training_player_count=1,
+        action_dim_per_player=14,
+        total_action_dim=14,
+        hidden_dims=(8,),
+        model_type="attention",
+        token_player_count=2,
+        token_dim=3,
+        global_dim=2,
+        attention_embed_dim=8,
+        attention_num_heads=2,
+        attention_token_mlp_dim=8,
+        attention_num_cls_tokens=2,
+        intent_embedding_enabled=True,
+        intent_embedding_dim=4,
+        num_intents=4,
+    )
+    params = init_actor_critic_params(jax, jnp, spec, seed=17)
+    runner = build_intent_policy_sensitivity_runner(jax, jnp, spec, sample_count=3)
+    flat_obs = jnp.asarray(
+        [
+            [[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 1.0, 0.5, 1.0]],
+            [[0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.8, 0.4, 1.0]],
+        ],
+        dtype=jnp.float32,
+    )
+    action_mask = jnp.ones((2, 1, 1, 14), dtype=jnp.float32)
+    metrics = runner(
+        params,
+        flat_obs,
+        action_mask,
+        jnp.ones((2, 1), dtype=jnp.bool_),
+    )
+    metrics = {key: float(np.asarray(value)) for key, value in metrics.items()}
+
+    assert metrics["intent_policy_sensitivity_sample_states"] == 2.0
+    assert metrics["intent_policy_sensitivity_pairs"] == 6.0
+    assert metrics["intent_policy_sensitivity_tv_mean"] > 0.0
+    assert 0.0 <= metrics["intent_policy_sensitivity_argmax_disagreement"] <= 1.0
+
+    stronger_runner = build_intent_policy_sensitivity_runner(
+        jax,
+        jnp,
+        replace(spec, intent_conditioning_scale=5.0),
+        sample_count=3,
+    )
+    stronger_metrics = stronger_runner(
+        params,
+        flat_obs,
+        action_mask,
+        jnp.ones((2, 1), dtype=jnp.bool_),
+    )
+    assert float(stronger_metrics["intent_policy_sensitivity_tv_mean"]) > (
+        2.0 * metrics["intent_policy_sensitivity_tv_mean"]
+    )
+
+
+def test_set_step_discriminator_learns_synthetic_state_signal_only():
+    jax = pytest.importorskip("jax")
+    jnp = jax.numpy
+    time_steps = 8
+    batch_size = 4
+    labels = (
+        jnp.arange(time_steps * batch_size, dtype=jnp.int32).reshape(time_steps, batch_size)
+        % 2
+    )
+    players = jnp.zeros((time_steps, batch_size, 2, 2), dtype=jnp.float32)
+    players = players.at[:, :, 0, 0].set(labels.astype(jnp.float32))
+    features = {
+        "players": players,
+        "globals": jnp.zeros((time_steps, batch_size, 1), dtype=jnp.float32),
+        "role_flag": jnp.ones((time_steps, batch_size, 1), dtype=jnp.float32),
+    }
+    spec = IntentDiscriminatorSpec(
+        encoder_type="set_step",
+        input_dim=1,
+        hidden_dim=16,
+        num_intents=2,
+        learning_rate=1e-2,
+        batch_size=32,
+        updates_per_rollout=8,
+        beta_target=0.01,
+        warmup_updates=0,
+        ramp_updates=1,
+        warmup_steps=0,
+        ramp_steps=1,
+        bonus_clip=2.0,
+        eval_holdout_fraction=0.25,
+        dropout=0.0,
+        max_obs_dim=6,
+        action_dim_per_player=3,
+        training_player_count=1,
+        token_player_count=2,
+        token_dim=2,
+        global_dim=1,
+        set_heads=1,
+        set_cls_tokens=1,
+        include_shot_clock=True,
+        include_pressure_exposure=True,
+    )
+    params = init_intent_discriminator_params(jax, jnp, spec, seed=8)
+    runner, transform = build_intent_discriminator_update_runner(jax, jnp, spec)
+    opt_state = transform.init(params)
+    active = jnp.ones((time_steps, batch_size), dtype=jnp.float32)
+    segment_ids = jnp.arange(time_steps * batch_size, dtype=jnp.int32).reshape(
+        time_steps,
+        batch_size,
+    )
+    intent_age = jnp.ones((time_steps, batch_size), dtype=jnp.int32)
+    split_key = jax.random.PRNGKey(23)
+    for _ in range(8):
+        params, opt_state, metrics, _ = runner(
+            params,
+            opt_state,
+            features,
+            labels,
+            active,
+            segment_ids,
+            intent_age,
+            split_key,
+        )
+
+    assert float(np.asarray(metrics["intent_disc_auc_ovr_macro_holdout"])) > 0.95
+    assert float(np.asarray(metrics["intent_disc_top1_acc_holdout"])) > 0.95
+
+    independent_features = {
+        **features,
+        "players": jnp.zeros_like(players),
+    }
+    independent_params = init_intent_discriminator_params(jax, jnp, spec, seed=9)
+    independent_opt_state = transform.init(independent_params)
+    for _ in range(8):
+        independent_params, independent_opt_state, independent_metrics, _ = runner(
+            independent_params,
+            independent_opt_state,
+            independent_features,
+            labels,
+            active,
+            segment_ids,
+            intent_age,
+            split_key,
+        )
+
+    assert float(np.asarray(independent_metrics["intent_disc_top1_acc_holdout"])) <= 0.75
+    assert float(np.asarray(independent_metrics["intent_disc_loss"])) > 0.65
+    assert float(np.asarray(independent_metrics["intent_disc_auc_ovr_macro_holdout"])) == pytest.approx(
+        0.5,
+        abs=1.0e-6,
+    )
 
 
 def test_ppo_eligible_episode_metrics_use_training_mask():
@@ -1577,6 +2004,20 @@ def test_jax_trainer_validates_intent_diversity_requirements():
     with pytest.raises(SystemExit, match="mlp_mean or set_step"):
         validate_train_args(gru_args)
 
+    negative_scale_args = parse_args(
+        [
+            "--policy-model",
+            "attention",
+            "--intent-embedding-enabled",
+            "--enable-intent-learning",
+            "true",
+            "--intent-conditioning-scale",
+            "-1.0",
+        ]
+    )
+    with pytest.raises(SystemExit, match="intent-conditioning-scale"):
+        validate_train_args(negative_scale_args)
+
 
 def test_jax_trainer_validates_ppo_minibatches_divide_batch_size():
     args = parse_args(
@@ -1736,6 +2177,54 @@ def test_multiselect_boundaries_do_not_apply_random_fallback_intents():
     np.testing.assert_array_equal(np.asarray(used), [False, False])
     np.testing.assert_array_equal(np.asarray(applied), [False, False])
     np.testing.assert_array_equal(np.asarray(fallback_used), [False, False])
+
+
+def test_selector_waits_for_live_play_and_renews_unselected_timeout():
+    jnp = pytest.importorskip("jax.numpy")
+
+    class BoundaryState:
+        intent_active = jnp.asarray([1, 1], dtype=jnp.int8)
+        intent_age = jnp.asarray([0, 0], dtype=jnp.int32)
+        intent_commitment_remaining = jnp.asarray([8, 8], dtype=jnp.int32)
+        step_count = jnp.asarray([10, 10], dtype=jnp.int32)
+        game_phase = jnp.asarray([GAME_PHASE_AWAITING_CHECK, GAME_PHASE_LIVE], dtype=jnp.int8)
+
+    masks = _selector_segment_application_masks(
+        BoundaryState,
+        alpha_used=jnp.asarray([True, True]),
+        multiselect_enabled=jnp.asarray(True),
+        completed_pass_boundary=jnp.asarray([False, False]),
+        offensive_rebound_boundary=jnp.asarray([False, False]),
+        selector_min_play_steps=4,
+        jnp=jnp,
+    )
+    possession_start = masks[1]
+    applied = masks[6]
+    np.testing.assert_array_equal(np.asarray(possession_start), [False, True])
+    np.testing.assert_array_equal(np.asarray(applied), [False, True])
+
+    from collections import namedtuple
+
+    RenewalState = namedtuple(
+        "RenewalState",
+        ["intent_active", "intent_commitment_remaining", "sentinel"],
+    )
+    renewal_state = RenewalState(
+        intent_active=jnp.asarray([1, 1], dtype=jnp.int8),
+        intent_commitment_remaining=jnp.asarray([0, 0], dtype=jnp.int32),
+        sentinel=jnp.asarray([4, 5], dtype=jnp.int32),
+    )
+    static = SimpleNamespace(intent_commitment_steps=jnp.asarray(8, dtype=jnp.int32))
+    renewed = _renew_unselected_intent_timeout(
+        static,
+        renewal_state,
+        jnp.asarray([True, True]),
+        jnp.asarray([False, True]),
+        jnp,
+    )
+    np.testing.assert_array_equal(np.asarray(renewed.intent_active), [1, 1])
+    np.testing.assert_array_equal(np.asarray(renewed.intent_commitment_remaining), [8, 0])
+    np.testing.assert_array_equal(np.asarray(renewed.sentinel), [4, 5])
 
 
 def test_multiselect_classifies_offensive_rebound_boundary_separately():
@@ -2055,6 +2544,7 @@ def test_mlflow_params_include_jax_env_skill_stds():
     assert "jax/phi_blend_weight" not in recorder.params
     assert recorder.params["jax/intent_embedding_enabled"] is False
     assert recorder.params["jax/intent_embedding_dim"] == 16
+    assert recorder.params["jax/intent_conditioning_scale"] == 1.0
     assert recorder.params["jax/num_intents"] == 8
     assert recorder.params["jax/task_reward_scale_start"] == 0.1
     assert recorder.params["jax/task_reward_scale_end"] == 1.0
@@ -2152,6 +2642,8 @@ def test_train_scaffold_supports_attention_policy_model():
             "--intent-embedding-enabled",
             "--intent-embedding-dim",
             "6",
+            "--intent-conditioning-scale",
+            "3.0",
             "--rebound-win-prob-features",
             "--enable-intent-learning",
             "true",
@@ -2184,6 +2676,7 @@ def test_train_scaffold_supports_attention_policy_model():
     assert result["policy_spec"]["attention_head_activation"] == "relu"
     assert result["policy_spec"]["intent_embedding_enabled"] is True
     assert result["policy_spec"]["intent_embedding_dim"] == 6
+    assert result["policy_spec"]["intent_conditioning_scale"] == 3.0
     assert result["trainer_config"]["ppo_minibatches"] == 2
     token_obs_dim = (
         (6 * (TOKEN_OBS_PLAYER_DIM + 1))
@@ -2927,7 +3420,7 @@ def test_train_loop_runs_offense_intent_discriminator_and_sample_dump(tmp_path):
         assert np.all(sample["globals"][:, 1] == 0.0)
 
 
-def test_train_loop_skips_intent_discriminator_during_warmup(tmp_path):
+def test_train_loop_pretrains_intent_discriminator_during_bonus_warmup(tmp_path):
     pytest.importorskip("jax")
 
     checkpoint_dir = tmp_path / "intent_disc_warmup_ckpts"
@@ -2997,8 +3490,10 @@ def test_train_loop_skips_intent_discriminator_during_warmup(tmp_path):
 
     metrics = result["final_metrics"]
     assert metrics["intent_bonus_beta"] == pytest.approx(0.0)
-    assert metrics["intent_disc_skipped_warmup"] == pytest.approx(1.0)
-    assert "intent_disc_loss" not in metrics
-    assert "intent_disc_top1_acc_trainbatch" not in metrics
-    assert "intent_bonus_active_sample_count" not in metrics
-    assert result["intent_sample_artifacts"] == []
+    assert metrics["intent_disc_skipped_warmup"] == pytest.approx(0.0)
+    assert metrics["intent_bonus_skipped_warmup"] == pytest.approx(1.0)
+    assert metrics["intent_disc_loss"] > 0.0
+    assert metrics["intent_disc_top1_acc_trainbatch"] >= 0.0
+    assert metrics["intent_bonus_active_sample_count"] > 0
+    assert metrics["intent_bonus_shaping_per_step_mean"] == pytest.approx(0.0)
+    assert len(result["intent_sample_artifacts"]) == 1

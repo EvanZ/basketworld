@@ -289,6 +289,8 @@ def test_fresh_launcher_keeps_the_agreed_budget_and_has_no_continuation_dependen
     assert "--policy-update-epochs 1" in script
     assert "--ppo-minibatches 16" in script
     assert "--gamma 1.0" in script
+    assert "--intent-disc-encoder-type set_step" in script
+    assert "set_transition" not in script
     assert '"$@"' in script
     assert "--start-template-enabled" not in script
     assert "--ppo-completed-episodes-only" not in script
