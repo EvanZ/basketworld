@@ -11,7 +11,12 @@ from fastapi.responses import Response
 
 from basketworld.utils.evaluation_helpers import get_outcome_category
 from app.backend.schemas import SaveEpisodeRequest, EpisodeExportFrameRequest, EpisodeExportFinishRequest
-from app.backend.episode_gif import EpisodeGifExports, quantize_gif_frame
+from app.backend.episode_gif import (
+    EpisodeGifExports,
+    Mp4EncoderUnavailableError,
+    Mp4EncodingError,
+    quantize_gif_frame,
+)
 from app.backend.state import game_state
 
 
@@ -183,7 +188,7 @@ def save_episode():
     return {"status": "success", "file_path": file_path}
 
 
-def _episode_png_output_path():
+def _episode_png_output_path(export_format="gif"):
     if _is_public_mode():
         raise HTTPException(status_code=403, detail="Saving full episodes is disabled in public mode.")
 
@@ -237,7 +242,9 @@ def _episode_png_output_path():
     if category is None:
         category = get_outcome_category(outcome)
 
-    return os.path.join(base_dir, f"episode_{timestamp}_{category}.gif")
+    if export_format not in {"gif", "mp4"}:
+        raise ValueError("Episode export format must be gif or mp4")
+    return os.path.join(base_dir, f"episode_{timestamp}_{category}.{export_format}")
 
 
 @router.post("/api/save_episode_from_pngs")
@@ -354,12 +361,16 @@ def _decode_episode_export_batch(body: bytes):
 
 
 @router.post("/api/episode_exports")
-def create_episode_export():
-    destination = _episode_png_output_path()
+def create_episode_export(format: str = "gif"):
     try:
-        return {"export_id": episode_exports.create(destination)}
+        export_format = str(format).strip().lower()
+        destination = _episode_png_output_path(export_format)
+        return {
+            "export_id": episode_exports.create(destination, export_format),
+            "format": export_format,
+        }
     except ValueError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 @router.post("/api/episode_exports/{export_id}/frames")
@@ -401,6 +412,10 @@ def finish_episode_export(export_id: str, request: EpisodeExportFinishRequest):
             return export.finish(request.frame_count)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    except Mp4EncoderUnavailableError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except Mp4EncodingError as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
     finally:
         episode_exports.remove(export_id)
 

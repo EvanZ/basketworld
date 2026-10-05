@@ -1,6 +1,8 @@
 import base64
 import io
 import json
+import re
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -151,6 +153,80 @@ def test_streamed_episode_accepts_bounded_binary_png_batches(export_client):
         assert gif.info["duration"] == 1000
 
 
+def test_streamed_mp4_is_h264_yuv420p_and_preserves_duration(export_client):
+    from app.backend.episode_gif import _ffmpeg_executable
+
+    create_response = export_client.post("/api/episode_exports?format=mp4")
+    assert create_response.status_code == 200, create_response.text
+    assert create_response.json()["format"] == "mp4"
+    key = create_response.json()["export_id"]
+    prefix = f"/api/episode_exports/{key}"
+    frames = [
+        (0, png_bytes((29, 49), "red"), 0.2),
+        (1, png_bytes((30, 50), "blue"), 0.3),
+        (2, png_bytes((29, 49), "green"), 1.0),
+    ]
+    response = export_client.post(
+        prefix + "/frame_batch",
+        content=png_batch(frames),
+        headers={"content-type": "application/octet-stream"},
+    )
+    assert response.status_code == 200, response.text
+
+    response = export_client.post(prefix + "/finish", json={"frame_count": 3})
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    movie_path = payload["file_path"]
+    assert movie_path.endswith(".mp4")
+    assert payload["codec"] == "h264"
+    assert payload["width"] == 30
+    assert payload["height"] == 50
+    assert payload["duration_seconds"] == pytest.approx(1.5)
+    with open(movie_path, "rb") as movie:
+        assert b"ftyp" in movie.read(32)
+
+    probe = subprocess.run(
+        [_ffmpeg_executable(), "-hide_banner", "-i", movie_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        text=True,
+    )
+    assert "Video: h264" in probe.stderr
+    assert "yuv420p" in probe.stderr
+    duration_match = re.search(r"Duration: 00:00:(\d+(?:\.\d+)?)", probe.stderr)
+    assert duration_match
+    assert float(duration_match.group(1)) == pytest.approx(1.5, abs=0.08)
+
+
+def test_streamed_mp4_missing_encoder_is_actionable_and_cleans_up(export_client, monkeypatch):
+    from app.backend import episode_gif
+
+    key = export_client.post("/api/episode_exports?format=mp4").json()["export_id"]
+    prefix = f"/api/episode_exports/{key}"
+    export = media_routes.episode_exports.get(key)
+    temp_path = export.temp.name
+    assert export_client.post(prefix + "/frames", json={
+        "index": 0,
+        "frame": png_data_url((20, 30), "red"),
+        "duration": 1,
+    }).status_code == 200
+
+    def unavailable():
+        raise episode_gif.Mp4EncoderUnavailableError(
+            "MP4 export requires FFmpeg. Install imageio-ffmpeg in the backend environment."
+        )
+
+    monkeypatch.setattr(episode_gif, "_ffmpeg_executable", unavailable)
+    response = export_client.post(prefix + "/finish", json={"frame_count": 1})
+    assert response.status_code == 503
+    assert "imageio-ffmpeg" in response.json()["detail"]
+    assert not export.destination.exists()
+    from pathlib import Path
+    assert not Path(temp_path).exists()
+    assert key not in media_routes.episode_exports.sessions
+
+
 def test_binary_png_batch_rejects_out_of_order_frames(export_client):
     key = export_client.post("/api/episode_exports").json()["export_id"]
     prefix = f"/api/episode_exports/{key}"
@@ -184,6 +260,12 @@ def test_streamed_export_cancel_and_public_mode(export_client, monkeypatch):
     monkeypatch.setenv("BW_PUBLIC_MODE", "true")
     assert export_client.post("/api/episode_exports").status_code == 403
     assert export_client.delete(f"/api/episode_exports/{key}").status_code == 403
+
+
+def test_streamed_export_rejects_unknown_format(export_client):
+    response = export_client.post("/api/episode_exports?format=webm")
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Episode export format must be gif or mp4"
 
 
 def test_encoder_failure_never_leaves_partial_gif(export_client, monkeypatch):

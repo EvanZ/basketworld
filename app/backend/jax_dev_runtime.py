@@ -2657,7 +2657,13 @@ class JaxDevRuntime:
         if isinstance(game_params, dict):
             params.update(game_params)
 
-        metadata = get_policy_metadata(self.unified_policy) or get_policy_metadata(self.raw_model) or {}
+        selector_policy = self._selector_policy_for_current_offense()
+        selector_model = unwrap_inference_model(selector_policy)
+        metadata = (
+            get_policy_metadata(selector_policy)
+            or get_policy_metadata(selector_model)
+            or {}
+        )
         trainer_config = metadata.get("trainer_config")
         if isinstance(trainer_config, dict):
             for key, value in trainer_config.items():
@@ -2677,13 +2683,21 @@ class JaxDevRuntime:
             )
         return params
 
+    def _selector_policy_for_current_offense(self) -> Any:
+        """Return the loaded policy controlling the active offensive roster."""
+        team_a_is_offense = self._team_is_current_offense(True)
+        if self._team_is_user(team_a_is_offense):
+            return self.unified_policy
+        return self.opponent_policy or self.unified_policy
+
+    def _selector_model_for_current_offense(self) -> Any:
+        return unwrap_inference_model(self._selector_policy_for_current_offense())
+
     def _selector_runtime_enabled(self, game_state: Any) -> bool:
-        # Selectors currently encode a single offense-side play segment. A
-        # continuous game changes offense dynamically, so do not apply a
-        # one-sided selector as an implicit clearing/inbound helper.
-        if self.multi_possession_enabled:
-            return False
-        if not bool(getattr(self.raw_model.spec, "intent_selector_enabled", False)):
+        selector_model = self._selector_model_for_current_offense()
+        if selector_model is None or not bool(
+            getattr(selector_model.spec, "intent_selector_enabled", False)
+        ):
             return False
         if not _as_bool(self.static.enable_intent_learning):
             return False
@@ -2744,19 +2758,35 @@ class JaxDevRuntime:
         return float(alpha), float(eps)
 
     def _selector_forward(self):
-        if not bool(getattr(self.raw_model.spec, "intent_selector_enabled", False)):
+        selector_model = self._selector_model_for_current_offense()
+        if selector_model is None or not bool(
+            getattr(selector_model.spec, "intent_selector_enabled", False)
+        ):
             return None
+        offense_team_is_a = self._team_is_current_offense(True)
+        role_flag = self._role_flag_for_team(offense_team_is_a)
         flat_obs = build_policy_observation_batch_with_role_flag(
             self.static,
             self.state,
-            self.role_flag_offense,
+            role_flag,
             self.jnp,
-            model_type=str(self.raw_model.spec.model_type),
-            rebound_win_prob_features=bool(getattr(self.raw_model.spec, "rebound_win_prob_features", False)),
-            rebound_target_observation_features=bool(getattr(self.raw_model.spec, "rebound_target_observation_features", True)),
-            multi_possession_features=bool(getattr(self.raw_model.spec, "multi_possession_features", False)),
+            model_type=str(selector_model.spec.model_type),
+            rebound_win_prob_features=bool(
+                getattr(selector_model.spec, "rebound_win_prob_features", False)
+            ),
+            rebound_target_observation_features=bool(
+                getattr(selector_model.spec, "rebound_target_observation_features", True)
+            ),
+            multi_possession_features=bool(
+                getattr(selector_model.spec, "multi_possession_features", False)
+            ),
         )
-        flat_obs = _adapt_policy_observation_to_spec(flat_obs, self.static, self.raw_model.spec, self.jnp)
+        flat_obs = _adapt_policy_observation_to_spec(
+            flat_obs,
+            self.static,
+            selector_model.spec,
+            self.jnp,
+        )
         batch_size = flat_obs.shape[0]
         neutral_context = {
             "intent_index": self.jnp.zeros((batch_size,), dtype=self.jnp.int32),
@@ -2765,9 +2795,9 @@ class JaxDevRuntime:
         from basketworld_jax.models import actor_critic_forward
 
         forward_out = actor_critic_forward(
-            self.raw_model.params,
+            selector_model.params,
             flat_obs,
-            self.raw_model.spec,
+            selector_model.spec,
             self.jnp,
             intent_context=neutral_context,
         )
@@ -2781,7 +2811,10 @@ class JaxDevRuntime:
         values_device = forward_out["selector_values"][0:1]
         raw_probs_device = self.jax.nn.softmax(logits_device, axis=-1)
         alpha, eps = self._selector_alpha_eps(game_state)
-        num_intents = int(max(1, getattr(self.raw_model.spec, "num_intents", logits_device.shape[-1])))
+        selector_model = self._selector_model_for_current_offense()
+        num_intents = int(
+            max(1, getattr(selector_model.spec, "num_intents", logits_device.shape[-1]))
+        )
         uniform_device = self.jnp.full_like(raw_probs_device, 1.0 / float(num_intents))
         mixed_probs_device = ((1.0 - eps) * raw_probs_device) + (eps * uniform_device)
         deployed_probs_device = (alpha * mixed_probs_device) + ((1.0 - alpha) * uniform_device)
@@ -2839,7 +2872,16 @@ class JaxDevRuntime:
         age = _as_int(_field0(self.state, "intent_age"))
         if not _as_bool(_field0(self.state, "intent_active")):
             return None
+        live_phase = _as_int(_field0(self.state, "game_phase")) == GAME_PHASE_LIVE
+        # Match the compiled training rollout: the kernel initializes a fresh
+        # provisional intent at every possession boundary. The selector must
+        # replace it on the first live action tick, after any inbound/check
+        # dead-ball phase has completed.
+        if live_phase and age == 0 and _as_int(_field0(self.state, "step_count")) > 0:
+            return "possession_start"
         if not multiselect_enabled:
+            return None
+        if not live_phase:
             return None
         remaining = _as_int(_field0(self.state, "intent_commitment_remaining"))
         if age > 0 and remaining <= 0:
@@ -2924,10 +2966,14 @@ class JaxDevRuntime:
                 }
                 break
         runtime_enabled = self._selector_runtime_enabled(game_state)
+        selector_model = self._selector_model_for_current_offense()
         last_transition = copy.deepcopy(self._last_selector_transition)
         return {
             "runtime_enabled": bool(runtime_enabled),
-            "model_selector_enabled": bool(getattr(self.raw_model.spec, "intent_selector_enabled", False)),
+            "model_selector_enabled": bool(
+                selector_model is not None
+                and getattr(selector_model.spec, "intent_selector_enabled", False)
+            ),
             "env_intent_learning_enabled": bool(_as_bool(self.static.enable_intent_learning)),
             "training_selector_enabled": bool(
                 _coerce_bool(_param_lookup(params, "intent_selector_enabled", True), default=True)
@@ -2988,8 +3034,10 @@ class JaxDevRuntime:
         }
 
     def _play_name_map(self, game_state: Any) -> dict[str, str]:
-        count = int(getattr(self.raw_model.spec, "num_intents", 0) or 0)
-        metadata = get_policy_metadata(getattr(game_state, "unified_policy", None))
+        selector_policy = self._selector_policy_for_current_offense()
+        selector_model = unwrap_inference_model(selector_policy)
+        count = int(getattr(selector_model.spec, "num_intents", 0) or 0)
+        metadata = get_policy_metadata(selector_policy) or get_policy_metadata(selector_model)
         return _coerce_play_name_map(metadata, count)
 
     def _counterfactual_snapshot_summary(self, game_state: Any) -> dict[str, Any]:

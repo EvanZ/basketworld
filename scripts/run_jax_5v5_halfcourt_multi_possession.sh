@@ -11,6 +11,7 @@ cd "$ROOT"
 
 PYTHON_BIN="${PYTHON_BIN:-$ROOT/.env/bin/python}"
 NUM_UPDATES="${NUM_UPDATES:-30000}"
+MLFLOW_EXPERIMENT_NAME="${MLFLOW_EXPERIMENT_NAME:-halfcourt_multi_possessions}"
 if [[ -v HISTORICAL_EVAL_UPDATES ]]; then
   HISTORICAL_EVAL_UPDATES="$HISTORICAL_EVAL_UPDATES"
 else
@@ -219,6 +220,6 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --eval-deploy-batches 2 \
   --eval-deploy-horizon 2048 \
   "${HISTORICAL_EVAL_ARGS[@]}" \
-  --mlflow-experiment-name halfcourt_multi_possessions \
+  --mlflow-experiment-name "$MLFLOW_EXPERIMENT_NAME" \
   --log-mlflow \
   "$@"

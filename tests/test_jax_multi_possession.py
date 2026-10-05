@@ -962,8 +962,31 @@ def test_possession_live_step_counter_excludes_inbounds_and_restarts_offensive_i
     assert int(np.asarray(inbound_timeout_out.state.intent_active)[0]) == 1
     assert int(np.asarray(inbound_timeout_out.state.intent_age)[0]) == 0
 
-    _, possession_start, _, _, _, _, applied, _ = _selector_segment_application_masks(
+    # The learned selector waits through the dead-ball inbound, then replaces
+    # the provisional intent before the recipient team's first live action.
+    inbound_masks = np.asarray(
+        build_action_masks_batch(static, made_out.state, jnp),
+        dtype=np.int8,
+    )
+    inbounder = int(np.asarray(made_out.state.inbound_player)[0])
+    legal_pass_slots = np.flatnonzero(inbound_masks[0, inbounder, PASS_ACTION_START:])
+    assert legal_pass_slots.size > 0
+    inbound_actions = _noops(made_out.state).at[0, inbounder].set(
+        PASS_ACTION_START + int(legal_pass_slots[0])
+    )
+    inbound_out = step_batch_minimal(
+        static,
         made_out.state,
+        inbound_actions,
+        jax.random.split(jax.random.PRNGKey(205), 1),
+        jax,
+        jnp,
+    )
+    assert int(np.asarray(inbound_out.state.game_phase)[0]) == GAME_PHASE_LIVE
+    assert int(np.asarray(inbound_out.state.intent_age)[0]) == 0
+
+    _, possession_start, _, _, _, _, applied, _ = _selector_segment_application_masks(
+        inbound_out.state,
         alpha_used=jnp.asarray([True]),
         multiselect_enabled=jnp.asarray(False),
         completed_pass_boundary=jnp.asarray([False]),

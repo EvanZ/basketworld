@@ -120,7 +120,7 @@ uvicorn app.backend.main:app --host 0.0.0.0 --port 8080 --reload
 ```
 - Reads env/training params, role-flag encoding, and available unified policies directly from MLflow for a given `run_id`.
 - Caches and loads `unified_*.zip` artifacts; optional frozen opponent policy selection.
-- Endpoints cover stepping games, policy probabilities, MCTS advice, batch evaluation, phi-shaping tweaks, offense skill overrides, shot/pass diagnostics, replays, GIF/PNG exports, and policy swapping mid-session.
+- Endpoints cover stepping games, policy probabilities, MCTS advice, batch evaluation, phi-shaping tweaks, offense skill overrides, shot/pass diagnostics, replays, MP4/GIF/PNG exports, and policy swapping mid-session.
 
 ### Frontend (Vue 3 + Vite)
 - Enter an MLflow `run_id`, choose offense/defense side, and pick a unified policy for you vs. the (optional) frozen opponent.

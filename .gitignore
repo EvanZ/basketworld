@@ -94,6 +94,7 @@ prompts/
 # installs
 *.egg-info/
 *.egg
+node_modules/
 
 .vscode/
 .DS_Store
@@ -102,6 +103,10 @@ prompts/
 app/backend/episodes/
 # Local UI episode exports and cached policy checkpoints.
 episodes/
+
+# Standalone training-control app runtime data.
+var/training_app/
+app/training_frontend/dist/
 
 # Auxiliary Git worktrees created for local comparison/debugging.
 .worktrees/

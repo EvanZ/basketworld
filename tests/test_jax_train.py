@@ -44,6 +44,7 @@ from basketworld_jax.train.main import (
     _checkpoint_interval_for_update,
     _checkpoint_trainer_config_from_args,
     _entropy_coef_for_update,
+    _filter_mlflow_deploy_metrics,
     _historical_eval_updates,
     _historical_eval_artifact_payload,
     _periodic_checkpoint_updates,
@@ -1129,13 +1130,9 @@ def test_mlflow_core_profile_keeps_learner_rebound_metrics_only():
     filtered = _filter_mlflow_train_metrics(metrics, profile="core")
 
     assert set(filtered) == {
-        "rebound_learner_avg_eligible_players_offense",
-        "rebound_learner_avg_total_logit_defense",
         "rebound_learner_offensive_rebound_rate",
         "rebound_learner_defensive_rebound_rate",
         "rebound_learner_softmax_win_rate_defense",
-        "rebound_learner_avg_total_logit_offense_vs_argmax",
-        "rebound_local_opponent_only_rate_defense",
     }
     assert _filter_mlflow_train_metrics(metrics, profile="full") == metrics
 
@@ -2345,6 +2342,7 @@ def test_jax_entropy_coef_supports_linear_and_exp_schedules():
         ]
     )
     validate_train_args(linear_args)
+    assert linear_args.entropy_decay_updates is None
     assert _entropy_coef_for_update(linear_args, 1) == pytest.approx(0.02)
     assert _entropy_coef_for_update(linear_args, 6) == pytest.approx(0.002)
 
@@ -2366,6 +2364,50 @@ def test_jax_entropy_coef_supports_linear_and_exp_schedules():
         float(np.sqrt(0.02 * 0.002))
     )
     assert _entropy_coef_for_update(exp_args, 3) == pytest.approx(0.002)
+
+    capped_args = parse_args(
+        [
+            "--num-updates",
+            "30",
+            "--ent-coef-start",
+            "0.02",
+            "--ent-coef-end",
+            "0.002",
+            "--ent-schedule",
+            "exp",
+            "--entropy-decay-updates",
+            "5",
+        ]
+    )
+    validate_train_args(capped_args)
+    assert _entropy_coef_for_update(capped_args, 1) == pytest.approx(0.02)
+    assert _entropy_coef_for_update(capped_args, 3) == pytest.approx(
+        float(np.sqrt(0.02 * 0.002))
+    )
+    assert _entropy_coef_for_update(capped_args, 5) == pytest.approx(0.002)
+    assert _entropy_coef_for_update(capped_args, 30) == pytest.approx(0.002)
+
+    immediate_args = parse_args(
+        [
+            "--num-updates",
+            "30",
+            "--ent-coef-start",
+            "0.02",
+            "--ent-coef-end",
+            "0.002",
+            "--entropy-decay-updates",
+            "1",
+        ]
+    )
+    validate_train_args(immediate_args)
+    assert _entropy_coef_for_update(immediate_args, 1) == pytest.approx(0.002)
+
+
+def test_jax_entropy_decay_updates_must_be_positive_when_set():
+    args = parse_args(["--entropy-decay-updates", "0"])
+
+    with pytest.raises(SystemExit, match="--entropy-decay-updates must be >= 1"):
+        validate_train_args(args)
 
 
 def test_mlflow_metric_profile_defaults_to_core():
@@ -2423,16 +2465,38 @@ def test_core_mlflow_train_metric_filter_drops_redundant_aliases():
     assert "offense_learner_points_total" not in filtered
     assert "defense_opponent_points_total" not in filtered
     assert filtered["offense_learner_mean_reward"] == 0.1
-    assert filtered["offense_learner_shot_dunk_share"] == 0.3
-    assert filtered["offense_ppo_eligible_learner_shot_attempts_per_completed_episode"] == 0.9
-    assert filtered["offense_ppo_eligible_terminal_shot_share"] == 0.8
-    assert filtered["offense_ppo_eligible_reward_per_step"] == 0.09
-    assert filtered["offense_intent_usage_share/0"] == 0.25
-    assert filtered["intent_disc_label_prob_by_intent/0"] == 0.125
-    assert filtered["selector_used_count"] == 500
-    assert filtered["selector_usage_by_intent/0"] == 0.2
+    assert "offense_learner_shot_dunk_share" not in filtered
+    assert "offense_ppo_eligible_learner_shot_attempts_per_completed_episode" not in filtered
+    assert "offense_ppo_eligible_terminal_shot_share" not in filtered
+    assert "offense_ppo_eligible_reward_per_step" not in filtered
+    assert "offense_intent_usage_share/0" not in filtered
+    assert "intent_disc_label_prob_by_intent/0" not in filtered
+    assert "selector_used_count" not in filtered
+    assert "selector_usage_by_intent/0" not in filtered
     assert filtered["end_to_end_steps_per_sec"] == 30000.0
     assert _filter_mlflow_train_metrics(metrics, profile="full") == metrics
+
+
+def test_core_mlflow_deploy_metric_filter_keeps_compact_aggregates():
+    metrics = {
+        "completion_rate": 1.0,
+        "mean_offense_score": 17.0,
+        "mean_live_boundary_player_fraction": 0.4,
+        "shot_make_rate": 0.5,
+        "shot_attempts": 100,
+        "rebound_avg_target_logit_offense": -1.0,
+        "turnover_intercepted_count": 5,
+    }
+
+    filtered = _filter_mlflow_deploy_metrics(metrics)
+
+    assert filtered == {
+        "completion_rate": 1.0,
+        "mean_offense_score": 17.0,
+        "mean_live_boundary_player_fraction": 0.4,
+        "shot_make_rate": 0.5,
+    }
+    assert _filter_mlflow_deploy_metrics(metrics, profile="full") == metrics
 
 
 def test_mlflow_params_include_jax_env_skill_stds():
@@ -2558,6 +2622,7 @@ def test_mlflow_params_include_jax_env_skill_stds():
     assert recorder.params["jax/ent_coef_start"] == 0.02
     assert recorder.params["jax/ent_coef_end"] == 0.003
     assert recorder.params["jax/ent_schedule"] == "exp"
+    assert recorder.params["jax/entropy_decay_updates"] == -1
     assert recorder.params["jax/rebound_win_prob_features"] is True
     assert recorder.params["jax/rebound_target_observation_features"] is False
     assert recorder.params["jax/mlflow_metric_profile"] == "core"

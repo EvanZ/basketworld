@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 
 // Load this Vite ES module in Node without changing the app's package mode.
 const source = await readFile(new URL('../src/utils/episodeExport.js', import.meta.url), 'utf8');
-const { createEpisodeGifExport } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const { createEpisodeExport, createEpisodeGifExport } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 const ok = (body) => ({ ok: true, json: async () => body });
 
 test('uploads >512 MiB cumulatively in bounded binary batches', async () => {
@@ -15,7 +15,7 @@ test('uploads >512 MiB cumulatively in bounded binary batches', async () => {
   const writer = await createEpisodeGifExport('', async (url, options) => {
     assert.equal(inFlight++, 0);
     try {
-      if (url.endsWith('/episode_exports')) return ok({ export_id: 'test' });
+      if (url.endsWith('/episode_exports?format=gif')) return ok({ export_id: 'test' });
       if (url.endsWith('/frame_batch')) {
         assert.equal(options.headers['Content-Type'], 'application/octet-stream');
         assert.ok(options.body instanceof Blob);
@@ -71,4 +71,25 @@ test('old backend gives an actionable restart message before capture', async () 
   await assert.rejects(createEpisodeGifExport('', async () => ({
     ok: false, status: 404, json: async () => ({ detail: 'Not Found' }),
   })), /Restart the backend/);
+});
+
+test('MP4 export selects the movie backend and retains bounded batches', async () => {
+  const urls = [];
+  const writer = await createEpisodeExport('', 'mp4', async (url, options) => {
+    urls.push(url);
+    if (url.endsWith('/episode_exports?format=mp4')) {
+      return ok({ export_id: 'movie', format: 'mp4' });
+    }
+    if (url.endsWith('/frame_batch')) return ok({ frame_count: 1 });
+    if (url.endsWith('/finish')) {
+      return ok({ status: 'success', frame_count: 1, file_path: '/tmp/episode.mp4' });
+    }
+    throw new Error(`Unexpected request ${url} ${options.method}`);
+  });
+  await writer.appendBatch([
+    { index: 0, png: new Blob(['png'], { type: 'image/png' }), duration: 1 },
+  ]);
+  const result = await writer.finish();
+  assert.equal(result.file_path, '/tmp/episode.mp4');
+  assert.equal(urls[0], '/api/episode_exports?format=mp4');
 });

@@ -133,7 +133,7 @@ def get_parser() -> argparse.ArgumentParser:
         default=0,
         help="PPO hyperparameter: Weight for entropy loss.",
     )
-    # Optional entropy schedule across entire training
+    # Optional entropy schedule across training (or an explicit decay horizon).
     parser.add_argument(
         "--ent-coef-start",
         type=float,
@@ -152,6 +152,16 @@ def get_parser() -> argparse.ArgumentParser:
         choices=["linear", "exp"],
         default="linear",
         help="Entropy schedule type when start/end are provided.",
+    )
+    parser.add_argument(
+        "--entropy-decay-updates",
+        type=int,
+        default=None,
+        help=(
+            "Optional update at which the entropy schedule reaches --ent-coef-end. "
+            "Afterward it remains at the end value. The default null uses the full "
+            "--num-updates horizon, preserving the existing behavior."
+        ),
     )
     parser.add_argument(
         "--ent-bump-updates",
@@ -349,6 +359,12 @@ def get_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mlflow-run-name", type=str, default=None, help="Name of the MLflow run."
+    )
+    parser.add_argument(
+        "--mlflow-resume-run-id",
+        type=str,
+        default="",
+        help="Existing MLflow run ID to reopen when resuming an app-managed worker.",
     )
     parser.add_argument(
         "--mlflow-sb3-log-every-writes",

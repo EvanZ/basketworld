@@ -27,6 +27,7 @@ from basketworld_jax.env.minimal import (
     GAME_PHASE_AWAITING_INBOUND,
     GAME_PHASE_AWAITING_CHECK,
     GAME_PHASE_CHECK_SETUP,
+    GAME_PHASE_LIVE,
     SHOT_TYPE_DUNK,
     TEAM_A,
     TEAM_B,
@@ -626,6 +627,52 @@ def _make_selector_runtime_and_state():
     return runtime, game_state
 
 
+def _make_multi_possession_selector_runtime_and_state():
+    player_policy = _FakeRawJaxModel()
+    opponent_policy = _FakeRawJaxModel()
+    selector_spec = _FakeSpec(
+        intent_selector_enabled=True,
+        num_intents=8,
+        multi_possession_features=True,
+    )
+    player_policy.spec = selector_spec
+    opponent_policy.spec = selector_spec
+    runtime = JaxDevRuntime(
+        required_params={"players": 3},
+        env_params={
+            "allow_dunks": True,
+            "pass_mode": "pointer_targeted",
+            "training_team": Team.OFFENSE,
+            "enable_multi_possession": True,
+            "multi_possession_limit": 5,
+            "enable_intent_learning": True,
+            "num_intents": 8,
+            "intent_commitment_steps": 4,
+        },
+        unified_policy=player_policy,
+        opponent_policy=opponent_policy,
+        user_team=Team.OFFENSE,
+        rng_seed=17,
+    )
+    runtime.reset(seed=17)
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.display_env
+    game_state.unified_policy = runtime.unified_policy
+    game_state.defense_policy = runtime.opponent_policy
+    game_state.user_team = Team.OFFENSE
+    game_state.self_play_active = True
+    game_state.mlflow_training_params = {
+        "intent_selector_enabled": True,
+        "intent_selector_multiselect_enabled": True,
+        "intent_selector_alpha_end": 1.0,
+        "intent_selector_eps_end": 0.0,
+        "intent_selector_min_play_steps": 3,
+    }
+    game_state.obs = runtime.observation_dict()
+    return runtime, game_state, player_policy, opponent_policy
+
+
 def _install_jax_runtime_session(monkeypatch, runtime: JaxDevRuntime | None = None):
     runtime = runtime or _make_runtime(
         env_params={
@@ -970,6 +1017,56 @@ def test_jax_dev_runtime_turn_step_does_not_reselect_at_episode_start(monkeypatc
     assert body["state"]["intent_commitment_remaining"] == 3
     assert body["state"]["selector_last_boundary_reason"] is None
     assert game_state.selector_segment_index == 0
+
+
+def test_jax_dev_runtime_multi_possession_reselects_on_first_live_possession_tick(
+    monkeypatch,
+):
+    runtime, game_state, player_policy, opponent_policy = (
+        _make_multi_possession_selector_runtime_and_state()
+    )
+    runtime.state = runtime.state._replace(
+        offense_team=jnp.asarray([TEAM_B], dtype=jnp.int32),
+        intent_active=jnp.asarray([1], dtype=jnp.int8),
+        intent_index=jnp.asarray([2], dtype=jnp.int32),
+        intent_age=jnp.asarray([0], dtype=jnp.int32),
+        intent_commitment_remaining=jnp.asarray([4], dtype=jnp.int32),
+        step_count=jnp.asarray([9], dtype=jnp.int32),
+        game_phase=jnp.asarray([GAME_PHASE_AWAITING_INBOUND], dtype=jnp.int32),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_sample_selector_intent",
+        lambda _game_state: {
+            "intent_index": 5,
+            "used_selector": True,
+            "alpha": 1.0,
+            "eps": 0.0,
+            "value": 0.25,
+        },
+    )
+
+    assert runtime._selector_runtime_enabled(game_state) is True
+    assert runtime._selector_policy_for_current_offense() is opponent_policy
+    assert runtime._maybe_apply_selector_boundary(game_state) is None
+
+    runtime.state = runtime.state._replace(
+        game_phase=jnp.asarray([GAME_PHASE_LIVE], dtype=jnp.int32),
+    )
+    transition = runtime._maybe_apply_selector_boundary(game_state)
+
+    assert transition is not None
+    assert transition["reason"] == "possession_start"
+    assert transition["previous_intent_index"] == 2
+    assert transition["intent_index"] == 5
+    assert game_state.selector_segment_index == 1
+    assert game_state.selector_last_boundary_reason == "possession_start"
+    assert int(np.asarray(runtime.state.intent_index)[0]) == 5
+
+    runtime.state = runtime.state._replace(
+        offense_team=jnp.asarray([TEAM_A], dtype=jnp.int32),
+    )
+    assert runtime._selector_policy_for_current_offense() is player_policy
 
 
 def test_jax_dev_runtime_turn_step_reselects_after_commitment_timeout(monkeypatch):

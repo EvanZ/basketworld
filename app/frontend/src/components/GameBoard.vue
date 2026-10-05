@@ -515,14 +515,34 @@ function reboundBannerText(actionResults) {
   return null;
 }
 
-function shotAttemptBannerPayload(shotResult, actionResults = null) {
+function shotOutcomeEventKey(state, shooterId, shotResult) {
+  return [
+    'shot-outcome',
+    props.gameHistory.length,
+    Number(shooterId),
+    shotResult?.success ? 1 : 0,
+    (shotResult?.is_three ?? shotResult?.isThree) ? 1 : 0,
+    Number(state?.user_score ?? -1),
+    Number(state?.ai_score ?? -1),
+    Number(state?.completed_possessions ?? -1),
+  ].join('|');
+}
+
+function shotAttemptBannerPayload(
+  shotResult,
+  actionResults = null,
+  scoringTeam = null,
+  eventKey = null,
+) {
   if (!shotResult || typeof shotResult !== 'object') return null;
   const made = Boolean(shotResult.success);
   const isThree = Boolean(shotResult.is_three ?? shotResult.isThree);
   return {
+    key: eventKey,
     text: `${made ? 'Made' : 'Missed'} ${isThree ? '3PT' : '2PT'}`,
     made,
     kind: made ? 'made' : 'missed',
+    scoringTeam: made ? scoringTeam : null,
     reboundText: made ? null : reboundBannerText(actionResults),
   };
 }
@@ -562,10 +582,22 @@ function checkViolationBannerPayload(actionResults) {
 function shotAttemptBannerPayloadForState(state) {
   const actionResults = state?.last_action_results;
   const shots = actionResults?.shots;
-  const firstShot = shots && typeof shots === 'object'
-    ? Object.values(shots).find((result) => result && typeof result === 'object')
+  const firstShotEntry = shots && typeof shots === 'object'
+    ? Object.entries(shots).find(([, result]) => result && typeof result === 'object')
     : null;
-  return shotAttemptBannerPayload(firstShot, actionResults)
+  const shooterId = firstShotEntry ? Number(firstShotEntry[0]) : null;
+  const scoringTeam = Number.isFinite(shooterId)
+    ? getPlayerOwner(state, shooterId)
+    : null;
+  const eventKey = firstShotEntry
+    ? shotOutcomeEventKey(state, shooterId, firstShotEntry[1])
+    : null;
+  return shotAttemptBannerPayload(
+    firstShotEntry?.[1],
+    actionResults,
+    scoringTeam,
+    eventKey,
+  )
     ?? checkViolationBannerPayload(actionResults)
     ?? turnoverBannerPayload(actionResults)
     ?? defensiveLaneViolationBannerPayload(actionResults);
@@ -579,8 +611,18 @@ function clearShotAttemptBanner() {
   shotAttemptBanner.value = null;
 }
 
-function triggerShotAttemptBanner(shotResult, actionResults = null) {
-  const payload = shotAttemptBannerPayload(shotResult, actionResults);
+function triggerShotAttemptBanner(
+  shotResult,
+  actionResults = null,
+  scoringTeam = null,
+  eventKey = null,
+) {
+  const payload = shotAttemptBannerPayload(
+    shotResult,
+    actionResults,
+    scoringTeam,
+    eventKey,
+  );
   if (!payload) return;
   triggerOutcomeBanner(payload);
 }
@@ -588,9 +630,10 @@ function triggerShotAttemptBanner(shotResult, actionResults = null) {
 function triggerOutcomeBanner(payload) {
   if (!payload) return;
   clearShotAttemptBanner();
+  const serialKey = ++shotAttemptBannerSerial;
   shotAttemptBanner.value = {
     ...payload,
-    key: ++shotAttemptBannerSerial,
+    key: payload.key ?? serialKey,
   };
   shotAttemptBannerTimeout = setTimeout(() => {
     shotAttemptBanner.value = null;
@@ -913,6 +956,13 @@ watch(
 const visibleShotAttemptBanner = computed(() =>
   shotAttemptBanner.value ?? shotAttemptBannerPayloadForState(currentGameState.value),
 );
+
+const scoreboardScoreCelebration = computed(() => {
+  const banner = visibleShotAttemptBanner.value;
+  if (!multiPossessionScoreboard.value || !banner?.made) return null;
+  if (banner.scoringTeam !== 'user' && banner.scoringTeam !== 'ai') return null;
+  return { team: banner.scoringTeam };
+});
 
 const allPoliciesVisible = computed(() => {
   const positions = currentGameState.value?.positions;
@@ -4499,7 +4549,12 @@ watch(
     }
     lastShotAnimationKey.value = shotAnimationKey;
 
-    triggerShotAttemptBanner(shotData.result, state.last_action_results);
+    triggerShotAttemptBanner(
+      shotData.result,
+      state.last_action_results,
+      getPlayerOwner(state, shotData.shooterId),
+      shotOutcomeEventKey(state, shotData.shooterId, shotData.result),
+    );
     const shotDurationMs = triggerShotFlash(
       shotData.shooterId,
       start,
@@ -5907,7 +5962,13 @@ onBeforeUnmount(() => {
       class="game-scoreboard"
       aria-label="Game scoreboard"
     >
-      <div class="score-side score-side-you" :class="{ 'has-possession': multiPossessionScoreboard.userHasPossession }">
+      <div
+        class="score-side score-side-you"
+        :class="{
+          'has-possession': multiPossessionScoreboard.userHasPossession,
+          'score-celebration': scoreboardScoreCelebration?.team === 'user',
+        }"
+      >
         <span
           class="score-possession-light"
           :class="{ lit: multiPossessionScoreboard.userHasPossession }"
@@ -5972,7 +6033,13 @@ onBeforeUnmount(() => {
           </template>
         </span>
       </div>
-      <div class="score-side score-side-ai" :class="{ 'has-possession': multiPossessionScoreboard.aiHasPossession }">
+      <div
+        class="score-side score-side-ai"
+        :class="{
+          'has-possession': multiPossessionScoreboard.aiHasPossession,
+          'score-celebration': scoreboardScoreCelebration?.team === 'ai',
+        }"
+      >
         <div class="score-side-main">
           <span class="score-team">AI</span>
           <span class="score-digits">{{ multiPossessionScoreboard.aiScore }}</span>
@@ -6165,6 +6232,11 @@ onBeforeUnmount(() => {
   pointer-events: none;
 }
 
+.score-side.score-celebration {
+  opacity: 1;
+  animation: scoreboard-score-border-pulse 0.62s ease-in-out infinite alternate;
+}
+
 /* Reserve header space for the scoreboard rather than laying it over the
    court. The developer controls sit below it as a compact utility row. */
 .multi-possession-board .game-scoreboard {
@@ -6305,7 +6377,25 @@ onBeforeUnmount(() => {
 }
 
 .shot-attempt-banner.made {
-  color: #22c55e;
+  min-width: 14rem;
+  padding: 0.55rem 1.45rem;
+  border-width: 2px;
+  border-radius: 10px;
+  background:
+    radial-gradient(circle at 50% 0%, rgba(74, 222, 128, 0.2), transparent 58%),
+    rgba(6, 20, 24, 0.98);
+  box-shadow:
+    0 0 5px currentColor,
+    0 0 16px rgba(74, 222, 128, 0.92),
+    0 0 32px rgba(34, 197, 94, 0.5),
+    inset 0 0 14px rgba(74, 222, 128, 0.12);
+  color: #4ade80;
+  font-size: 1.2rem;
+  letter-spacing: 0.13em;
+  text-shadow: 0 0 7px rgba(187, 247, 208, 0.95);
+  animation:
+    made-shot-banner-enter 0.28s cubic-bezier(0.16, 1, 0.3, 1) both,
+    made-shot-banner-pulse 0.72s 0.22s ease-out 1;
 }
 
 .shot-attempt-banner.missed {
@@ -6348,7 +6438,61 @@ onBeforeUnmount(() => {
   }
 }
 
+@keyframes made-shot-banner-enter {
+  0% {
+    opacity: 0;
+    transform: translateY(-0.55rem) scale(0.72);
+  }
+  72% {
+    opacity: 1;
+    transform: translateY(0) scale(1.08);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes made-shot-banner-pulse {
+  0%,
+  100% {
+    filter: brightness(1);
+  }
+  48% {
+    filter: brightness(1.42);
+  }
+}
+
+@keyframes scoreboard-score-border-pulse {
+  from {
+    border-color: var(--scoreboard-flash-color);
+    box-shadow:
+      0 0 4px var(--scoreboard-flash-color),
+      inset 0 0 4px rgba(255, 255, 255, 0.18);
+  }
+  to {
+    border-color: #ffffff;
+    box-shadow:
+      0 0 7px rgba(255, 255, 255, 0.98),
+      0 0 22px var(--scoreboard-flash-color),
+      inset 0 0 14px var(--scoreboard-flash-color);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .score-side.score-celebration,
+  .shot-attempt-banner.made {
+    animation: none;
+  }
+
+  .score-side.score-celebration {
+    border-color: #ffffff;
+    box-shadow: 0 0 16px var(--scoreboard-flash-color);
+  }
+}
+
 .score-side {
+  position: relative;
   display: inline-flex;
   flex-direction: row;
   align-items: center;
@@ -6376,11 +6520,13 @@ onBeforeUnmount(() => {
 }
 
 .score-side-you {
+  --scoreboard-flash-color: #38bdf8;
   background: #007bff;
   border-color: #ffffff;
 }
 
 .score-side-ai {
+  --scoreboard-flash-color: #fb7185;
   background: #dc3545;
   border-color: #ffffff;
 }

@@ -8,7 +8,7 @@ import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
 import { initGame, initTemplateSandbox, stepGame, saveEpisode, saveEpisodeFromPngs, startSelfPlay, prepareFastSelfPlay, setMultiPossessionLimit, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getEvaluationProgress, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal, getReboundPreview, applyStartTemplate } from './services/api';
 import { resetStatsStorage } from './services/stats';
-import { startEpisodeGifExport } from './services/api';
+import { startEpisodeExport } from './services/api';
 import { actionAnimationFrameCount, actionAnimationTiming, hexDistance } from './utils/actionAnimationTiming';
 import {
   buildEpisodeFrameSelection,
@@ -1360,6 +1360,7 @@ const BASE_STEP_DURATION_MS = 900;
 const gifStepDurationMs = ref(BASE_STEP_DURATION_MS);
 const gifWidthPx = ref(960);
 const gifAnimationDetail = ref('standard');
+const episodeExportFormat = ref('mp4');
 const gifRangeStartFrame = ref(0);
 const gifRangeEndFrame = ref(0);
 
@@ -3324,7 +3325,7 @@ async function handleSaveEpisode() {
     
     // Capture binary PNGs and transfer bounded batches. This avoids both
     // base64 expansion and an HTTP round trip for every animation frame.
-    writer = await startEpisodeGifExport();
+    writer = await startEpisodeExport(episodeExportFormat.value);
     let frameCount = 0;
     let pendingFrames = [];
     const flushPendingFrames = async () => {
@@ -3412,14 +3413,14 @@ async function handleSaveEpisode() {
     }
     
     await flushPendingFrames();
-    episodeSaveProgress.value = `Encoding ${frameCount} frames…`;
+    episodeSaveProgress.value = `Encoding ${frameCount} frames as ${episodeExportFormat.value.toUpperCase()}…`;
     const res = await writer.finish();
     alert(`Episode saved to ${res.file_path}`);
   } catch (e) {
     console.error('Failed to save episode:', e);
     alert(`Failed to save episode: ${e.message}`);
   } finally {
-    await writer?.abort().catch((error) => console.warn('Could not clean up GIF export:', error));
+    await writer?.abort().catch((error) => console.warn('Could not clean up episode export:', error));
     currentStepIndex.value = savedStepIndex;
     gameHistory.value = savedHistory;
     disableTransitionsForCapture.value = false;
@@ -4277,8 +4278,15 @@ onBeforeUnmount(() => {
         </div>
         <div v-if="gameState.done || isManualStepping" class="save-episode-panel">
           <div class="save-episode-row">
+            <label class="gif-detail-control" for="episode-export-format">
+              Format
+              <select id="episode-export-format" v-model="episodeExportFormat">
+                <option value="mp4">MP4 video</option>
+                <option value="gif">GIF animation</option>
+              </select>
+            </label>
             <div class="gif-speed-control">
-              <label for="gif-speed-slider">GIF speed</label>
+              <label for="gif-speed-slider">Playback speed</label>
               <input
                 id="gif-speed-slider"
                 type="range"
@@ -4290,7 +4298,7 @@ onBeforeUnmount(() => {
               <span class="gif-speed-label">{{ (gifStepDurationMs / 1000).toFixed(2) }}s / step</span>
             </div>
             <label class="gif-width-control" for="gif-width-input">
-              GIF width
+              Output width
               <input
                 id="gif-width-input"
                 type="number"
@@ -4310,14 +4318,14 @@ onBeforeUnmount(() => {
               </select>
             </label>
             <button @click="handleSaveEpisode" class="save-episode-button" :disabled="isSavingEpisode">
-              {{ isSavingEpisode ? episodeSaveProgress : 'Save Episode' }}
+              {{ isSavingEpisode ? episodeSaveProgress : `Save ${episodeExportFormat.toUpperCase()}` }}
             </button>
           </div>
           <div
             v-if="episodeFrameCount > 0"
             class="gif-frame-range-control"
             role="group"
-            aria-label="GIF episode frame range"
+            aria-label="Episode export frame range"
           >
             <div class="gif-frame-range-header">
               <span>Episode trim</span>

@@ -1,4 +1,4 @@
-import { createEpisodeGifExport } from '../utils/episodeExport';
+import { createEpisodeExport, createEpisodeGifExport } from '../utils/episodeExport';
 
 // Determine the backend base URL.
 // Priority:
@@ -337,6 +337,10 @@ export async function saveEpisodeFromPngs(frames, durations, stepDurationMs) {
 
 export function startEpisodeGifExport() {
     return createEpisodeGifExport(API_BASE_URL);
+}
+
+export function startEpisodeExport(format = 'mp4') {
+    return createEpisodeExport(API_BASE_URL, format);
 }
 
 export async function renderGifFromPngs(frames, durations, stepDurationMs) {
