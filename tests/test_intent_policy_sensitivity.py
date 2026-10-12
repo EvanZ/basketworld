@@ -72,8 +72,9 @@ def _single_obs():
 
 
 def test_build_intent_variant_batch_patches_scalar_and_set_fields():
-    batch, intents = build_intent_variant_batch(_single_obs(), num_intents=4)
+    batch, intents, gate = build_intent_variant_batch(_single_obs(), num_intents=4)
     assert intents == [0, 1, 2, 3]
+    np.testing.assert_array_equal(gate, np.ones(4, dtype=np.float32))
     assert batch["globals"].shape == (4, 8)
     assert np.isclose(batch["globals"][2, -4], 2.0 / 3.0)
     assert np.isclose(batch["globals"][3, -3], 1.0)

@@ -82,6 +82,37 @@ def test_jax_dev_runtime_adapts_attention_observation_with_extra_token_and_globa
     np.testing.assert_allclose(adapted[:, -1], np.asarray(flat[:, current_global_start + current_global_dim]))
 
 
+def test_jax_dev_runtime_adapts_v3_flat_observation_for_v2_checkpoint():
+    n_players = 4
+    offense_count = 2
+    prefix_dim = 9
+    legacy_multi_dim = 7
+    role_and_shooting_dim = 1 + (3 * offense_count)
+    skill_dim = 4 * n_players
+    current_dim = prefix_dim + legacy_multi_dim + skill_dim + role_and_shooting_dim
+    expected_dim = current_dim - skill_dim
+    spec = SimpleNamespace(
+        model_type="mlp",
+        flat_obs_dim=expected_dim,
+        multi_possession_features=True,
+        observation_schema_version=2,
+    )
+    static = SimpleNamespace(
+        role_encoding=np.zeros((n_players,), dtype=np.float32),
+        offense_ids=np.zeros((offense_count,), dtype=np.int32),
+    )
+    flat = jnp.arange(current_dim, dtype=jnp.float32)[None, :]
+
+    adapted = np.asarray(_adapt_policy_observation_to_spec(flat, static, spec, jnp))
+
+    remove_start = prefix_dim + legacy_multi_dim
+    expected = np.concatenate(
+        [np.asarray(flat)[:, :remove_start], np.asarray(flat)[:, remove_start + skill_dim :]],
+        axis=1,
+    )
+    np.testing.assert_allclose(adapted, expected)
+
+
 class _FakeRawJaxModel:
     metadata = {"policy_spec": {"model_type": "mlp"}}
 
@@ -513,6 +544,13 @@ def test_jax_dev_runtime_fast_self_play_returns_board_state_with_value_overlay_o
     assert len(start["state"]["player_shooting_skills"]) == runtime.n_players
     assert len(start["state"]["player_rebound_skills"]) == runtime.n_players
     assert len(start["state"]["player_rebound_skill_specialists"]) == runtime.n_players
+    assert len(start["state"]["player_episode_skills"]) == runtime.n_players
+    assert set(start["state"]["player_episode_skills"]["0"]) == {
+        "pressure",
+        "steal",
+        "ball_handling",
+        "passing",
+    }
     assert len(start["state"]["team_a_shooting_pct_by_player"]["layup"]) == runtime.n_players // 2
     assert len(start["state"]["team_b_shooting_pct_by_player"]["layup"]) == runtime.n_players // 2
     assert start["state"]["episode_parameters"]["shot"] == start["state"]["shot_params"]
@@ -553,6 +591,7 @@ def test_jax_dev_runtime_fast_self_play_returns_board_state_with_value_overlay_o
     assert "pre_step_state_values" not in body
     assert "episode_parameters" not in state
     assert "offense_shooting_pct_by_player" in state
+    assert "player_episode_skills" not in state
     assert "intent_active_current" in state
     assert "intent_index_current" in state
     assert "current_play_name" in state
@@ -1616,8 +1655,16 @@ def test_jax_dev_runtime_exposes_dynamic_multi_possession_game_context():
     assert state["inbound_deadline_steps"] == 4
     assert state["start_templates_disabled"] is True
     assert state["obs_tokens"]["globals"]
-    assert state["obs_tokens"]["players_labels"][-2:] == ["is_inbounder", "on_court"]
+    assert state["obs_tokens"]["players_labels"][-6:] == [
+        "is_inbounder",
+        "on_court",
+        "pressure_skill",
+        "steal_skill",
+        "ball_handling_skill",
+        "passing_skill",
+    ]
     assert len(state["obs_tokens"]["players_labels"]) == len(state["obs_tokens"]["players"][0])
+    assert len(state["player_episode_skills"]) == runtime.n_players
     assert state["obs_tokens"]["globals_labels"][-5:] == [
         "relative_score",
         "possessions_remaining_norm",
@@ -1626,6 +1673,157 @@ def test_jax_dev_runtime_exposes_dynamic_multi_possession_game_context():
         "restart_countdown_norm",
     ]
     assert runtime.observation_dict(observer_is_offense=True)["role_flag"].tolist() == [-1.0]
+
+
+def test_jax_dev_runtime_box_score_accumulates_authoritative_events_and_team_totals():
+    runtime = _make_runtime(
+        env_params={
+            "enable_multi_possession": True,
+            "multi_possession_limit": 5,
+        }
+    )
+    prev_state = runtime.state._replace(
+        offense_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
+    )
+    shooter = runtime.offense_ids[0]
+    passer = runtime.offense_ids[1]
+    rebounder = runtime.offense_ids[2]
+    stealer = runtime.defense_ids[0]
+
+    def output(**updates):
+        fields = {
+            "shot_attempt": np.asarray([0]),
+            "shot_shooter": np.asarray([-1]),
+            "shot_type": np.asarray([0]),
+            "shot_success": np.asarray([0]),
+            "shot_value": np.asarray([0.0]),
+            "assist": np.asarray([0]),
+            "assist_passer": np.asarray([-1]),
+            "rebound_attempt": np.asarray([0]),
+            "rebound_winner": np.asarray([-1]),
+            "offensive_rebound": np.asarray([0]),
+            "defensive_rebound": np.asarray([0]),
+            "turnover": np.asarray([0]),
+            "turnover_player": np.asarray([-1]),
+            "steal_player": np.asarray([-1]),
+        }
+        fields.update(updates)
+        return SimpleNamespace(**fields)
+
+    runtime._record_box_score_step(
+        prev_state,
+        output(
+            shot_attempt=np.asarray([1]),
+            shot_shooter=np.asarray([shooter]),
+            shot_type=np.asarray([3]),
+            shot_success=np.asarray([1]),
+            shot_value=np.asarray([3.0]),
+            assist=np.asarray([1]),
+            assist_passer=np.asarray([passer]),
+        ),
+    )
+    runtime._record_box_score_step(
+        prev_state,
+        output(
+            shot_attempt=np.asarray([1]),
+            shot_shooter=np.asarray([shooter]),
+            shot_type=np.asarray([SHOT_TYPE_DUNK]),
+            shot_success=np.asarray([0]),
+            shot_value=np.asarray([2.0]),
+            rebound_attempt=np.asarray([1]),
+            rebound_winner=np.asarray([rebounder]),
+            offensive_rebound=np.asarray([1]),
+        ),
+    )
+    runtime._record_box_score_step(
+        prev_state,
+        output(
+            turnover=np.asarray([1]),
+            turnover_player=np.asarray([shooter]),
+            steal_player=np.asarray([stealer]),
+        ),
+    )
+    runtime._record_box_score_step(
+        prev_state,
+        output(turnover=np.asarray([1])),
+    )
+
+    payload = runtime._box_score_payload(team_a_score=4.0, team_b_score=0.0)
+    player_rows = {row["player_id"]: row for row in payload["player"]["players"]}
+    ai_rows = {row["player_id"]: row for row in payload["ai"]["players"]}
+
+    assert player_rows[shooter] == {
+        "player_id": shooter,
+        "pts": 3,
+        "fgm": 1,
+        "fga": 2,
+        "two_pm": 0,
+        "two_pa": 1,
+        "three_pm": 1,
+        "three_pa": 1,
+        "dunk_m": 0,
+        "dunk_a": 1,
+        "orb": 0,
+        "drb": 0,
+        "reb": 0,
+        "ast": 0,
+        "stl": 0,
+        "tov": 1,
+    }
+    assert player_rows[passer]["ast"] == 1
+    assert player_rows[rebounder]["orb"] == 1
+    assert player_rows[rebounder]["reb"] == 1
+    assert ai_rows[stealer]["stl"] == 1
+    assert payload["player"]["totals"]["pts"] == 4
+    assert payload["player"]["unattributed_points"] == 1
+    assert payload["player"]["totals"]["tov"] == 2
+    assert payload["player"]["unattributed_turnovers"] == 1
+
+
+def test_jax_dev_runtime_box_score_is_present_in_full_and_fast_state():
+    runtime = _make_runtime(
+        env_params={
+            "enable_multi_possession": True,
+            "multi_possession_limit": 5,
+        }
+    )
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.display_env
+    game_state.unified_policy = runtime.unified_policy
+    game_state.defense_policy = runtime.opponent_policy
+    game_state.user_team = Team.OFFENSE
+
+    for compact in (False, True):
+        state = runtime.get_full_game_state(
+            game_state,
+            include_policy_probs=False,
+            compact=compact,
+        )
+        assert set(state["box_score"]) == {"player", "ai"}
+        assert len(state["box_score"]["player"]["players"]) == 3
+        assert state["box_score"]["player"]["totals"]["pts"] == state["user_score"]
+        assert state["box_score"]["ai"]["totals"]["pts"] == state["ai_score"]
+
+
+def test_jax_dev_runtime_box_score_resets_with_game_and_restores_with_snapshot():
+    runtime = _make_runtime(
+        env_params={
+            "enable_multi_possession": True,
+            "multi_possession_limit": 5,
+        }
+    )
+    player_id = runtime.offense_ids[0]
+    runtime._box_score_players[str(player_id)]["pts"] = 2
+    snapshot = runtime.capture_snapshot()
+
+    runtime._box_score_players[str(player_id)]["pts"] = 7
+    runtime.restore_snapshot(snapshot)
+    assert runtime._box_score_players[str(player_id)]["pts"] == 2
+
+    runtime.reset(seed=99)
+    assert runtime._box_score_players[str(player_id)]["pts"] == 0
+    assert runtime._box_score_unattributed_turnovers == {"team_a": 0, "team_b": 0}
 
 
 def test_jax_dev_runtime_serializes_check_restart_in_full_and_fast_modes():

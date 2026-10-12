@@ -71,6 +71,10 @@ class TrajectoryBatch(NamedTuple):
     completed_passes: Any
     assists: Any
     turnovers: Any
+    pressure_opportunities: Any
+    pressure_expected_turnovers: Any
+    pass_interception_opportunities: Any
+    pass_expected_interceptions: Any
     learner_turnovers: Any
     opponent_turnovers: Any
     turnover_pass_out_of_bounds: Any

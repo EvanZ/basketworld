@@ -1,6 +1,18 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { api } from './api'
+import {
+  eloSparklineCoordinates,
+  eloSparklinePoints,
+  eloWarningMessages,
+  fitLogElo,
+  latestEloGainPerThousandUpdates,
+  prepareEloSeries,
+} from './elo'
+import {
+  estimateRemainingTrainingSeconds,
+  remainingTrainingTimeCaption,
+} from './runTiming'
 
 const defaultConfig = () => ({
   name: `halfcourt-${new Date().toISOString().slice(0, 10)}`,
@@ -118,6 +130,9 @@ const metricToAdd = ref('')
 const metricPickerOpen = ref(false)
 const metricsLoading = ref(false)
 const metricsError = ref('')
+const eloSummary = ref(null)
+const eloLoading = ref(false)
+const eloError = ref('')
 const activeView = ref('runs')
 let refreshTimer = null
 let previewTimer = null
@@ -129,8 +144,23 @@ const activeRun = computed(() => runs.value.find((run) =>
 ))
 const canPause = computed(() => selected.value?.status === 'running')
 const canResume = computed(() => selected.value?.status === 'paused')
+const canRecover = computed(() => selected.value?.status === 'stopped')
+const continuationUpdates = ref(10000)
+const continuationTarget = computed(() => {
+  const currentUpdate = Number(selected.value?.current_update) || 0
+  const targetUpdates = Number(selected.value?.target_updates) || 0
+  const additionalUpdates = Number(continuationUpdates.value)
+  if (!Number.isInteger(additionalUpdates) || additionalUpdates < 1) return null
+  return Math.max(currentUpdate, targetUpdates) + additionalUpdates
+})
+const canContinue = computed(() => (
+  selected.value?.status === 'completed'
+  && continuationTarget.value !== null
+  && continuationTarget.value <= 1_000_000
+))
 const canCheckpoint = computed(() => selected.value?.status === 'running')
 const canStop = computed(() => ['starting', 'running', 'pausing'].includes(selected.value?.status))
+const provenanceComparison = computed(() => selected.value?.provenance_comparison || null)
 const filteredConfigSchema = computed(() => {
   const query = configSearch.value.trim().toLowerCase()
   return configSchema.value.filter((field) => {
@@ -168,6 +198,17 @@ const metricCards = computed(() => selectedMetricNames.value.map((name) => ({
   points: metricSeries.value[name] || [],
   available: availableMetricNames.value.has(name),
 })))
+const eloPoints = computed(() => prepareEloSeries(eloSummary.value))
+const eloPlotPoints = computed(() => eloSparklineCoordinates(eloPoints.value))
+const latestElo = computed(() => eloPoints.value[eloPoints.value.length - 1] || null)
+const eloWarnings = computed(() => eloWarningMessages(eloSummary.value))
+const eloLogFit = computed(() => fitLogElo(eloPoints.value))
+const recentEloGainPerThousand = computed(() => latestEloGainPerThousandUpdates(eloPoints.value))
+const estimatedRemainingSeconds = computed(() => estimateRemainingTrainingSeconds(selected.value))
+const estimatedRemainingCaption = computed(() => remainingTrainingTimeCaption(
+  selected.value,
+  estimatedRemainingSeconds.value,
+))
 
 const applicationConfigValues = computed(() => ({
   num_updates: config.value.num_updates,
@@ -200,6 +241,11 @@ function formatDuration(totalSeconds) {
   const remainder = seconds % 60
   const clock = [hours, minutes, remainder].map((value) => String(value).padStart(2, '0')).join(':')
   return days ? `${days}d ${clock}` : clock
+}
+
+function shortCommit(provenance) {
+  const commit = provenance?.commit_sha
+  return typeof commit === 'string' && commit ? commit.slice(0, 12) : 'unavailable'
 }
 
 function formatRunConfigValue(value) {
@@ -240,6 +286,16 @@ function formatMetricValue(value) {
   const absolute = Math.abs(value)
   if ((absolute > 0 && absolute < 0.001) || absolute >= 100000) return value.toExponential(2)
   return value.toLocaleString(undefined, { maximumFractionDigits: absolute < 10 ? 4 : 2 })
+}
+
+function formatElo(value) {
+  return Number.isFinite(Number(value)) ? Math.round(Number(value)).toLocaleString() : '—'
+}
+
+function formatEloDelta(value) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return '—'
+  return `${numeric >= 0 ? '+' : ''}${Math.round(numeric).toLocaleString()}`
 }
 
 function metricStats(points) {
@@ -327,6 +383,21 @@ async function loadMetrics({ refreshCatalog = false } = {}) {
     if (selected.value?.id === runId) metricsError.value = cause.message
   } finally {
     metricsLoading.value = false
+  }
+}
+
+async function loadHistoricalElo() {
+  const runId = selected.value?.id
+  if (!runId || eloLoading.value) return
+  eloLoading.value = true
+  eloError.value = ''
+  try {
+    const result = await api.getHistoricalElo(runId)
+    if (selected.value?.id === runId) eloSummary.value = result
+  } catch (cause) {
+    if (selected.value?.id === runId) eloError.value = cause.message
+  } finally {
+    eloLoading.value = false
   }
 }
 
@@ -486,12 +557,18 @@ async function selectRun(run) {
       api.getLogs(run.id),
     ])
     selected.value = detail
+    continuationUpdates.value = 10000
     logs.value = logText
+    eloSummary.value = null
+    eloError.value = ''
     activeView.value = 'detail'
     availableMetrics.value = []
     metricSeries.value = {}
     lastMetricCatalogAt = 0
-    await loadMetrics({ refreshCatalog: true })
+    await Promise.all([
+      loadMetrics({ refreshCatalog: true }),
+      loadHistoricalElo(),
+    ])
   } catch (cause) {
     error.value = cause.message
   }
@@ -550,12 +627,71 @@ async function runAction(action) {
   }
 }
 
+async function withProvenanceConfirmation(requestAction) {
+  try {
+    return await requestAction(false)
+  } catch (cause) {
+    const detail = cause?.detail
+    if (detail?.code !== 'provenance_confirmation_required') throw cause
+    const accepted = window.confirm(
+      `${detail.message}\n\nThe trainer will still validate the checkpoint's model, observation, action, and resolved configuration before launch. Continue anyway?`,
+    )
+    if (!accepted) return null
+    return requestAction(true)
+  }
+}
+
+async function resumeRun() {
+  if (!selected.value || (!canResume.value && !canRecover.value)) return
+  loading.value = true
+  error.value = ''
+  try {
+    const response = await withProvenanceConfirmation((confirmed) => (
+      api.resumeRun(selected.value.id, confirmed)
+    ))
+    if (response) {
+      selected.value = response.run
+      await loadRuns()
+    }
+  } catch (cause) {
+    error.value = cause.message
+  } finally {
+    loading.value = false
+  }
+}
+
+async function continueRun() {
+  if (!selected.value || !canContinue.value) return
+  loading.value = true
+  error.value = ''
+  try {
+    const response = await withProvenanceConfirmation((confirmed) => (
+      api.continueRun(
+        selected.value.id,
+        Number(continuationUpdates.value),
+        confirmed,
+      )
+    ))
+    if (response) {
+      selected.value = response.run
+      await loadRuns()
+    }
+  } catch (cause) {
+    error.value = cause.message
+  } finally {
+    loading.value = false
+  }
+}
+
 onMounted(async () => {
   const [, , schema] = await Promise.all([loadRuns(), loadPreview(), api.getConfigSchema()])
   configSchema.value = schema
   refreshTimer = window.setInterval(() => loadRuns(), 2500)
   metricRefreshTimer = window.setInterval(() => {
-    if (activeView.value === 'detail') loadMetrics()
+    if (activeView.value === 'detail') {
+      loadMetrics()
+      loadHistoricalElo()
+    }
   }, 10000)
 })
 
@@ -718,7 +854,17 @@ onBeforeUnmount(() => {
               <button @click="cloneRun(selected)">Copy as new run</button>
               <button :disabled="loading || !canCheckpoint" @click="runAction('checkpoint')">Checkpoint</button>
               <button :disabled="loading || !canPause" @click="runAction('pause')">Pause</button>
-              <button class="primary" :disabled="loading || !canResume" @click="runAction('resume')">Resume</button>
+              <button v-if="selected.status === 'paused'" class="primary" :disabled="loading || !canResume" @click="resumeRun">Resume</button>
+              <button v-if="selected.status === 'stopped'" class="primary" :disabled="loading || !canRecover" @click="resumeRun">Recover checkpoint</button>
+              <div v-if="selected.status === 'completed'" class="continue-control">
+                <label>
+                  <span>More updates</span>
+                  <input v-model.number="continuationUpdates" type="number" min="1" max="1000000" step="1000" :disabled="loading" />
+                </label>
+                <small v-if="continuationTarget">New target: {{ continuationTarget.toLocaleString() }} · same MLflow run</small>
+                <small v-else class="error-text">Enter at least one update.</small>
+                <button class="primary" :disabled="loading || !canContinue" @click="continueRun">Continue</button>
+              </div>
               <button class="danger" :disabled="loading || !canStop" @click="runAction('stop')">Stop</button>
             </div>
           </div>
@@ -726,6 +872,11 @@ onBeforeUnmount(() => {
             <article class="panel stat"><span>Update</span><strong>{{ selected.current_update.toLocaleString() }}</strong><small>of {{ selected.target_updates.toLocaleString() }}</small></article>
             <article class="panel stat"><span>Progress</span><strong>{{ progress(selected).toFixed(1) }}%</strong><small>{{ selected.worker_status?.state || selected.status }}</small></article>
             <article class="panel stat"><span>Training time</span><strong class="duration-value">{{ formatDuration(selected.training_elapsed_seconds) }}</strong><small>active elapsed</small></article>
+            <article class="panel stat" title="Estimated from the average active training time per completed update. The estimate adjusts as the run progresses and excludes time spent paused.">
+              <span>Time left</span>
+              <strong class="duration-value">{{ estimatedRemainingSeconds === null ? 'Calculating' : formatDuration(estimatedRemainingSeconds) }}</strong>
+              <small>{{ estimatedRemainingCaption }}</small>
+            </article>
             <article class="panel stat"><span>Steps / sec</span><strong>{{ Math.round(selected.worker_status?.metrics?.end_to_end_steps_per_sec || 0).toLocaleString() }}</strong><small>end to end</small></article>
             <article class="panel stat">
               <span>MLflow</span>
@@ -744,6 +895,77 @@ onBeforeUnmount(() => {
             </article>
           </div>
           <div class="panel progress-panel"><span class="progress-track large"><i :style="{ width: `${progress(selected)}%` }"></i></span></div>
+          <div v-if="provenanceComparison" class="panel provenance-panel" :class="provenanceComparison.status">
+            <div>
+              <p class="eyebrow">CHECKPOINT COMPATIBILITY</p>
+              <h3>Source provenance: {{ provenanceComparison.status }}</h3>
+              <p>{{ provenanceComparison.message }}</p>
+            </div>
+            <dl v-if="provenanceComparison.checkpoint || provenanceComparison.current">
+              <div><dt>Checkpoint commit</dt><dd class="mono">{{ shortCommit(provenanceComparison.checkpoint) }}</dd></div>
+              <div><dt>Current commit</dt><dd class="mono">{{ shortCommit(provenanceComparison.current) }}</dd></div>
+              <div><dt>Tracked diff</dt><dd>{{ provenanceComparison.checkpoint?.worktree_dirty ? 'checkpoint dirty' : 'checkpoint clean' }} · {{ provenanceComparison.current?.worktree_dirty ? 'current dirty' : 'current clean' }}</dd></div>
+            </dl>
+            <small>Diagnostic only — an exact Git match does not prove runtime or dependency compatibility.</small>
+          </div>
+          <div class="panel elo-panel">
+            <div class="detail-section-heading">
+              <div>
+                <h3>Deterministic checkpoint Elo</h3>
+                <span>Batch fit from completed historical-evaluation episodes</span>
+              </div>
+              <span v-if="eloSummary?.anchor_update" class="elo-anchor">
+                U{{ eloSummary.anchor_update }} = {{ formatElo(eloSummary.anchor_rating) }}
+              </span>
+            </div>
+            <p v-if="eloError" class="metric-error">{{ eloError }}</p>
+            <div v-if="eloSummary?.status === 'ready' && latestElo" class="elo-content">
+              <div class="elo-stat-strip">
+                <div><span>Training update</span><strong>U{{ selected.current_update.toLocaleString() }}</strong></div>
+                <div><span>Latest evaluated</span><strong>U{{ latestElo.update.toLocaleString() }}</strong></div>
+                <div><span>Elo</span><strong>{{ formatElo(latestElo.elo_rating) }}</strong></div>
+                <div><span>Change</span><strong :class="{ positive: latestElo.elo_delta > 0, negative: latestElo.elo_delta < 0 }">{{ formatEloDelta(latestElo.elo_delta) }}</strong></div>
+                <div title="R² for an ordinary least-squares fit of Elo against the natural logarithm of training update."><span>Log-fit R²</span><strong>{{ eloLogFit ? eloLogFit.rSquared.toFixed(2) : '—' }}</strong></div>
+                <div title="Elo change between the latest two evaluated checkpoints, normalized to 1,000 training updates."><span>Recent / 1k</span><strong :class="{ positive: recentEloGainPerThousand > 0, negative: recentEloGainPerThousand < 0 }">{{ formatEloDelta(recentEloGainPerThousand) }}</strong></div>
+                <div><span>Next evaluation</span><strong>{{ eloSummary.next_evaluation_update ? `U${eloSummary.next_evaluation_update.toLocaleString()}` : 'Final milestone' }}</strong></div>
+              </div>
+              <div class="elo-chart-wrap">
+                <div class="elo-chart-stage">
+                  <svg class="elo-sparkline" viewBox="0 0 420 112" preserveAspectRatio="none" role="img" aria-label="Deterministic Elo by checkpoint update">
+                    <polyline :points="eloSparklinePoints(eloPoints)" />
+                    <circle
+                      v-for="point in eloPlotPoints"
+                      :key="point.update"
+                      :cx="point.x"
+                      :cy="point.y"
+                      r="3.2"
+                    >
+                      <title>U{{ point.update }} · Elo {{ formatElo(point.elo_rating) }}</title>
+                    </circle>
+                  </svg>
+                  <span
+                    v-for="point in eloPlotPoints"
+                    :key="`elo-data-label-${point.update}`"
+                    class="elo-data-label"
+                    :class="{ below: point.y < 34 }"
+                    :style="{ left: `${(point.x / 420) * 100}%`, top: `${(point.y / 112) * 100}%` }"
+                    :title="`Update ${point.update.toLocaleString()}`"
+                  >{{ formatElo(point.elo_rating) }}</span>
+                </div>
+                <div class="elo-axis-labels">
+                  <span>U{{ eloPoints[0].update.toLocaleString() }}</span>
+                  <span>U{{ latestElo.update.toLocaleString() }}</span>
+                </div>
+              </div>
+              <div class="elo-checkpoints" aria-label="Elo checkpoint values">
+                <span v-for="point in eloPoints" :key="`elo-label-${point.update}`">U{{ point.update }} <strong>{{ formatElo(point.elo_rating) }}</strong></span>
+              </div>
+              <p v-for="warning in eloWarnings" :key="warning" class="elo-warning">{{ warning }}</p>
+            </div>
+            <div v-else class="empty-elo">
+              {{ eloLoading ? 'Calculating Elo…' : 'Waiting for at least one deterministic cross-checkpoint historical evaluation.' }}
+            </div>
+          </div>
           <div class="panel metrics-panel">
             <div class="detail-section-heading metrics-heading">
               <div><h3>MLflow metrics</h3><span>{{ selectedMetricNames.length }} pinned · {{ availableMetrics.length }} available</span></div>

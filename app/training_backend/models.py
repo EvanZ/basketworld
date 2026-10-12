@@ -123,6 +123,7 @@ class TrainingRun(BaseModel):
     status_file: str
     log_file: str
     error_message: str | None = None
+    provenance: dict[str, Any] = Field(default_factory=dict)
 
 
 class RunEvent(BaseModel):
@@ -141,11 +142,33 @@ class RunDetail(TrainingRun):
     display_command: str
     resolved_config: list[dict[str, Any]] = Field(default_factory=list)
     training_elapsed_seconds: float = 0.0
+    provenance_comparison: dict[str, Any] | None = None
+
+
+class HistoricalEloSummary(BaseModel):
+    status: Literal["waiting", "ready"]
+    anchor_update: int | None = None
+    anchor_rating: float | None = None
+    latest: dict[str, Any] | None = None
+    points: list[dict[str, Any]] = Field(default_factory=list)
+    next_evaluation_update: int | None = None
+    warnings: list[str] = Field(default_factory=list)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    source_signature: dict[str, int] | None = None
 
 
 class RunActionResponse(BaseModel):
     run: TrainingRun
     message: str
+
+
+class RunContinuationRequest(BaseModel):
+    additional_updates: int = Field(default=10_000, ge=1, le=1_000_000)
+    confirm_provenance_mismatch: bool = False
+
+
+class RunResumeRequest(BaseModel):
+    confirm_provenance_mismatch: bool = False
 
 
 class HealthResponse(BaseModel):

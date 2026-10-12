@@ -93,3 +93,23 @@ test('MP4 export selects the movie backend and retains bounded batches', async (
   assert.equal(result.file_path, '/tmp/episode.mp4');
   assert.equal(urls[0], '/api/episode_exports?format=mp4');
 });
+
+test('MP4 export forwards soundtrack inclusion and playback volume', async () => {
+  const urls = [];
+  const writer = await createEpisodeExport('', 'mp4', async (url, options) => {
+    urls.push(url);
+    if (url.includes('/episode_exports?')) {
+      return ok({ export_id: 'movie-with-music', format: 'mp4', audio: true });
+    }
+    if (url.endsWith('/finish')) {
+      return ok({ status: 'success', frame_count: 0, audio: true });
+    }
+    throw new Error(`Unexpected request ${url} ${options.method}`);
+  }, { includeAudio: true, audioVolume: 0.45 });
+  const result = await writer.finish();
+  assert.equal(result.audio, true);
+  assert.equal(
+    urls[0],
+    '/api/episode_exports?format=mp4&include_audio=true&audio_volume=0.45',
+  );
+});

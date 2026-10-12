@@ -86,6 +86,9 @@ def build_checkpoint_payload(
     env_config: dict[str, Any] | None = None,
     intent_discriminator_state: dict[str, Any] | None = None,
     play_name_metadata: dict[str, Any] | None = None,
+    observation_metadata: dict[str, Any] | None = None,
+    source_provenance: dict[str, Any] | None = None,
+    resolved_training_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = {
         "checkpoint_version": CHECKPOINT_VERSION,
@@ -134,6 +137,12 @@ def build_checkpoint_payload(
         )
     if play_name_metadata is not None:
         payload["play_name_metadata"] = dict(play_name_metadata)
+    if observation_metadata is not None:
+        payload["observation_metadata"] = dict(observation_metadata)
+    if source_provenance is not None:
+        payload["source_provenance"] = dict(source_provenance)
+    if resolved_training_config is not None:
+        payload["resolved_training_config"] = dict(resolved_training_config)
     return payload
 
 
@@ -182,6 +191,18 @@ def _metadata_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         model_codename = str(play_name_metadata.get("model_codename", "")).strip()
         if model_codename:
             metadata["model_codename"] = model_codename
+    if payload.get("observation_metadata") is not None:
+        metadata["observation_metadata"] = _to_jsonable(
+            dict(payload["observation_metadata"])
+        )
+    if payload.get("source_provenance") is not None:
+        metadata["source_provenance"] = _to_jsonable(
+            dict(payload["source_provenance"])
+        )
+    if payload.get("resolved_training_config") is not None:
+        metadata["resolved_training_config"] = _to_jsonable(
+            dict(payload["resolved_training_config"])
+        )
     return metadata
 
 
@@ -230,6 +251,16 @@ def _payload_from_metadata(metadata: dict[str, Any], state: dict[str, Any]) -> d
         payload["play_name_map"] = _from_jsonable(metadata["play_name_map"])
     if "model_codename" in metadata:
         payload["model_codename"] = metadata["model_codename"]
+    if "observation_metadata" in metadata:
+        payload["observation_metadata"] = _from_jsonable(
+            metadata["observation_metadata"]
+        )
+    if "source_provenance" in metadata:
+        payload["source_provenance"] = _from_jsonable(metadata["source_provenance"])
+    if "resolved_training_config" in metadata:
+        payload["resolved_training_config"] = _from_jsonable(
+            metadata["resolved_training_config"]
+        )
     return payload
 
 
@@ -241,6 +272,56 @@ def _state_dir(path: str | Path) -> Path:
 
 def _metadata_path(path: str | Path) -> Path:
     return Path(path) / METADATA_FILENAME
+
+
+def _read_checkpoint_metadata(path: str | Path) -> dict[str, Any]:
+    checkpoint_path = Path(path)
+    metadata_file = _metadata_path(checkpoint_path)
+    if not metadata_file.is_file():
+        raise FileNotFoundError(f"JAX checkpoint metadata not found at {metadata_file}.")
+    with metadata_file.open("r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    version = int(metadata.get("checkpoint_version", 0))
+    if version != CHECKPOINT_VERSION:
+        raise ValueError(
+            f"Unsupported JAX checkpoint version {version}; expected {CHECKPOINT_VERSION}."
+        )
+    return metadata
+
+
+def load_checkpoint_metadata(path: str | Path) -> dict[str, Any]:
+    """Load a checkpoint's JSON metadata without restoring its Orbax state.
+
+    Evaluation preflight needs environment and trainer settings, not policy
+    tensors.  Reading this compact sidecar prevents an otherwise redundant
+    full restore before the runtime performs the one restore it actually needs.
+    """
+    checkpoint_path = Path(path)
+    if checkpoint_path.is_file():
+        payload = _load_legacy_pickle_checkpoint(checkpoint_path)
+        return {
+            key: value
+            for key, value in payload.items()
+            if key not in {"params", "opt_state", "current_state", "eval_initial_state"}
+        }
+    metadata = _read_checkpoint_metadata(checkpoint_path)
+    payload: dict[str, Any] = {
+        "checkpoint_version": int(metadata["checkpoint_version"]),
+        "saved_at": metadata["saved_at"],
+        "update_index": int(metadata["update_index"]),
+        "trainer_config": _from_jsonable(metadata["trainer_config"]),
+        "policy_spec": _from_jsonable(metadata["policy_spec"]),
+        "frozen_config": _from_jsonable(metadata["frozen_config"]),
+    }
+    for key in (
+        "env_config",
+        "observation_metadata",
+        "source_provenance",
+        "resolved_training_config",
+    ):
+        if key in metadata:
+            payload[key] = _from_jsonable(metadata[key])
+    return payload
 
 
 def _save_orbax_state(path: str | Path, state: dict[str, Any]) -> None:
@@ -289,18 +370,7 @@ def load_checkpoint(path: str | Path) -> dict[str, Any]:
     if checkpoint_path.is_file():
         return _load_legacy_pickle_checkpoint(checkpoint_path)
 
-    metadata_file = _metadata_path(checkpoint_path)
-    if not metadata_file.is_file():
-        raise FileNotFoundError(f"JAX checkpoint metadata not found at {metadata_file}.")
-
-    with metadata_file.open("r", encoding="utf-8") as handle:
-        metadata = json.load(handle)
-
-    version = int(metadata.get("checkpoint_version", 0))
-    if version != CHECKPOINT_VERSION:
-        raise ValueError(
-            f"Unsupported JAX checkpoint version {version}; expected {CHECKPOINT_VERSION}."
-        )
+    metadata = _read_checkpoint_metadata(checkpoint_path)
     state = _load_orbax_state(checkpoint_path)
     return _payload_from_metadata(metadata, state)
 

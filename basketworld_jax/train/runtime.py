@@ -12,11 +12,13 @@ from basketworld_jax.env import (
     assemble_full_actions_jax,
     build_action_masks_batch,
     build_aggregated_reward_batch,
+    build_pass_steal_probabilities_batch,
     build_opponent_role_flags_batch,
     build_policy_intent_context_batch,
     build_policy_intent_context_batch_with_role_flag,
     build_policy_observation_batch,
     build_policy_observation_batch_with_role_flag,
+    build_turnover_probabilities_batch,
     build_training_role_flags_batch,
     replace_done_states,
     reset_batch_minimal,
@@ -765,6 +767,37 @@ def _build_turnover_transition_metrics(static, env_out, jnp) -> dict[str, Any]:
     }
 
 
+def _build_skill_calibration_transition_metrics(static, state, env_out, jnp) -> dict[str, Any]:
+    pressure_risks = build_turnover_probabilities_batch(static, state, jnp)
+    pressure_expected = jnp.max(pressure_risks, axis=1).astype(jnp.float32)
+    pass_risks = build_pass_steal_probabilities_batch(static, state, jnp)
+    active_offense_ids = jnp.where(
+        (state.offense_team == 0)[:, None],
+        jnp.broadcast_to(static.offense_ids[None, :], pass_risks.shape),
+        jnp.broadcast_to(static.defense_ids[None, :], pass_risks.shape),
+    )
+    receiver_matches = active_offense_ids == env_out.pass_receiver[:, None]
+    receiver_slot = jnp.argmax(receiver_matches.astype(jnp.int32), axis=1)
+    selected_pass_risk = jnp.take_along_axis(
+        pass_risks,
+        receiver_slot[:, None],
+        axis=1,
+    )[:, 0]
+    valid_pass = env_out.pass_attempt.astype(jnp.bool_) & jnp.any(
+        receiver_matches, axis=1
+    )
+    return {
+        "pressure_opportunities": (pressure_expected > 0.0).astype(jnp.int8),
+        "pressure_expected_turnovers": pressure_expected,
+        "pass_interception_opportunities": valid_pass.astype(jnp.int8),
+        "pass_expected_interceptions": jnp.where(
+            valid_pass,
+            selected_pass_risk,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        ),
+    }
+
+
 def _build_intent_transition_metrics(state) -> dict[str, Any]:
     return {
         "intent_index": state.intent_index.astype(state.intent_index.dtype),
@@ -1329,6 +1362,9 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
             aggregated_reward = build_aggregated_reward_batch(static, env_out.rewards, jnp)
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             turnover_metrics = _build_turnover_transition_metrics(static, env_out, jnp)
+            skill_calibration_metrics = _build_skill_calibration_transition_metrics(
+                static, policy_state, env_out, jnp
+            )
             rebound_metrics = _mask_rebound_transition_metrics(
                 _build_rebound_transition_metrics(env_out, jnp),
                 active_step,
@@ -1349,6 +1385,9 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 jnp,
             )
             turnover_metrics = _mask_step_metrics(turnover_metrics, active_step, jnp)
+            skill_calibration_metrics = _mask_step_metrics(
+                skill_calibration_metrics, active_step, jnp
+            )
             intent_metrics = _mask_step_metrics(
                 _build_intent_transition_metrics(policy_state),
                 active_step,
@@ -1417,6 +1456,7 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 completed_passes=jnp.where(active_step, env_out.completed_pass.astype(jnp.int8), 0),
                 assists=jnp.where(active_step, env_out.assist.astype(jnp.int8), 0),
                 turnovers=jnp.where(active_step, env_out.turnover.astype(jnp.int8), 0),
+                **skill_calibration_metrics,
                 clearance_events=jnp.where(active_step, env_out.clearance_event.astype(jnp.int8), 0),
                 clearance_elapsed_steps=jnp.where(
                     active_step,
@@ -1794,6 +1834,9 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             aggregated_reward = build_aggregated_reward_batch(static, env_out.rewards, jnp)
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             turnover_metrics = _build_turnover_transition_metrics(static, env_out, jnp)
+            skill_calibration_metrics = _build_skill_calibration_transition_metrics(
+                static, policy_state, env_out, jnp
+            )
             shot_metrics = _mask_step_metrics(shot_metrics, active_step, jnp)
             rebound_metrics = _mask_rebound_transition_metrics(
                 _build_rebound_transition_metrics(env_out, jnp),
@@ -1815,6 +1858,9 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 jnp,
             )
             turnover_metrics = _mask_step_metrics(turnover_metrics, active_step, jnp)
+            skill_calibration_metrics = _mask_step_metrics(
+                skill_calibration_metrics, active_step, jnp
+            )
             intent_metrics = _mask_step_metrics(
                 _build_intent_transition_metrics(policy_state),
                 active_step,
@@ -1889,6 +1935,7 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 completed_passes=jnp.where(active_step, env_out.completed_pass.astype(jnp.int8), 0),
                 assists=jnp.where(active_step, env_out.assist.astype(jnp.int8), 0),
                 turnovers=jnp.where(active_step, env_out.turnover.astype(jnp.int8), 0),
+                **skill_calibration_metrics,
                 clearance_events=jnp.where(active_step, env_out.clearance_event.astype(jnp.int8), 0),
                 clearance_elapsed_steps=jnp.where(
                     active_step,
@@ -2281,6 +2328,9 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             aggregated_reward = build_aggregated_reward_batch(static, env_out.rewards, jnp)
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             turnover_metrics = _build_turnover_transition_metrics(static, env_out, jnp)
+            skill_calibration_metrics = _build_skill_calibration_transition_metrics(
+                static, policy_state, env_out, jnp
+            )
             shot_metrics = _mask_step_metrics(shot_metrics, active_step, jnp)
             rebound_auxiliary = _build_rebound_auxiliary_transition(
                 static,
@@ -2302,6 +2352,9 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 jnp,
             )
             turnover_metrics = _mask_step_metrics(turnover_metrics, active_step, jnp)
+            skill_calibration_metrics = _mask_step_metrics(
+                skill_calibration_metrics, active_step, jnp
+            )
             intent_metrics = _mask_step_metrics(
                 _build_intent_transition_metrics(policy_state),
                 active_step,
@@ -2372,6 +2425,7 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 completed_passes=jnp.where(active_step, env_out.completed_pass.astype(jnp.int8), 0),
                 assists=jnp.where(active_step, env_out.assist.astype(jnp.int8), 0),
                 turnovers=jnp.where(active_step, env_out.turnover.astype(jnp.int8), 0),
+                **skill_calibration_metrics,
                 clearance_events=jnp.where(active_step, env_out.clearance_event.astype(jnp.int8), 0),
                 clearance_elapsed_steps=jnp.where(
                     active_step,

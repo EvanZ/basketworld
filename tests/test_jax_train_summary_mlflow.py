@@ -43,8 +43,10 @@ def test_log_mlflow_train_loop_summary_logs_json_artifact():
     assert mlflow.tags["jax_train_loop_summary_artifact"] == TRAIN_LOOP_SUMMARY_ARTIFACT_PATH
     assert mlflow.logged_payload == {
         "array_metric": [1, 2],
+        "deploy_eval_history_count": 0,
         "eval_trajectory_count": 1,
         "float_metric": 0.5,
+        "historical_eval_match_count": 0,
         "status": "train_loop",
         "train_history_count": 1,
     }

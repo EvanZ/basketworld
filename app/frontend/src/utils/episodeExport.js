@@ -1,6 +1,11 @@
 // Binary PNGs are sent in small ordered batches. The backend still spools and
 // encodes one frame at a time, so complete episodes never form one large blob.
-export async function createEpisodeExport(baseUrl, format = 'gif', fetchRequest = fetch) {
+export async function createEpisodeExport(
+  baseUrl,
+  format = 'gif',
+  fetchRequest = fetch,
+  options = {},
+) {
   const exportFormat = String(format || 'gif').toLowerCase();
   if (!['gif', 'mp4'].includes(exportFormat)) throw new Error('Episode export format must be GIF or MP4');
   const formatLabel = exportFormat.toUpperCase();
@@ -23,7 +28,17 @@ export async function createEpisodeExport(baseUrl, format = 'gif', fetchRequest 
     return response.json();
   }
 
-  const { export_id: id } = await request(`?format=${encodeURIComponent(exportFormat)}`);
+  const includeAudio = exportFormat === 'mp4' && Boolean(options?.includeAudio);
+  const requestedVolume = Number(options?.audioVolume);
+  const audioVolume = Number.isFinite(requestedVolume)
+    ? Math.max(0, Math.min(1, requestedVolume))
+    : 0.45;
+  const query = new URLSearchParams({ format: exportFormat });
+  if (includeAudio) {
+    query.set('include_audio', 'true');
+    query.set('audio_volume', String(audioVolume));
+  }
+  const { export_id: id } = await request(`?${query.toString()}`);
   if (!id) throw new Error(`Backend did not create an ${formatLabel} export`);
   const path = `/${encodeURIComponent(id)}`;
   let frameCount = 0;

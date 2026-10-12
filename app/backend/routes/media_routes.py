@@ -2,6 +2,7 @@ import os
 import io
 import json
 from datetime import datetime
+from pathlib import Path
 from typing import List
 
 import imageio
@@ -24,6 +25,12 @@ router = APIRouter()
 episode_exports = EpisodeGifExports()
 EPISODE_EXPORT_BATCH_MAX_FRAMES = 8
 EPISODE_EXPORT_BATCH_MAX_BYTES = 64 * 1024 * 1024
+DEFAULT_EPISODE_SOUNDTRACK = (
+    Path(__file__).resolve().parents[2]
+    / "frontend"
+    / "public"
+    / "roundball-rock-playback.wav"
+)
 
 
 def _is_public_mode() -> bool:
@@ -361,13 +368,30 @@ def _decode_episode_export_batch(body: bytes):
 
 
 @router.post("/api/episode_exports")
-def create_episode_export(format: str = "gif"):
+def create_episode_export(
+    format: str = "gif",
+    include_audio: bool = False,
+    audio_volume: float = 0.45,
+):
     try:
         export_format = str(format).strip().lower()
+        if not np.isfinite(audio_volume) or not 0.0 <= audio_volume <= 1.0:
+            raise ValueError("MP4 audio volume must be between 0 and 1")
+        soundtrack_path = None
+        if include_audio and export_format == "mp4":
+            if not DEFAULT_EPISODE_SOUNDTRACK.is_file():
+                raise ValueError("BasketWorld MP4 soundtrack is unavailable")
+            soundtrack_path = DEFAULT_EPISODE_SOUNDTRACK
         destination = _episode_png_output_path(export_format)
         return {
-            "export_id": episode_exports.create(destination, export_format),
+            "export_id": episode_exports.create(
+                destination,
+                export_format,
+                soundtrack_path=soundtrack_path,
+                audio_volume=audio_volume,
+            ),
             "format": export_format,
+            "audio": bool(soundtrack_path),
         }
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error

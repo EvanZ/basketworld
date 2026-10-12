@@ -883,6 +883,9 @@ def get_full_game_state(
         except Exception:
             obs_vector = obs_vector
 
+    def _float_or_default(value, default: float) -> float:
+        return float(default if value is None else value)
+
     state = {
         "players_per_side": int(env.players_per_side or 3),
         "players": int(env.players_per_side or 3),
@@ -976,13 +979,25 @@ def get_full_game_state(
         "receiver_alignment_width": float(getattr(env, "receiver_alignment_width", 2.0)),
         "max_receiver_hazard": float(getattr(env, "max_receiver_hazard", 0.85)),
         "lane_weight": float(getattr(env, "lane_weight", 0.0)),
-        "rebound_winner_distance_weight": float(getattr(env, "rebound_winner_distance_weight", 1.0)),
-        "rebound_winner_temperature": float(getattr(env, "rebound_winner_temperature", 1.0)),
-        "rebound_skill_std": float(getattr(env, "rebound_skill_std", 0.0)),
+        "rebound_winner_distance_weight": _float_or_default(
+            getattr(env, "rebound_winner_distance_weight", None), 1.0
+        ),
+        "rebound_winner_temperature": _float_or_default(
+            getattr(env, "rebound_winner_temperature", None), 1.0
+        ),
+        "rebound_skill_std": _float_or_default(
+            getattr(env, "rebound_skill_std", None), 0.0
+        ),
         "rebound_skill_sampling_mode": str(getattr(env, "rebound_skill_sampling_mode", "gaussian") or "gaussian"),
-        "rebound_skill_high": float(getattr(env, "rebound_skill_high", 1.0)),
-        "rebound_skill_low": float(getattr(env, "rebound_skill_low", -0.25)),
-        "rebound_skill_weight": float(getattr(env, "rebound_skill_weight", 0.0)),
+        "rebound_skill_high": _float_or_default(
+            getattr(env, "rebound_skill_high", None), 1.0
+        ),
+        "rebound_skill_low": _float_or_default(
+            getattr(env, "rebound_skill_low", None), -0.25
+        ),
+        "rebound_skill_weight": _float_or_default(
+            getattr(env, "rebound_skill_weight", None), 0.0
+        ),
         "spawn_distance": int(env.spawn_distance or 3),
         "max_spawn_distance": (
             int(env.max_spawn_distance)

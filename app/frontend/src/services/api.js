@@ -339,8 +339,8 @@ export function startEpisodeGifExport() {
     return createEpisodeGifExport(API_BASE_URL);
 }
 
-export function startEpisodeExport(format = 'mp4') {
-    return createEpisodeExport(API_BASE_URL, format);
+export function startEpisodeExport(format = 'mp4', options = {}) {
+    return createEpisodeExport(API_BASE_URL, format, fetch, options);
 }
 
 export async function renderGifFromPngs(frames, durations, stepDurationMs) {
@@ -456,6 +456,16 @@ export async function listPolicies(runId) {
     return response.json();
 } 
 
+export async function listRecentTrainingRuns(limit = 8) {
+    const params = new URLSearchParams({ limit: String(limit) });
+    const response = await fetch(`${API_BASE_URL}/api/training/runs?${params.toString()}`);
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Failed to list training runs' }));
+        throw new Error(errorData.detail || 'Failed to list training runs');
+    }
+    return response.json();
+}
+
 // --- Phi Shaping API ---
 export async function getPhiParams() {
   const response = await fetch(`${API_BASE_URL}/api/phi_params`);
@@ -530,6 +540,22 @@ export async function getEvaluationProgress() {
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
     throw new Error(err.detail || 'Failed to get evaluation progress');
+  }
+  return response.json();
+}
+
+export async function sampleEvalPlayerSkills(seed = null) {
+  const query = (
+    seed !== null
+    && seed !== undefined
+    && Number.isFinite(Number(seed))
+  ) ? `?seed=${encodeURIComponent(Number(seed))}` : '';
+  const response = await fetch(`${API_BASE_URL}/api/sample_eval_player_skills${query}`, {
+    method: 'POST',
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to sample evaluation roster');
   }
   return response.json();
 }
@@ -736,7 +762,9 @@ export async function swapPolicies(payload = {}) {
   });
   if (!response.ok) {
     const err = await response.json().catch(() => ({}));
-    throw new Error(err.detail || 'Failed to swap policies');
+    const error = new Error(err.detail || 'Failed to swap policies');
+    error.status = response.status;
+    throw error;
   }
   return response.json();
 }
@@ -941,4 +969,52 @@ export async function getPlayableState() {
     throw new Error(err.detail || 'Failed to fetch playable state');
   }
   return parsePlayableJsonResponse(response);
+}
+
+async function parseSkillRatingsResponse(response, fallbackMessage) {
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.detail || fallbackMessage);
+  }
+  return response.json();
+}
+
+export async function launchSkillRatingsStudy(payload) {
+  const response = await fetch(`${API_BASE_URL}/api/skill-ratings/jobs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseSkillRatingsResponse(response, 'Failed to launch Skill Ratings study');
+}
+
+export async function extendSkillRatingsStudy(payload) {
+  const response = await fetch(`${API_BASE_URL}/api/skill-ratings/extensions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseSkillRatingsResponse(response, 'Failed to extend Skill Ratings study');
+}
+
+export async function getSkillRatingsJob(jobId) {
+  const response = await fetch(`${API_BASE_URL}/api/skill-ratings/jobs/${encodeURIComponent(jobId)}`);
+  return parseSkillRatingsResponse(response, 'Failed to fetch Skill Ratings progress');
+}
+
+export async function getActiveSkillRatingsJob() {
+  const response = await fetch(`${API_BASE_URL}/api/skill-ratings/jobs/active`);
+  return parseSkillRatingsResponse(response, 'Failed to find the active Skill Ratings study');
+}
+
+export async function listSkillRatingsReports(artifactDir) {
+  const query = new URLSearchParams({ artifact_dir: artifactDir });
+  const response = await fetch(`${API_BASE_URL}/api/skill-ratings/reports?${query.toString()}`);
+  return parseSkillRatingsResponse(response, 'Failed to list Skill Ratings reports');
+}
+
+export async function getSkillRatingsReport(path) {
+  const query = new URLSearchParams({ path });
+  const response = await fetch(`${API_BASE_URL}/api/skill-ratings/report?${query.toString()}`);
+  return parseSkillRatingsResponse(response, 'Failed to load Skill Ratings report');
 }

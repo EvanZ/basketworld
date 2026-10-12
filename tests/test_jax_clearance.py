@@ -417,7 +417,10 @@ def test_offensive_rebound_preserves_clearance_and_continuation_clock_rules():
         shot_clock=jnp.asarray([5], dtype=jnp.int32),
     )
     static = _force_rebound_winner(static, state, holder)
-    out = _shoot(static, state, seed=113)
+    # The shot kernel retains a 1% make floor even when all shooting skills are
+    # zero. This seed deterministically draws above that floor so the test
+    # exercises the rebound continuation path it is intended to cover.
+    out = _shoot(static, state, seed=114)
 
     assert int(np.asarray(out.offensive_rebound)[0]) == 1
     assert int(np.asarray(out.possession_ended)[0]) == 0

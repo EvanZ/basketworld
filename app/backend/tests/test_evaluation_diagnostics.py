@@ -1,4 +1,5 @@
 from app.backend.evaluation import (
+    _accumulate_assist_links,
     _accumulate_intent_selection,
     _init_eval_diagnostics,
     _merge_eval_diagnostics,
@@ -37,3 +38,29 @@ def test_merge_eval_diagnostics_merges_intent_counts():
 
     assert merged["intent_selection_counts"] == {"1": 7, "4": 1, "7": 4}
     assert merged["intent_inactive_count"] == 5
+
+
+def test_assist_links_preserve_player_and_opponent_flows():
+    diagnostics = _init_eval_diagnostics()
+    shots = {
+        1: {
+            "assist_full": True,
+            "assist_potential": True,
+            "assist_passer_id": 0,
+            "distance": 2,
+            "is_three": False,
+        },
+        6: {
+            "assist_full": True,
+            "assist_potential": True,
+            "assist_passer_id": 5,
+            "distance": 5,
+            "is_three": True,
+        },
+    }
+
+    _accumulate_assist_links(diagnostics, shots, {0, 1})
+
+    assert diagnostics["assist_links"] == {"0->1": 1, "5->6": 1}
+    assert diagnostics["assist_links_by_type"]["two"] == {"0->1": 1}
+    assert diagnostics["assist_links_by_type"]["three"] == {"5->6": 1}

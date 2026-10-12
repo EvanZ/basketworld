@@ -7,7 +7,13 @@ async function request(path, options = {}) {
   })
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}))
-    throw new Error(payload.detail || `Request failed (${response.status})`)
+    const detail = payload.detail
+    const message = typeof detail === 'string'
+      ? detail
+      : detail?.message || `Request failed (${response.status})`
+    const error = new Error(message)
+    error.detail = detail
+    throw error
   }
   return response.json()
 }
@@ -28,6 +34,7 @@ export const api = {
   getRun: (id) => request(`/runs/${id}`),
   getLogs: (id) => requestText(`/runs/${id}/logs`),
   getMetricCatalog: (id) => request(`/runs/${id}/metrics/catalog`),
+  getHistoricalElo: (id) => request(`/runs/${id}/elo`),
   getMetricHistories: (id, names) => {
     const params = new URLSearchParams()
     names.forEach((name) => params.append('names', name))
@@ -41,6 +48,17 @@ export const api = {
   createRun: (config, idempotencyKey) => request('/runs', {
     method: 'POST',
     body: JSON.stringify({ config, idempotency_key: idempotencyKey }),
+  }),
+  resumeRun: (id, confirmProvenanceMismatch = false) => request(`/runs/${id}/resume`, {
+    method: 'POST',
+    body: JSON.stringify({ confirm_provenance_mismatch: confirmProvenanceMismatch }),
+  }),
+  continueRun: (id, additionalUpdates, confirmProvenanceMismatch = false) => request(`/runs/${id}/continue`, {
+    method: 'POST',
+    body: JSON.stringify({
+      additional_updates: additionalUpdates,
+      confirm_provenance_mismatch: confirmProvenanceMismatch,
+    }),
   }),
   action: (id, action) => request(`/runs/${id}/${action}`, { method: 'POST' }),
 }

@@ -133,8 +133,10 @@ class EpisodeMp4Export(EpisodeGifExport):
 
     frames_per_second = 20
 
-    def __init__(self, destination):
+    def __init__(self, destination, *, soundtrack_path=None, audio_volume=0.45):
         super().__init__(destination, temp_prefix="basketworld-mp4-")
+        self.soundtrack_path = Path(soundtrack_path) if soundtrack_path else None
+        self.audio_volume = max(0.0, min(1.0, float(audio_volume)))
 
     def _normalize_frames(self):
         width = self.size[0] + (self.size[0] % 2)
@@ -188,6 +190,12 @@ class EpisodeMp4Export(EpisodeGifExport):
         sequence_dir, encoded_frame_count = self._build_constant_rate_sequence(
             normalized_paths
         )
+        duration_seconds = encoded_frame_count / self.frames_per_second
+        has_audio = bool(
+            self.soundtrack_path
+            and self.soundtrack_path.is_file()
+            and self.audio_volume > 0.0
+        )
 
         self.destination.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
@@ -207,7 +215,21 @@ class EpisodeMp4Export(EpisodeGifExport):
                 str(self.frames_per_second),
                 "-i",
                 str(sequence_dir / "%08d.png"),
-                "-an",
+            ]
+            if has_audio:
+                command.extend([
+                    "-stream_loop",
+                    "-1",
+                    "-i",
+                    str(self.soundtrack_path),
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                ])
+            else:
+                command.append("-an")
+            command.extend([
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -220,12 +242,34 @@ class EpisodeMp4Export(EpisodeGifExport):
                 str(self.frames_per_second),
                 "-video_track_timescale",
                 "1000",
+            ])
+            if has_audio:
+                fade_duration = min(0.5, duration_seconds)
+                fade_start = max(0.0, duration_seconds - fade_duration)
+                command.extend([
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "160k",
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    "2",
+                    "-af",
+                    (
+                        f"volume={self.audio_volume:.6f},"
+                        f"afade=t=out:st={fade_start:.6f}:d={fade_duration:.6f}"
+                    ),
+                    "-t",
+                    f"{duration_seconds:.6f}",
+                ])
+            command.extend([
                 "-movflags",
                 "+faststart",
                 "-f",
                 "mp4",
                 str(staging_path),
-            ]
+            ])
             try:
                 result = subprocess.run(
                     command,
@@ -252,12 +296,14 @@ class EpisodeMp4Export(EpisodeGifExport):
             "file_path": str(self.destination),
             "format": "mp4",
             "codec": "h264",
+            "audio": has_audio,
+            "audio_codec": "aac" if has_audio else None,
             "frame_count": len(self.durations),
             "width": output_size[0],
             "height": output_size[1],
             "frames_per_second": self.frames_per_second,
             "encoded_frame_count": encoded_frame_count,
-            "duration_seconds": encoded_frame_count / self.frames_per_second,
+            "duration_seconds": duration_seconds,
         }
 
 
@@ -268,7 +314,14 @@ class EpisodeGifExports:
         self.sessions = {}
         self.lock = threading.Lock()
 
-    def create(self, destination, export_format="gif"):
+    def create(
+        self,
+        destination,
+        export_format="gif",
+        *,
+        soundtrack_path=None,
+        audio_volume=0.45,
+    ):
         with self.lock:
             for key, export in list(self.sessions.items()):
                 if time.monotonic() - export.updated > 3600 and export.lock.acquire(blocking=False):
@@ -283,7 +336,11 @@ class EpisodeGifExports:
             if export_format == "gif":
                 export = EpisodeGifExport(destination)
             elif export_format == "mp4":
-                export = EpisodeMp4Export(destination)
+                export = EpisodeMp4Export(
+                    destination,
+                    soundtrack_path=soundtrack_path,
+                    audio_volume=audio_volume,
+                )
             else:
                 raise ValueError("Episode export format must be gif or mp4")
             self.sessions[key] = export

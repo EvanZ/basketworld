@@ -3,6 +3,7 @@ import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import GameSetup from './components/GameSetup.vue';
 import GameBoard from './components/GameBoard.vue';
 import PlayerControls from './components/PlayerControls.vue';
+import LiveBoxScore from './components/LiveBoxScore.vue';
 import AssistSankey from './components/AssistSankey.vue';
 import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
@@ -10,6 +11,11 @@ import { initGame, initTemplateSandbox, stepGame, saveEpisode, saveEpisodeFromPn
 import { resetStatsStorage } from './services/stats';
 import { startEpisodeExport } from './services/api';
 import { actionAnimationFrameCount, actionAnimationTiming, hexDistance } from './utils/actionAnimationTiming';
+import { playerSurnameForId } from './utils/playerIdentity';
+import {
+  aggregatePlayerShotCharts,
+  stableEvalTeamIds,
+} from './utils/evalTeamVisualizations';
 import {
   buildEpisodeFrameSelection,
   fullEpisodeFrameRange,
@@ -231,6 +237,83 @@ const gameHistory = ref([]);     // For ghost trails
 const showGhostTrails = ref(true);
 const policyProbs = ref(null);   // For AI suggestions
 const templateSandboxMode = ref(false);
+const musicAudioRef = ref(null);
+const MUSIC_ENABLED_STORAGE_KEY = 'basketworld-dev-music-enabled';
+const MUSIC_VOLUME_STORAGE_KEY = 'basketworld-dev-music-volume';
+
+function storedMusicEnabled() {
+  try {
+    const raw = window.localStorage.getItem(MUSIC_ENABLED_STORAGE_KEY);
+    return raw === null ? true : raw === 'true';
+  } catch (_) {
+    return true;
+  }
+}
+
+function storedMusicVolume() {
+  try {
+    const stored = window.localStorage.getItem(MUSIC_VOLUME_STORAGE_KEY);
+    if (stored === null || stored === '') return 0.45;
+    const raw = Number(stored);
+    return Number.isFinite(raw) ? Math.max(0, Math.min(1, raw)) : 0.45;
+  } catch (_) {
+    return 0.45;
+  }
+}
+
+const musicEnabled = ref(storedMusicEnabled());
+const musicVolume = ref(storedMusicVolume());
+
+async function startBackgroundMusic() {
+  const audio = musicAudioRef.value;
+  if (!audio || !musicEnabled.value) return;
+  audio.volume = musicVolume.value;
+  try {
+    await audio.play();
+  } catch (err) {
+    // A later direct click on the music control can retry if the browser did
+    // not consider the game-start interaction sufficient to unlock audio.
+    console.debug('[App] Background music is waiting for a user gesture:', err);
+  }
+}
+
+function toggleBackgroundMusic() {
+  musicEnabled.value = !musicEnabled.value;
+  try {
+    window.localStorage.setItem(MUSIC_ENABLED_STORAGE_KEY, String(musicEnabled.value));
+  } catch (_) {}
+  if (musicEnabled.value) {
+    startBackgroundMusic();
+  } else {
+    musicAudioRef.value?.pause();
+  }
+}
+
+function updateBackgroundMusicVolume(value) {
+  const next = Math.max(0, Math.min(1, Number(value) || 0));
+  musicVolume.value = next;
+  if (musicAudioRef.value) musicAudioRef.value.volume = next;
+  try {
+    window.localStorage.setItem(MUSIC_VOLUME_STORAGE_KEY, String(next));
+  } catch (_) {}
+}
+
+const playerDisplayNames = computed(() => {
+  const ids = new Set([
+    ...(gameState.value?.team_a_ids || []),
+    ...(gameState.value?.team_b_ids || []),
+    ...(gameState.value?.offense_ids || []),
+    ...(gameState.value?.defense_ids || []),
+  ].map(Number).filter(Number.isFinite));
+  return Object.fromEntries(
+    [...ids].map((playerId) => [playerId, playerSurnameForId(playerId)]),
+  );
+});
+
+const playerJerseyNumbers = computed(() => {
+  const ids = Object.keys(playerDisplayNames.value).map(Number);
+  return Object.fromEntries(ids.map((playerId) => [playerId, String(playerId)]));
+});
 
 function hasAnyProbabilities(probsByPlayer) {
   if (!probsByPlayer) return false;
@@ -303,6 +386,7 @@ const playbookShowBallPaths = ref(true);
 const playbookShowPassPaths = ref(false);
 const playbookShowShotHeatmap = ref(true);
 const playbookPlayerFilter = ref('all');
+const evalVisualizationTeam = ref('player');
 const shotChartTarget = ref('team');
 const assistLinksByPair = ref({});
 const assistLinksByType = ref({ dunk: {}, two: {}, three: {} });
@@ -447,9 +531,24 @@ function hasPositiveLinkCount(rawMap) {
   return false;
 }
 
+const selectedEvalTeamLabel = computed(() => (
+  evalVisualizationTeam.value === 'ai' ? 'AI' : 'Player'
+));
+
+const selectedEvalTeamPlayerIds = computed(() => stableEvalTeamIds(
+  gameState.value,
+  evalVisualizationTeam.value,
+  perPlayerEvalStats.value,
+));
+
 const shotAccumulatorForBoard = computed(() => {
   if (shotChartTarget.value === 'team' || !shotChartTarget.value) {
-    return shotAccumulator.value || {};
+    const teamChart = aggregatePlayerShotCharts(
+      perPlayerEvalStats.value,
+      selectedEvalTeamPlayerIds.value,
+    );
+    if (Object.keys(teamChart).length > 0) return teamChart;
+    return evalVisualizationTeam.value === 'player' ? (shotAccumulator.value || {}) : {};
   }
   if (String(shotChartTarget.value).startsWith('intent:')) {
     const intentKey = String(shotChartTarget.value).slice('intent:'.length);
@@ -605,6 +704,9 @@ const defaultEvalConfig = () => ({
   ballHolder: null,
   shootingMode: 'random',
   skills: { layup: [], three_pt: [], dunk: [] },
+  playerSkillsPinned: false,
+  playerSkills: {},
+  playerSkillsSource: '',
   reboundSkills: [],
   reboundSkillsPinned: false,
   reboundSkillSampling: {
@@ -723,11 +825,15 @@ watch(positioningHeatmapEnabled, (enabled) => {
   }
 });
 const shotChartOptions = computed(() => {
-  const opts = [{ label: 'Team', value: 'team' }];
-  const offenseIds = gameState.value?.offense_ids || [];
-  if (Array.isArray(offenseIds)) {
-    offenseIds.forEach((pid) => opts.push({ label: `Player ${pid}`, value: String(pid) }));
-  }
+  const opts = [{ label: 'Team total', value: 'team' }];
+  selectedEvalTeamPlayerIds.value.forEach((pid) => {
+    const surname = playerDisplayNames.value?.[pid] || playerSurnameForId(pid);
+    opts.push({
+      label: surname ? `${surname} #${pid}` : `Player ${pid}`,
+      value: String(pid),
+    });
+  });
+  if (evalVisualizationTeam.value !== 'player') return opts;
   Object.keys(perIntentEvalStats.value || {})
     .sort((a, b) => {
       if (a === 'none') return 1;
@@ -747,6 +853,9 @@ const shotChartOptions = computed(() => {
       });
     });
   return opts;
+});
+watch(evalVisualizationTeam, () => {
+  shotChartTarget.value = 'team';
 });
 const hasShotChartData = computed(
   () => !!shotAccumulator.value && Object.keys(shotAccumulator.value).length > 0,
@@ -1088,7 +1197,7 @@ const showSankeySelector = computed(
 );
 const boardShotChartLabel = computed(() =>
   hasShotChartData.value
-    ? (shotChartOptions.value.find((o) => o.value === shotChartTarget.value)?.label || '')
+    ? `${selectedEvalTeamLabel.value} • ${shotChartOptions.value.find((o) => o.value === shotChartTarget.value)?.label || ''}`
     : '',
 );
 const playbookIntentOptions = computed(() => {
@@ -1287,7 +1396,7 @@ const assistSankeyTitle = computed(() => {
     : (sankeyShotType.value === 'dunk'
       ? 'Dunks'
       : (sankeyShotType.value === 'two' ? '2PT' : '3PT'));
-  return `${flowLabel} • ${typeLabel}`;
+  return `${selectedEvalTeamLabel.value} • ${flowLabel} • ${typeLabel}`;
 });
 const assistSankeyTotalLabel = computed(() => {
   if (sankeyFlowMode.value === 'potential') return 'Potential assists (missed)';
@@ -1297,16 +1406,7 @@ const assistSankeyTotalLabel = computed(() => {
 });
 
 const assistSankeyPlayerIds = computed(() => {
-  const state = gameState.value;
-  const userTeam = String(state?.user_team_name || 'OFFENSE').toUpperCase();
-  const ids = Array.isArray(state?.user_player_ids)
-    ? state.user_player_ids
-    : (state?.enable_multi_possession
-      ? (state?.team_a_ids || [])
-      : (userTeam === 'DEFENSE' ? (state?.defense_ids || []) : (state?.offense_ids || [])));
-  const normalized = ids
-    .map((id) => Number(id))
-    .filter((id) => Number.isFinite(id));
+  const normalized = selectedEvalTeamPlayerIds.value;
   if (normalized.length > 0) {
     return normalized;
   }
@@ -1361,6 +1461,7 @@ const gifStepDurationMs = ref(BASE_STEP_DURATION_MS);
 const gifWidthPx = ref(960);
 const gifAnimationDetail = ref('standard');
 const episodeExportFormat = ref('mp4');
+const episodeIncludeMusic = ref(true);
 const gifRangeStartFrame = ref(0);
 const gifRangeEndFrame = ref(0);
 
@@ -1486,6 +1587,7 @@ watch(reboundPreviewParams, async () => {
 
 async function handleGameStarted(setupData) {
   console.log('[App] Starting game with data:', setupData);
+  startBackgroundMusic();
   const sessionId = ++gameSessionId;
   stopSelfPlay();
   cancelReplayAnimation();
@@ -1586,6 +1688,7 @@ async function handleGameStarted(setupData) {
 
 async function handleTemplateSandboxStarted(setupData = {}) {
   console.log('[App] Opening template sandbox with data:', setupData);
+  startBackgroundMusic();
   const sessionId = ++gameSessionId;
   stopSelfPlay();
   cancelReplayAnimation();
@@ -1951,6 +2054,38 @@ async function handlePolicySwap({ target, policyName }) {
     }
   } catch (err) {
     console.error('[App] Policy swap failed:', err);
+    const backendGameWasRestarted = (
+      Number(err?.status) === 400
+      && /game not initialized/i.test(String(err?.message || ''))
+    );
+    if (backendGameWasRestarted) {
+      const baseSetup = initialSetup.value
+        ? { ...initialSetup.value }
+        : (
+            gameState.value?.run_id
+              ? {
+                  runId: gameState.value.run_id,
+                  userTeam: gameState.value.user_team_name || 'OFFENSE',
+                  unifiedPolicyName: gameState.value.unified_policy_name || null,
+                  opponentUnifiedPolicyName: gameState.value.opponent_unified_policy_name || null,
+                  multiPossessionLimit: gameState.value.multi_possession_limit ?? null,
+                }
+              : null
+          );
+      if (baseSetup?.runId) {
+        const recoveredSetup = {
+          ...baseSetup,
+          ...(target === 'user'
+            ? { unifiedPolicyName: policyName }
+            : { opponentUnifiedPolicyName: policyName || null }),
+        };
+        console.warn(
+          '[App] Backend game state was reset; starting a fresh game with the selected policy.',
+        );
+        await handleGameStarted(recoveredSetup);
+        return;
+      }
+    }
     alert(`Failed to swap policies: ${err.message}`);
   } finally {
     isPolicySwapping.value = false;
@@ -2265,6 +2400,9 @@ async function toggleFastSelfPlayMode() {
 async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
   if (!gameState.value || !aiMode.value || selfPlayStarting.value || isSelfPlaying.value) return;
   if (fastSelfPlayMode.value && fastSelfPlayWarming.value) return;
+  // The Self-Play click is also a direct user gesture, so use it to resume
+  // music if the browser suspended media while the tab or game was idle.
+  startBackgroundMusic();
   const sessionId = ++selfPlaySessionId;
   const activeGameSessionId = ++gameSessionId;
   const useFastMode = fastSelfPlayMode.value;
@@ -2613,6 +2751,10 @@ function handleEvalConfigChanged(nextConfig) {
       ...(current.skills || {}),
       ...(nextConfig?.skills || {}),
     },
+    playerSkills: {
+      ...(current.playerSkills || {}),
+      ...(nextConfig?.playerSkills || {}),
+    },
     reboundSkillSampling: {
       ...base.reboundSkillSampling,
       ...(current.reboundSkillSampling || {}),
@@ -2818,6 +2960,40 @@ function buildCustomEvalSetup() {
     shooting_mode: shootingMode,
   };
 
+  if (isCustomMode && evalConfig.value.playerSkillsPinned) {
+    const totalPlayers = Number(gameState.value.positions?.length || 0);
+    const profiles = evalConfig.value.playerSkills || {};
+    const requiredSkills = [
+      'layup',
+      'three_pt',
+      'dunk',
+      'rebound',
+      'pressure',
+      'steal',
+      'ball_handling',
+      'passing',
+    ];
+    const normalizedProfiles = {};
+    for (let playerId = 0; playerId < totalPlayers; playerId += 1) {
+      const raw = profiles[String(playerId)] ?? profiles[playerId];
+      if (!raw || typeof raw !== 'object') {
+        throw new Error(`Pinned roster is missing Player ${playerId}.`);
+      }
+      const profile = {};
+      for (const skillName of requiredSkills) {
+        const value = Number(raw[skillName]);
+        if (!Number.isFinite(value)) {
+          throw new Error(`Pinned roster has an invalid ${skillName} value for Player ${playerId}.`);
+        }
+        profile[skillName] = ['layup', 'three_pt', 'dunk'].includes(skillName)
+          ? percentToProbClamp(value)
+          : value;
+      }
+      normalizedProfiles[String(playerId)] = profile;
+    }
+    payload.player_skills = normalizedProfiles;
+  }
+
   // In custom eval mode, placement editing controls whether we pin placement.
   // If disabled, backend reset uses randomized spawn positions + random offensive ball handler.
   if (usePinnedPlacement) {
@@ -2837,7 +3013,7 @@ function buildCustomEvalSetup() {
     payload.ball_holder = ballHolder;
   }
 
-  if (shootingMode === 'fixed') {
+  if (!payload.player_skills && shootingMode === 'fixed') {
     const offenseCount = gameState.value.offense_ids?.length || 0;
     const skills = evalConfig.value.skills || {};
     const toProb = (arrKey) =>
@@ -2855,7 +3031,7 @@ function buildCustomEvalSetup() {
   ].map((pid) => Number(pid));
   const totalPlayers = (gameState.value.offense_ids?.length || 0) + (gameState.value.defense_ids?.length || 0);
   const usePinnedReboundSkills = isCustomMode && Boolean(evalConfig.value.reboundSkillsPinned) && reboundSkills.length;
-  if (usePinnedReboundSkills) {
+  if (!payload.player_skills && usePinnedReboundSkills) {
     const skillsByPlayerId = Array.from({ length: totalPlayers }, () => 0);
     allReboundSkillIds.forEach((pid, idx) => {
       const numeric = Number(reboundSkills[idx] ?? 0);
@@ -2864,7 +3040,7 @@ function buildCustomEvalSetup() {
       }
     });
     payload.rebound_skills = skillsByPlayerId;
-  } else if (useConstrainedReboundSampling) {
+  } else if (!payload.player_skills && useConstrainedReboundSampling) {
     payload.rebound_skill_sampling = {
       mode: 'constrained_gaussian',
       std: Math.max(0, Number(reboundSkillSampling.std ?? 1.0)),
@@ -2908,6 +3084,7 @@ async function handleEvaluation() {
   sankeyFlowMode.value = 'assisted';
   sankeyShotType.value = 'all';
   clearReboundPreview();
+  evalVisualizationTeam.value = 'player';
   shotChartTarget.value = 'team';
   perPlayerEvalStats.value = {};
   perIntentEvalStats.value = {};
@@ -3003,6 +3180,10 @@ async function handleEvaluation() {
       );
       perPlayerEvalStats.value = response.per_player_stats || {};
       perIntentEvalStats.value = response.per_intent_stats || {};
+      await nextTick();
+      if (controlsRef.value?.showStatsTab) {
+        controlsRef.value.showStatsTab();
+      }
       try {
         const totals = Object.values(perPlayerEvalStats.value || {}).reduce(
           (acc, row) => {
@@ -3325,7 +3506,10 @@ async function handleSaveEpisode() {
     
     // Capture binary PNGs and transfer bounded batches. This avoids both
     // base64 expansion and an HTTP round trip for every animation frame.
-    writer = await startEpisodeExport(episodeExportFormat.value);
+    writer = await startEpisodeExport(episodeExportFormat.value, {
+      includeAudio: episodeExportFormat.value === 'mp4' && episodeIncludeMusic.value,
+      audioVolume: musicVolume.value,
+    });
     let frameCount = 0;
     let pendingFrames = [];
     const flushPendingFrames = async () => {
@@ -3640,6 +3824,7 @@ async function handlePlayAgain() {
   currentStepIndex.value = 0;
   isReplayPaused.value = false;
   isEvaluating.value = false;
+  evalVisualizationTeam.value = 'player';
   shotChartTarget.value = 'team';
   perPlayerEvalStats.value = {};
   perIntentEvalStats.value = {};
@@ -3762,6 +3947,7 @@ function clearEvaluationArtifacts() {
   completedPassLinksByPair.value = {};
   potentialAssistLinksByPair.value = {};
   potentialAssistLinksByType.value = emptyAssistLinkTypeMap();
+  evalVisualizationTeam.value = 'player';
   shotChartTarget.value = 'team';
   perPlayerEvalStats.value = {};
   perIntentEvalStats.value = {};
@@ -3883,6 +4069,7 @@ function onKeyup(e) {
 onMounted(() => {
   // Clear persisted stats once per app load
   try { resetStatsStorage(); } catch (_) {}
+  if (musicAudioRef.value) musicAudioRef.value.volume = musicVolume.value;
   window.addEventListener('keydown', onKeydown);
   window.addEventListener('keyup', onKeyup);
 });
@@ -3890,6 +4077,7 @@ onBeforeUnmount(() => {
   stopSelfPlay();
   stopFastSelfPlayStatusPolling();
   stopEvaluationProgressPolling();
+  musicAudioRef.value?.pause();
   window.removeEventListener('keydown', onKeydown);
   window.removeEventListener('keyup', onKeyup);
 });
@@ -3897,32 +4085,46 @@ onBeforeUnmount(() => {
 
 <template>
   <main>
-    <div class="header-container">
+    <audio
+      ref="musicAudioRef"
+      src="/roundball-rock-playback.wav"
+      loop
+      preload="auto"
+      aria-hidden="true"
+    ></audio>
+    <div v-if="!gameState" class="header-container">
       <img src="@/assets/basketworld-logo.jpg" alt="BasketWorld Logo" class="logo" />
-      
-      <div class="header-content">
-        <header>
-          <h1>Welcome to BasketWorld</h1>
-        </header>
 
+      <div class="header-content">
         <!-- Only render setup when no initialSetup has been chosen -->
         <GameSetup
           v-if="!initialSetup"
           @game-started="handleGameStarted"
           @template-sandbox-started="handleTemplateSandboxStarted"
         />
-        
-        <div v-if="isLoading" class="loading">Loading Game...</div>
-        <div v-if="error" class="error-message">{{ error }}</div>
-        
       </div>
     </div>
 
+    <div v-if="isLoading" class="loading">Loading Game...</div>
+    <div v-if="error" class="error-message">{{ error }}</div>
+
     <div v-if="gameState" class="game-container">
-      <div id="dev-bottom-tabs" ref="tabsMountEl" class="bottom-tabs-panel"></div>
+      <div
+        id="dev-bottom-tabs"
+        ref="tabsMountEl"
+        class="bottom-tabs-panel"
+        :class="{ 'skill-ratings-panel': activeControlsTab === 'skill_ratings' }"
+      ></div>
       <div class="top-row">
       <div class="board-area">
         <div v-if="(activeControlsTab !== 'playbook' && (showShotChartSelector || showSankeySelector || showReboundHeatmapSelector || showPositioningHeatmapSelector)) || (activeControlsTab === 'playbook' && playbookIntentOptions.length > 0)" class="shot-chart-selector">
+          <template v-if="activeControlsTab !== 'playbook' && (showShotChartSelector || showSankeySelector)">
+            <label>Side:</label>
+            <select v-model="evalVisualizationTeam">
+              <option value="player">Player</option>
+              <option value="ai">AI</option>
+            </select>
+          </template>
           <template v-if="activeControlsTab !== 'playbook' && showShotChartSelector">
             <label>Shot chart:</label>
             <select v-model="shotChartTarget" :disabled="sourceHeatmapEnabled">
@@ -4037,6 +4239,8 @@ onBeforeUnmount(() => {
           :fast-mode-locked="isSelfPlaying || selfPlayStarting"
           :show-opponent-actions="showOpponentActions"
           :show-ghost-trails-control="showGhostTrails"
+          :music-enabled="musicEnabled"
+          :music-volume="musicVolume"
           :show-episode-outcome="activeControlsTab !== 'stats'"
           :playbook-overlay="boardPlaybookOverlay"
           v-model:activePlayerId="activePlayerId"
@@ -4062,6 +4266,8 @@ onBeforeUnmount(() => {
           :placement-ball-holder="boardPlacementBallHolder"
           :placement-pass-probs="boardPlacementPassProbs"
           :show-coordinates="boardShowCoordinates"
+          :player-display-names="playerDisplayNames"
+          :player-jersey-numbers="playerJerseyNumbers"
           @update-player-position="handlePlayerPositionUpdate"
           @update-placement="handleBoardPlacementUpdate"
           @select-shot-cell="handleReboundShotSelected"
@@ -4072,6 +4278,8 @@ onBeforeUnmount(() => {
           @toggle-fast-self-play="toggleFastSelfPlayMode"
           @toggle-show-opponent-actions="showOpponentActions = !showOpponentActions"
           @toggle-show-ghost-trails="showGhostTrails = !showGhostTrails"
+          @toggle-music="toggleBackgroundMusic"
+          @update-music-volume="updateBackgroundMusicVolume"
           :is-shot-clock-updating="isShotClockUpdating"
           :disable-transitions="disableTransitionsForCapture"
           :move-progress="moveProgressForCapture"
@@ -4122,6 +4330,8 @@ onBeforeUnmount(() => {
           :eval-progress="evalProgress"
           :per-player-eval-stats="perPlayerEvalStats"
           :per-intent-eval-stats="perIntentEvalStats"
+          :player-display-names="playerDisplayNames"
+          :player-jersey-numbers="playerJerseyNumbers"
           :tabs-mount-el="tabsMountEl"
           :tabs-mount-selector="'#dev-bottom-tabs'"
           @actions-submitted="handleActionsSubmitted" 
@@ -4206,6 +4416,12 @@ onBeforeUnmount(() => {
             <span class="turn-self-play-speed-value">{{ Math.round(selfPlayStepIntervalMs) }} ms per step</span>
           </label>
         </div>
+        <LiveBoxScore
+          v-if="gameState?.enable_multi_possession && gameState?.box_score"
+          :box-score="gameState.box_score"
+          :player-display-names="playerDisplayNames"
+          :player-jersey-numbers="playerJerseyNumbers"
+        />
         <div
           v-if="selfPlayStarting"
           class="self-play-loading"
@@ -4284,6 +4500,13 @@ onBeforeUnmount(() => {
                 <option value="mp4">MP4 video</option>
                 <option value="gif">GIF animation</option>
               </select>
+            </label>
+            <label
+              v-if="episodeExportFormat === 'mp4'"
+              class="gif-detail-control episode-music-control"
+            >
+              <input type="checkbox" v-model="episodeIncludeMusic" />
+              Include music ({{ Math.round(musicVolume * 100) }}%)
             </label>
             <div class="gif-speed-control">
               <label for="gif-speed-slider">Playback speed</label>
@@ -4413,6 +4636,12 @@ main {
   display: flex;
   flex-direction: column;
   gap: 1.5rem;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
 }
 
 .header-container {
@@ -4436,14 +4665,6 @@ main {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
-}
-
-header {
-  text-align: center;
-  letter-spacing: 0.15em;
-  text-transform: uppercase;
-  color: var(--app-accent);
-  font-size: 1.5rem;
 }
 
 .loading,
@@ -4598,6 +4819,16 @@ header {
 
 .bottom-tabs-panel:empty {
   display: none;
+}
+
+/* Skill Ratings supplies its own restrained result cards.  Let it sit directly
+   on the app surface instead of wrapping it in a second, concentric panel. */
+.bottom-tabs-panel.skill-ratings-panel {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
 }
 
 .board-area {

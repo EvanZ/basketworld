@@ -3,6 +3,7 @@ import io
 import json
 import re
 import subprocess
+import wave
 from types import SimpleNamespace
 
 import pytest
@@ -197,6 +198,60 @@ def test_streamed_mp4_is_h264_yuv420p_and_preserves_duration(export_client):
     duration_match = re.search(r"Duration: 00:00:(\d+(?:\.\d+)?)", probe.stderr)
     assert duration_match
     assert float(duration_match.group(1)) == pytest.approx(1.5, abs=0.08)
+
+
+def test_streamed_mp4_loops_and_trims_background_music(
+    export_client,
+    tmp_path,
+    monkeypatch,
+):
+    from app.backend.episode_gif import _ffmpeg_executable
+
+    soundtrack = tmp_path / "soundtrack.wav"
+    with wave.open(str(soundtrack), "wb") as wav:
+        wav.setnchannels(2)
+        wav.setsampwidth(2)
+        wav.setframerate(48000)
+        # A short source proves FFmpeg loops it to fill the longer movie.
+        wav.writeframes(b"\x10\x00\x10\x00" * 4800)
+    monkeypatch.setattr(media_routes, "DEFAULT_EPISODE_SOUNDTRACK", soundtrack)
+
+    create_response = export_client.post(
+        "/api/episode_exports?format=mp4&include_audio=true&audio_volume=0.5"
+    )
+    assert create_response.status_code == 200, create_response.text
+    assert create_response.json()["audio"] is True
+    key = create_response.json()["export_id"]
+    prefix = f"/api/episode_exports/{key}"
+    frames = [
+        (0, png_bytes((30, 50), "red"), 0.4),
+        (1, png_bytes((30, 50), "blue"), 0.6),
+    ]
+    assert export_client.post(
+        prefix + "/frame_batch",
+        content=png_batch(frames),
+        headers={"content-type": "application/octet-stream"},
+    ).status_code == 200
+
+    response = export_client.post(prefix + "/finish", json={"frame_count": 2})
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["audio"] is True
+    assert payload["audio_codec"] == "aac"
+    assert payload["duration_seconds"] == pytest.approx(1.0)
+
+    probe = subprocess.run(
+        [_ffmpeg_executable(), "-hide_banner", "-i", payload["file_path"]],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        text=True,
+    )
+    assert "Video: h264" in probe.stderr
+    assert "Audio: aac" in probe.stderr
+    duration_match = re.search(r"Duration: 00:00:(\d+(?:\.\d+)?)", probe.stderr)
+    assert duration_match
+    assert float(duration_match.group(1)) == pytest.approx(1.0, abs=0.08)
 
 
 def test_streamed_mp4_missing_encoder_is_actionable_and_cleans_up(export_client, monkeypatch):

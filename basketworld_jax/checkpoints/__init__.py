@@ -4,6 +4,7 @@ from basketworld_jax.checkpoints.checkpoint import (
     build_checkpoint_paths,
     build_checkpoint_payload,
     load_checkpoint,
+    load_checkpoint_metadata,
     save_checkpoint,
 )
 
@@ -12,5 +13,6 @@ __all__ = [
     "build_checkpoint_paths",
     "build_checkpoint_payload",
     "load_checkpoint",
+    "load_checkpoint_metadata",
     "save_checkpoint",
 ]

@@ -45,6 +45,8 @@ So the next questions are empirical:
 | P2 | DIAYN-first pretraining / reward curriculum | Medium | Tests whether plays separate better when discovery precedes strong task reward |
 | P2 | Start-state curriculum / formation restriction | Medium | Tests whether plays become more coherent when early discovery sees fewer starting contexts |
 | P2 | Mirror-symmetry exploitation / augmentation | Medium | Tests whether left-right symmetry can reduce exploration burden and improve play coherence |
+| P3 (deferred) | Closed-loop policy-entropy scheduling | Medium | Tests whether stable exploration followed by late consolidation improves robust final play without collapsing behavioral diversity |
+| P3 (deferred) | Checkpoint resume provenance and compatibility gate | Medium | Makes pause, recovery, and completed-run continuation auditable and safe across checkout changes |
 | P3 | Selector abstain / null-play option | Medium | Tests whether the hierarchy benefits from an explicit “do not call a play” choice instead of forcing every possession into one of the learned plays |
 | P3 | Embedding structure ablations | Medium | Clarifies whether current `e_z` parameterization is over-flexible |
 | P4 | Learned play-boundary / reselection head | Large | Expands hierarchy expressiveness, but with larger tuning risk |
@@ -581,6 +583,120 @@ Expected insight:
 Recommendation:
 
 - do this only after the discriminator and behavioral evidence are better understood
+
+### P3 (Deferred). Closed-Loop Policy-Entropy Scheduling
+
+Status:
+
+- placeholder for a later research experiment; do not implement ahead of the
+  baseline and behavioral-diagnostic work above
+
+Origin:
+
+- inspired by Wang et al.,
+  [*Entropy Scheduling in Reinforcement Learning for Large Language Models*](https://aclanthology.org/2026.findings-acl.206.pdf)
+
+Goal:
+
+- test whether holding action-policy exploration stable while BW learns a
+  repertoire, then reducing it only near the end of training, yields stronger
+  final play than decaying exploration from the beginning
+
+Current state:
+
+- the JAX trainer already supports open-loop linear or exponential schedules
+  for the entropy *coefficient* (`ent_coef`); it does not target measured
+  policy entropy
+- PPO currently logs mean masked per-player categorical entropy, whose raw
+  value changes with the number of legal actions in a state
+
+Required first version:
+
+1. Log normalized legal-action entropy for active player decisions:
+   `H(policy) / log(number of legal actions)`. Exclude forced one-action/no-op
+   decisions from the aggregate.
+2. Add a hold-then-anneal target schedule: a stable exploration phase followed
+   by a short late reduction. Do not reuse LLM entropy target values, since BW
+   has a different, masked action space.
+3. Adjust only `ent_coef` from a bounded, windowed controller (with an EMA and
+   cooldown) based on target-versus-observed normalized entropy. Keep PPO clip
+   range fixed initially and retain KL/clip-fraction safeguards.
+4. If intent learning is enabled, report and control selector entropy
+   separately from low-level action entropy.
+
+Experiment ladder:
+
+1. current coefficient schedule baseline
+2. equal-budget open-loop hold-then-anneal schedule
+3. feedback-controlled target-entropy schedule only if step 2 is promising
+
+Evaluation requirements:
+
+- matched seeds, training budget, opponent-pool configuration, and evaluation
+  checkpoints
+- fixed-pool and held-out lineup evaluation, both deterministic and stochastic
+- final reward/win rate plus turnover rate, pass-target diversity, spatial
+  coverage, intent usage, and opponent robustness
+
+Success criterion:
+
+- improved deterministic final evaluation without a material regression in
+  held-out robustness or behavioral diversity
+
+Main risks:
+
+- raw entropy is confounded by action masks and may look healthy while tactics
+  collapse
+- the non-stationary self-play distribution can make a fixed entropy target
+  inappropriate
+- delayed feedback can cause controller oscillation or excessive PPO updates
+
+### P3 (Deferred). Checkpoint Resume Provenance and Compatibility Gate
+
+Status:
+
+- placeholder for a trainer-control safety feature; do not treat a clean pause
+  as proof that a checkpoint remains compatible after code changes
+
+Goal:
+
+- make paused-run resume, stopped-run recovery, and completed-run continuation
+  explicitly assess whether the current checkout can safely load the checkpoint
+
+Required first version:
+
+1. Record at launch and at every durable checkpoint:
+   - current Git commit SHA
+   - whether the worktree is dirty
+   - a deterministic fingerprint of the tracked diff when it is dirty
+2. Store the data in checkpoint metadata and the trainer control-plane record.
+   Record the fingerprint, not the full diff, so checkpoints do not duplicate
+   potentially large local changes.
+3. On resume, recovery, or continuation, compare the checkpoint provenance with
+   the current checkout:
+   - exact match: allow the normal action
+   - commit or dirty-diff mismatch: show a clear warning and require explicit
+     confirmation
+   - incompatible checkpoint schema, model/action/observation shapes, or
+     resolved training configuration: block the action with a specific reason
+4. Preserve the original MLflow run ID whenever continuation is allowed, and
+   log the provenance comparison plus the user decision as a run event.
+
+Success criteria:
+
+- a user can tell whether a checkpoint came from this exact checkout before
+  resuming it
+- a stopped run with a valid earlier checkpoint can be recovered deliberately
+- incompatible state fails before a worker is launched, rather than failing
+  late or silently changing training semantics
+
+Main risks:
+
+- Git identity is necessary but not sufficient: dependency/runtime changes can
+  still break deserialization or alter behavior
+- a dirty flag without a diff fingerprint cannot distinguish the same local
+  edit from a different edit
+- the warning path must not be mistaken for an assertion of compatibility
 
 ## Suggested Order
 

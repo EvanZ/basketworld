@@ -17,6 +17,15 @@ Development, with separate Vite and FastAPI processes:
 scripts/start_training_app.sh
 ```
 
+To restart this alongside MLflow and the gameplay development application, use:
+
+```bash
+scripts/restart_dev_services.sh
+```
+
+That script owns the trainer API and Vite process groups, but it deliberately
+does not stop detached training workers.
+
 - Frontend: <http://localhost:5174>
 - API documentation: <http://localhost:8090/docs>
 - DuckDB database: `var/training_app/training.duckdb`
@@ -36,8 +45,11 @@ Closing the browser or stopping the frontend does not stop a training worker. Th
 
 - **Checkpoint** writes a request file that the JAX trainer consumes after its current PPO update.
 - **Pause** finishes the current update, writes a complete checkpoint, acknowledges the request, and exits normally.
-- **Resume** launches the same absolute-update target from the local `latest` checkpoint without resetting environment or intent-discriminator state, and reopens the original MLflow run so metrics and artifacts continue in one history.
-- **Stop** sends SIGTERM to the verified worker process group. It is distinct from pause and does not promise a fresh checkpoint.
+- **Resume** launches the same absolute-update target from the local `latest` checkpoint without resetting environment or intent-discriminator state, and reopens the original MLflow run so metrics and artifacts continue in one history. Before launch, the app validates checkpoint schema, policy/action/observation metadata, and resolved training settings.
+- **Continue** extends a completed run from its latest checkpoint in the same MLflow run. The update target changes, but checkpoint-compatible training settings do not.
+- **Stop** sends SIGTERM to the verified worker process group. It is distinct from pause and does not promise a fresh checkpoint. A stopped run can be deliberately recovered from its last validated checkpoint.
+
+Every durable checkpoint records its Git commit, tracked-worktree cleanliness, and (when dirty) a SHA-256 fingerprint of the tracked diff. The trainer app compares that record with the current checkout before Resume, Recover, or Continue. An exact match proceeds normally; a mismatch, unavailable Git metadata, or a legacy checkpoint requires explicit confirmation. This provenance is diagnostic only—it does not guarantee dependency or runtime compatibility.
 
 DuckDB stores control-plane state only. MLflow remains the source of truth for training metrics, parameters, and uploaded artifacts.
 

@@ -12,6 +12,8 @@ import {
 import { defensiveLaneViolationBannerPayload } from '@/utils/outcomeBanners';
 import { resolveRenderableState } from '@/utils/renderableState';
 import { stableBoardViewBox } from '@/utils/boardViewBox';
+import { resolveEpisodeSkillMetadata } from '@/utils/episodeSkillMetadata';
+import basketworldLogo from '@/assets/basketworld-logo.jpg';
 
 const props = defineProps({
   gameHistory: {
@@ -204,6 +206,14 @@ const props = defineProps({
     type: Boolean,
     default: true,
   },
+  musicEnabled: {
+    type: Boolean,
+    default: true,
+  },
+  musicVolume: {
+    type: Number,
+    default: 0.45,
+  },
   forcedEpisodeOutcome: {
     type: Object,
     default: null,
@@ -222,6 +232,8 @@ const emit = defineEmits([
   'toggle-fast-self-play',
   'toggle-show-opponent-actions',
   'toggle-show-ghost-trails',
+  'toggle-music',
+  'update-music-volume',
 ]);
 
 // ------------------------------------------------------------
@@ -353,19 +365,60 @@ function getTurnoverOutcomeText(outcome) {
   return 'Turnover!';
 }
 
-function expectedValueLabelDy() {
-  return props.minimalChrome ? '1.9em' : '-1.0em';
-}
-
 function reboundSkillLabel(playerId) {
   if (!props.showReboundSkills) return '';
   const overrides = props.reboundSkillOverrides || {};
-  const liveSkills = currentGameState.value?.player_rebound_skills || {};
+  const liveSkills = episodeSkillMetadata.value.player_rebound_skills || {};
   const raw = overrides[String(playerId)] ?? overrides[playerId] ?? liveSkills[String(playerId)] ?? liveSkills[playerId];
   const numeric = Number(raw);
   if (!Number.isFinite(numeric)) return '';
   const sign = numeric >= 0 ? '+' : '';
   return `REB ${sign}${numeric.toFixed(1)}`;
+}
+
+function normalizedLatentSkill(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 0.5;
+  return Math.max(0, Math.min(1, 1 / (1 + Math.exp(-numeric))));
+}
+
+function playerSkillGauges(player) {
+  const metadata = episodeSkillMetadata.value;
+  const raw = metadata.player_episode_skills?.[String(player.id)]
+    ?? metadata.player_episode_skills?.[player.id];
+  if (!raw || typeof raw !== 'object') return [];
+  const reboundSkill = metadata.player_rebound_skills?.[String(player.id)]
+    ?? metadata.player_rebound_skills?.[player.id];
+  const reboundGauge = Number.isFinite(Number(reboundSkill))
+    ? [{ key: 'rebound', label: 'R', value: normalizedLatentSkill(reboundSkill) }]
+    : [];
+  if (player.isOffense) {
+    const shooting = metadata.player_shooting_skills?.[String(player.id)]
+      ?? metadata.player_shooting_skills?.[player.id]
+      ?? {};
+    return [
+      { key: 'layup', label: 'L', value: Math.max(0, Math.min(1, Number(shooting.layup) || 0)) },
+      { key: 'three', label: '3', value: Math.max(0, Math.min(1, Number(shooting.three_pt) || 0)) },
+      { key: 'dunk', label: 'D', value: Math.max(0, Math.min(1, Number(shooting.dunk) || 0)) },
+      { key: 'handling', label: 'H', value: normalizedLatentSkill(raw.ball_handling) },
+      { key: 'passing', label: 'P', value: normalizedLatentSkill(raw.passing) },
+      ...reboundGauge,
+    ];
+  }
+  return [
+    { key: 'pressure', label: 'P', value: normalizedLatentSkill(raw.pressure) },
+    { key: 'steal', label: 'S', value: normalizedLatentSkill(raw.steal) },
+    ...reboundGauge,
+  ];
+}
+
+function playerSkillGaugeSpacing(player) {
+  return playerSkillGauges(player).length > 5 ? 0.23 : 0.27;
+}
+
+function playerSkillGaugeTransform(player) {
+  const center = draggedPlayerId === player.id ? draggedPlayerPos : player;
+  return `translate(${center.x} ${center.y + (HEX_RADIUS * 0.34)})`;
 }
 
 function isPointerPassMode(gs) {
@@ -868,6 +921,11 @@ const currentGameState = computed(() => {
   }
   return cloned;
 });
+
+const episodeSkillMetadata = computed(() => resolveEpisodeSkillMetadata(
+  currentGameState.value,
+  props.gameHistory,
+));
 
 function playCallName(state, intentIndex) {
   const explicit = typeof state?.current_play_name === 'string'
@@ -4737,6 +4795,29 @@ onBeforeUnmount(() => {
           <font-awesome-icon :icon="passRaysVisible ? ['fas','toggle-on'] : ['fas','toggle-off']" />
           <span class="toggle-label">Pass Rays</span>
         </button>
+        <div class="board-music-control" title="BasketWorld background music">
+          <button
+            class="toggle-btn board-toggle-btn board-music-toggle"
+            type="button"
+            :aria-pressed="musicEnabled"
+            :aria-label="musicEnabled ? 'Mute background music' : 'Play background music'"
+            @click="emit('toggle-music')"
+          >
+            <span aria-hidden="true">{{ musicEnabled ? '🔊' : '🔇' }}</span>
+            <span class="toggle-label">Music</span>
+          </button>
+          <input
+            class="board-music-volume"
+            type="range"
+            min="0"
+            max="1"
+            step="0.01"
+            :value="musicVolume"
+            :disabled="!musicEnabled"
+            aria-label="Background music volume"
+            @input="emit('update-music-volume', Number($event.target.value))"
+          />
+        </div>
       </div>
     </div>
     <svg class="board-svg" :viewBox="viewBox" preserveAspectRatio="xMidYMid meet" ref="svgRef">
@@ -5283,11 +5364,11 @@ onBeforeUnmount(() => {
               </g>
             </g>
             <text 
-              v-if="minimalChrome && getPlayerDisplayName(player.id)"
+              v-if="getPlayerDisplayName(player.id)"
               :transform="playerLabelTransform(player)"
               x="0"
               y="0"
-              dy="-0.85em"
+              :dy="minimalChrome ? '-0.85em' : '-0.55em'"
               text-anchor="middle"
               class="player-name-text"
               style="pointer-events: none;"
@@ -5307,7 +5388,7 @@ onBeforeUnmount(() => {
               :transform="playerLabelTransform(player)"
               x="0" 
               y="0" 
-              :dy="minimalChrome && getPlayerDisplayName(player.id) ? '0.48em' : '0.3em'"
+              :dy="getPlayerDisplayName(player.id) ? (minimalChrome ? '0.48em' : '0.58em') : '0.3em'"
               text-anchor="middle" 
               :class="[
                 'player-text',
@@ -5315,17 +5396,42 @@ onBeforeUnmount(() => {
               ]"
               style="pointer-events: none;" 
             >{{ getPlayerJerseyNumber(player.id) }}</text>
-            <!-- EP (Expected Points) label above player ID for offensive players -->
-            <text
-              v-if="player.isOffense && currentGameState.ep_by_player && currentGameState.ep_by_player[player.id] !== undefined && draggedPlayerId !== player.id"
-              :x="player.x"
-              :y="player.y"
-              :dy="expectedValueLabelDy()"
-              text-anchor="middle"
-              class="noop-prob-text"
+            <g
+              v-if="playerSkillGauges(player).length && draggedPlayerId !== player.id"
+              :transform="playerSkillGaugeTransform(player)"
+              class="player-skill-gauges"
+              aria-hidden="true"
             >
-              {{ Number(currentGameState.ep_by_player[player.id]).toFixed(2) }}
-            </text>
+              <g
+                v-for="(gauge, gaugeIndex) in playerSkillGauges(player)"
+                :key="`${player.id}-skill-gauge-${gauge.key}`"
+                :transform="`translate(${(gaugeIndex - ((playerSkillGauges(player).length - 1) / 2)) * HEX_RADIUS * playerSkillGaugeSpacing(player)} 0)`"
+              >
+                <rect
+                  :x="-HEX_RADIUS * 0.085"
+                  :y="-HEX_RADIUS * 0.18"
+                  :width="HEX_RADIUS * 0.17"
+                  :height="HEX_RADIUS * 0.30"
+                  rx="1"
+                  class="player-skill-gauge-track"
+                />
+                <rect
+                  :x="-HEX_RADIUS * 0.085"
+                  :y="HEX_RADIUS * (0.12 - (0.30 * gauge.value))"
+                  :width="HEX_RADIUS * 0.17"
+                  :height="HEX_RADIUS * 0.30 * gauge.value"
+                  rx="1"
+                  class="player-skill-gauge-fill"
+                />
+                <text
+                  x="0"
+                  :y="HEX_RADIUS * 0.27"
+                  text-anchor="middle"
+                  class="player-skill-gauge-label"
+                >{{ gauge.label }}</text>
+                <title>{{ `${gauge.key}: ${(gauge.value * 100).toFixed(0)}% gauge` }}</title>
+              </g>
+            </g>
             <text
               v-if="props.showReboundSkills && reboundSkillLabel(player.id) && draggedPlayerId !== player.id"
               :x="player.x"
@@ -5957,11 +6063,18 @@ onBeforeUnmount(() => {
       </g>
 
     </svg>
-    <section
-      v-if="multiPossessionScoreboard"
-      class="game-scoreboard"
-      aria-label="Game scoreboard"
-    >
+    <div v-if="multiPossessionScoreboard" class="board-scoreboard-row">
+      <span class="board-brand-logo-frame">
+        <img
+          :src="basketworldLogo"
+          class="board-brand-logo"
+          alt="BasketWorld logo"
+        />
+      </span>
+      <section
+        class="game-scoreboard"
+        aria-label="Game scoreboard"
+      >
       <div
         class="score-side score-side-you"
         :class="{
@@ -6059,7 +6172,8 @@ onBeforeUnmount(() => {
           aria-hidden="true"
         ></span>
       </div>
-    </section>
+      </section>
+    </div>
     <div v-if="multiPossessionScoreboard || fastSelfPlayWarming || playCallBadge" class="board-banner-area">
       <div
         v-if="fastSelfPlayWarming"
@@ -6237,15 +6351,43 @@ onBeforeUnmount(() => {
   animation: scoreboard-score-border-pulse 0.62s ease-in-out infinite alternate;
 }
 
-/* Reserve header space for the scoreboard rather than laying it over the
-   court. The developer controls sit below it as a compact utility row. */
+/* Keep the compact brand and scoreboard in one header row. This replaces the
+   large page-level game header so the court can begin much higher on screen. */
+.board-scoreboard-row {
+  position: relative;
+  align-self: center;
+  order: -2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: max(12px, 2.5cqw);
+  gap: 0.65rem;
+  max-width: calc(100% - 1rem);
+  margin: 0.15rem 0 0.2rem;
+}
+
+.board-brand-logo-frame {
+  width: 5.8em;
+  height: 5.8em;
+  flex: 0 0 auto;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 5px 16px rgba(56, 189, 248, 0.32);
+}
+
+.board-brand-logo {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
 .multi-possession-board .game-scoreboard {
   position: relative;
   top: auto;
   left: auto;
-  align-self: center;
-  order: -2;
-  margin: 0.45rem 0 0.25rem;
+  align-self: auto;
+  margin: 0;
   transform: none;
 }
 
@@ -6916,6 +7058,27 @@ onBeforeUnmount(() => {
   cursor: not-allowed;
 }
 
+.board-music-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.board-music-toggle {
+  flex: 0 0 auto;
+}
+
+.board-music-volume {
+  width: 5.2rem;
+  accent-color: #38bdf8;
+  cursor: pointer;
+}
+
+.board-music-volume:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
 
 .state-value-overlay rect {
   fill: rgba(15, 15, 20, 0.9);
@@ -7297,6 +7460,28 @@ onBeforeUnmount(() => {
 .active-player-text {
   fill: #f8e71c;
 }
+.player-skill-gauges {
+  pointer-events: none;
+  transition: transform 0.26s ease;
+}
+.player-skill-gauge-track {
+  fill: rgba(2, 6, 23, 0.78);
+  stroke: rgba(255, 255, 255, 0.55);
+  stroke-width: 0.025rem;
+}
+.player-skill-gauge-fill {
+  fill: #fde047;
+  filter: drop-shadow(0 0 1.5px rgba(253, 224, 71, 0.65));
+}
+.player-skill-gauge-label {
+  fill: #f8fafc;
+  font-size: 0.34rem;
+  font-weight: 900;
+  paint-order: stroke;
+  stroke: #020617;
+  stroke-width: 0.04rem;
+  letter-spacing: -0.02em;
+}
 .ghost-text {
   font-size: 10px;
   opacity: 0.7;
@@ -7353,10 +7538,11 @@ onBeforeUnmount(() => {
 }
 .ball-indicator {
   fill: none;
-  stroke: orange;
-  stroke-linecap: round;
-  stroke-width: 0.25rem;
-  stroke-dasharray: 4 8;
+  stroke: #facc15;
+  stroke-width: 0.09rem;
+  animation: ball-handler-glow-pulse var(--dribble-period, 0.5s) ease-in-out infinite;
+  animation-delay: var(--dribble-delay, 0s);
+  will-change: opacity, filter;
   transition: cx 0.26s ease, cy 0.26s ease, r 0.12s ease;
 }
 .ball-indicator-wrap {
@@ -7484,6 +7670,7 @@ onBeforeUnmount(() => {
 .no-move-transitions .player-name-text,
 .no-move-transitions .player-index-text,
 .no-move-transitions .player-text,
+.no-move-transitions .player-skill-gauges,
 .no-move-transitions .shot-prob-text,
 .no-move-transitions .noop-prob-text,
 .no-move-transitions .ball-indicator,
@@ -7912,6 +8099,23 @@ onBeforeUnmount(() => {
   38% { transform: translateY(var(--dribble-amp, 6px)); }
   50% { transform: translateY(var(--dribble-amp, 6px)); }
   72% { transform: translateY(calc(0.25 * var(--dribble-amp, 6px))); }
+}
+
+@keyframes ball-handler-glow-pulse {
+  0%, 100% {
+    opacity: 0.68;
+    filter: drop-shadow(0 0 2px rgba(250, 204, 21, 0.58));
+  }
+  38%, 50% {
+    opacity: 1;
+    filter:
+      drop-shadow(0 0 3px rgba(250, 204, 21, 1))
+      drop-shadow(0 0 8px rgba(250, 204, 21, 0.78));
+  }
+  72% {
+    opacity: 0.8;
+    filter: drop-shadow(0 0 4px rgba(250, 204, 21, 0.68));
+  }
 }
 
 @keyframes shoot-jump {

@@ -13,6 +13,13 @@ from app.training_backend.config import Settings
 from app.training_backend.database import TrainingRepository, utc_now
 from app.training_backend.models import RunStatus, TrainingRunConfig
 from app.training_backend.presets import build_halfcourt_multi_possession_preview
+from app.training_backend.application_training import resolve_run_config_schema
+from basketworld_jax.checkpoints import CHECKPOINT_VERSION, load_checkpoint_metadata
+from basketworld_jax.provenance import (
+    capture_source_provenance,
+    compare_source_provenance,
+    resume_config_snapshot,
+)
 
 
 ACTIVE_STATUSES = {
@@ -21,6 +28,14 @@ ACTIVE_STATUSES = {
     RunStatus.PAUSING.value,
     RunStatus.STOPPING.value,
 }
+
+
+class ProvenanceConfirmationRequired(RuntimeError):
+    """Raised when a restore source mismatch has not been approved explicitly."""
+
+    def __init__(self, comparison: dict[str, Any]):
+        super().__init__(str(comparison["message"]))
+        self.comparison = comparison
 
 
 def _process_start_token(pid: int) -> str | None:
@@ -126,6 +141,9 @@ class JobManager:
                     "control_file": preview.control_file,
                     "status_file": preview.status_file,
                     "log_file": preview.log_file,
+                    "provenance_json": json.dumps(
+                        {"schema_version": 1, "launches": []}, sort_keys=True
+                    ),
                 }
             )
             self._event(
@@ -158,6 +176,19 @@ class JobManager:
         Path(run["control_file"]).unlink(missing_ok=True)
         environment = os.environ.copy()
         environment.update(run["environment"])
+        launch_provenance = capture_source_provenance(self.settings.repo_root)
+        provenance = dict(run.get("provenance", {}) or {})
+        launches = list(provenance.get("launches", []) or [])
+        launches.append(
+            {
+                "at": utc_now().isoformat(),
+                "source_provenance": launch_provenance,
+            }
+        )
+        provenance.update({"schema_version": 1, "launches": launches})
+        run = self.repository.update_run(
+            run_id, provenance_json=json.dumps(provenance, sort_keys=True)
+        )
         self.repository.update_run(run_id, status=RunStatus.STARTING.value)
         with log_path.open("ab", buffering=0) as log_handle:
             process = subprocess.Popen(
@@ -190,7 +221,7 @@ class JobManager:
             run_id,
             "started",
             status=RunStatus.RUNNING.value,
-            payload={"pid": process.pid},
+            payload={"pid": process.pid, "source_provenance": launch_provenance},
         )
         return updated
 
@@ -243,14 +274,78 @@ class JobManager:
         )
         return updated
 
-    def resume(self, run_id: str) -> dict[str, Any]:
-        run = self._require_status(run_id, {RunStatus.PAUSED.value})
+    def resume(
+        self, run_id: str, *, confirm_provenance_mismatch: bool = False
+    ) -> dict[str, Any]:
+        run = self._require_status(
+            run_id, {RunStatus.PAUSED.value, RunStatus.STOPPED.value}
+        )
         config = TrainingRunConfig.model_validate(run["config"])
+        self._require_available_worker_slot(run_id)
+        return self._resume_from_checkpoint(
+            run,
+            config,
+            event_type=(
+                "stopped_recovery_requested"
+                if run["status"] == RunStatus.STOPPED.value
+                else "resume_requested"
+            ),
+            confirm_provenance_mismatch=confirm_provenance_mismatch,
+        )
+
+    def continue_completed(
+        self,
+        run_id: str,
+        *,
+        additional_updates: int,
+        confirm_provenance_mismatch: bool = False,
+    ) -> dict[str, Any]:
+        run = self._require_status(run_id, {RunStatus.COMPLETED.value})
+        self._require_available_worker_slot(run_id)
+        if additional_updates < 1:
+            raise RuntimeError("Continuation requires at least one additional update.")
+
+        previous_target = max(
+            int(run["target_updates"]), int(run["current_update"])
+        )
+        target_updates = previous_target + int(additional_updates)
+        if target_updates > 1_000_000:
+            raise RuntimeError(
+                "Continuation target exceeds the maximum of 1,000,000 updates."
+            )
+
+        config = TrainingRunConfig.model_validate(run["config"]).model_copy(
+            update={"num_updates": target_updates}
+        )
+        return self._resume_from_checkpoint(
+            run,
+            config,
+            event_type="continuation_requested",
+            event_payload={
+                "additional_updates": int(additional_updates),
+                "previous_target_updates": previous_target,
+                "target_updates": target_updates,
+            },
+            target_updates=target_updates,
+            confirm_provenance_mismatch=confirm_provenance_mismatch,
+        )
+
+    def _resume_from_checkpoint(
+        self,
+        run: dict[str, Any],
+        config: TrainingRunConfig,
+        *,
+        event_type: str,
+        event_payload: dict[str, Any] | None = None,
+        target_updates: int | None = None,
+        confirm_provenance_mismatch: bool = False,
+    ) -> dict[str, Any]:
+        run_id = run["id"]
         checkpoint = run.get("checkpoint_path") or str(
             Path(run["status_file"]).parent / "checkpoints" / "latest"
         )
         if not Path(checkpoint).exists():
-            raise RuntimeError(f"Pause checkpoint does not exist: {checkpoint}")
+            raise RuntimeError(f"Resume checkpoint does not exist: {checkpoint}")
         preview = build_halfcourt_multi_possession_preview(
             config=config,
             run_id=run_id,
@@ -259,15 +354,173 @@ class JobManager:
             resume_checkpoint=checkpoint,
             mlflow_resume_run_id=run.get("mlflow_run_id"),
         )
+        checkpoint_metadata, provenance_comparison = self._preflight_resume(
+            checkpoint=checkpoint,
+            preview=preview,
+        )
+        if (
+            provenance_comparison["requires_confirmation"]
+            and not confirm_provenance_mismatch
+        ):
+            raise ProvenanceConfirmationRequired(provenance_comparison)
         updated = self.repository.update_run(
             run_id,
             command_json=json.dumps(preview.argv),
             environment_json=json.dumps(preview.environment, sort_keys=True),
+            config_json=config.model_dump_json(),
             status=RunStatus.QUEUED.value,
             finished_at=None,
+            target_updates=(
+                int(run["target_updates"])
+                if target_updates is None
+                else target_updates
+            ),
         )
-        self._event(run_id, "resume_requested", status=RunStatus.QUEUED.value)
+        self._event(
+            run_id,
+            event_type,
+            status=RunStatus.QUEUED.value,
+            payload={
+                **(event_payload or {}),
+                "checkpoint_path": checkpoint,
+                "checkpoint_update": int(checkpoint_metadata["update_index"]),
+                "checkpoint_provenance": checkpoint_metadata.get(
+                    "source_provenance"
+                ),
+                "provenance_comparison": provenance_comparison,
+                "provenance_confirmation": {
+                    "required": bool(provenance_comparison["requires_confirmation"]),
+                    "confirmed": bool(confirm_provenance_mismatch),
+                },
+            },
+        )
         return self._launch(updated)
+
+    def provenance_comparison(self, run: dict[str, Any]) -> dict[str, Any] | None:
+        """Return a display-safe checkpoint/current-checkout source comparison."""
+
+        checkpoint = run.get("checkpoint_path") or str(
+            Path(run["status_file"]).parent / "checkpoints" / "latest"
+        )
+        if not Path(checkpoint).exists():
+            return {
+                "status": "missing",
+                "exact": False,
+                "requires_confirmation": False,
+                "message": "No durable checkpoint is available for restore.",
+            }
+        try:
+            metadata = load_checkpoint_metadata(checkpoint)
+        except (OSError, ValueError, KeyError) as exc:
+            return {
+                "status": "invalid",
+                "exact": False,
+                "requires_confirmation": False,
+                "message": f"Checkpoint cannot be inspected: {exc}",
+            }
+        return compare_source_provenance(
+            metadata.get("source_provenance"),
+            capture_source_provenance(self.settings.repo_root),
+        )
+
+    @staticmethod
+    def _resolved_config_from_preview(preview) -> dict[str, Any]:
+        fields = resolve_run_config_schema(tuple(preview.argv))
+        return resume_config_snapshot(
+            {str(field["name"]): field.get("value") for field in fields}
+        )
+
+    @staticmethod
+    def _validate_checkpoint_metadata(metadata: dict[str, Any]) -> None:
+        if int(metadata.get("checkpoint_version", 0)) != CHECKPOINT_VERSION:
+            raise RuntimeError(
+                "Resume checkpoint schema is unsupported: "
+                f"expected version {CHECKPOINT_VERSION}."
+            )
+        policy_spec = metadata.get("policy_spec")
+        if not isinstance(policy_spec, dict):
+            raise RuntimeError("Resume checkpoint is missing policy_spec metadata.")
+        required_shape_keys = (
+            "model_type",
+            "flat_obs_dim",
+            "training_player_count",
+            "action_dim_per_player",
+            "total_action_dim",
+            "observation_schema_version",
+        )
+        missing = [key for key in required_shape_keys if key not in policy_spec]
+        if missing:
+            raise RuntimeError(
+                "Resume checkpoint policy/action/observation metadata is incomplete: "
+                + ", ".join(missing)
+                + "."
+            )
+        try:
+            player_count = int(policy_spec["training_player_count"])
+            action_dim = int(policy_spec["action_dim_per_player"])
+            total_dim = int(policy_spec["total_action_dim"])
+            observation_dim = int(policy_spec["flat_obs_dim"])
+            schema = int(policy_spec["observation_schema_version"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Resume checkpoint policy/action/observation metadata is invalid."
+            ) from exc
+        if min(player_count, action_dim, total_dim, observation_dim, schema) <= 0:
+            raise RuntimeError(
+                "Resume checkpoint policy/action/observation metadata has non-positive dimensions."
+            )
+        if total_dim != player_count * action_dim:
+            raise RuntimeError(
+                "Resume checkpoint action shape is inconsistent: total_action_dim must "
+                "equal training_player_count × action_dim_per_player."
+            )
+        for key in ("trainer_config", "frozen_config"):
+            if not isinstance(metadata.get(key), dict):
+                raise RuntimeError(f"Resume checkpoint is missing {key} metadata.")
+
+    def _preflight_resume(self, *, checkpoint: str, preview) -> tuple[dict[str, Any], dict[str, Any]]:
+        checkpoint_path = Path(checkpoint)
+        if not checkpoint_path.is_dir():
+            raise RuntimeError(
+                "Resume checkpoint must be a durable JAX checkpoint directory."
+            )
+        if not (checkpoint_path / "state").is_dir():
+            raise RuntimeError("Resume checkpoint is missing its durable state directory.")
+        try:
+            metadata = load_checkpoint_metadata(checkpoint_path)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Resume checkpoint metadata is missing: {exc}") from exc
+        except (OSError, ValueError, KeyError) as exc:
+            raise RuntimeError(f"Resume checkpoint cannot be inspected: {exc}") from exc
+        self._validate_checkpoint_metadata(metadata)
+
+        saved_config = metadata.get("resolved_training_config")
+        if isinstance(saved_config, dict):
+            expected_config = self._resolved_config_from_preview(preview)
+            changed = [
+                key
+                for key in sorted(set(saved_config) | set(expected_config))
+                if saved_config.get(key) != expected_config.get(key)
+            ]
+            if changed:
+                raise RuntimeError(
+                    "Resume checkpoint resolved training config mismatch for "
+                    + ", ".join(repr(key) for key in changed[:8])
+                    + ("." if len(changed) <= 8 else ", and more.")
+                )
+
+        comparison = compare_source_provenance(
+            metadata.get("source_provenance"),
+            capture_source_provenance(self.settings.repo_root),
+        )
+        return metadata, comparison
+
+    def _require_available_worker_slot(self, run_id: str) -> None:
+        for active in self.repository.list_active_runs():
+            if active["id"] != run_id:
+                raise RuntimeError(
+                    f"Training run {active['id']} is already active; v0 permits one active worker."
+                )
 
     def poll(self) -> None:
         for run in self.repository.list_active_runs():
@@ -321,6 +574,17 @@ class JobManager:
             changes["current_update"] = int(status["completed_updates"])
         if status.get("checkpoint_path"):
             changes["checkpoint_path"] = str(status["checkpoint_path"])
+        checkpoint_provenance = status.get("checkpoint_provenance")
+        if isinstance(checkpoint_provenance, dict):
+            provenance = dict(run.get("provenance", {}) or {})
+            if provenance.get("latest_checkpoint") != checkpoint_provenance:
+                provenance.update(
+                    {
+                        "schema_version": 1,
+                        "latest_checkpoint": checkpoint_provenance,
+                    }
+                )
+                changes["provenance_json"] = json.dumps(provenance, sort_keys=True)
         if status.get("mlflow_run_id"):
             changes["mlflow_run_id"] = str(status["mlflow_run_id"])
         if changes:

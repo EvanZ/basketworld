@@ -10,7 +10,7 @@ from typing import Any, Iterator
 import duckdb
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def utc_now() -> datetime:
@@ -69,8 +69,15 @@ class TrainingRepository:
                     control_file VARCHAR NOT NULL,
                     status_file VARCHAR NOT NULL,
                     log_file VARCHAR NOT NULL,
-                    error_message VARCHAR
+                    error_message VARCHAR,
+                    provenance_json VARCHAR NOT NULL DEFAULT '{}'
                 )
+                """
+            )
+            connection.execute(
+                """
+                ALTER TABLE training_runs
+                ADD COLUMN IF NOT EXISTS provenance_json VARCHAR DEFAULT '{}'
                 """
             )
             connection.execute(
@@ -113,8 +120,9 @@ class TrainingRepository:
             ("config_json", "config"),
             ("command_json", "command"),
             ("environment_json", "environment"),
+            ("provenance_json", "provenance"),
         ):
-            decoded[target] = json.loads(decoded.pop(source))
+            decoded[target] = json.loads(decoded.pop(source) or "{}")
         return decoded
 
     def create_run(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -134,8 +142,14 @@ class TrainingRepository:
             "control_file",
             "status_file",
             "log_file",
+            "provenance_json",
         )
-        values = [payload[column] for column in columns]
+        values = [
+            payload.get("provenance_json", "{}")
+            if column == "provenance_json"
+            else payload[column]
+            for column in columns
+        ]
         with self._lock, self._connection() as connection:
             connection.execute(
                 f"INSERT INTO training_runs ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
@@ -200,6 +214,9 @@ class TrainingRepository:
             "error_message",
             "command_json",
             "environment_json",
+            "config_json",
+            "target_updates",
+            "provenance_json",
         }
         unknown = set(changes) - allowed
         if unknown:

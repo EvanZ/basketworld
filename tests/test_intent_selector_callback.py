@@ -11,6 +11,15 @@ class _DummySelectorVecEnv:
 
     def env_method(self, method_name, *args, indices=None, **kwargs):
         self.calls.append((method_name, args, indices, kwargs))
+        if method_name == "get_intent_observation_fields":
+            return [
+                {
+                    "intent_index": 0.0,
+                    "intent_active": 1.0,
+                    "intent_visible": 1.0,
+                    "intent_age_norm": 0.0,
+                }
+            ]
         return [None]
 
 
@@ -75,8 +84,13 @@ def test_intent_selector_callback_overrides_offense_episode_starts_only():
 
     callback._on_rollout_start()
 
-    assert len(model.get_env().calls) == 1
-    method_name, args, indices, kwargs = model.get_env().calls[0]
+    set_calls = [
+        call
+        for call in model.get_env().calls
+        if call[0] == "set_offense_intent_state"
+    ]
+    assert len(set_calls) == 1
+    method_name, args, indices, kwargs = set_calls[0]
     assert method_name == "set_offense_intent_state"
     assert args == (2,)
     assert indices == [0]

@@ -1,4 +1,6 @@
+import json
 from gymnasium import Wrapper
+import numpy as np
 from types import SimpleNamespace
 import pytest
 
@@ -6,6 +8,25 @@ import app.backend.evaluation as backend_evaluation
 from app.backend.routes import evaluation_routes
 from app.backend.schemas import EvaluationRequest
 from basketworld.envs.basketworld_env_v2 import HexagonBasketballEnv, Team
+
+
+def test_evaluation_response_normalizes_nonfinite_diagnostics_to_json_null():
+    payload = evaluation_routes._to_jsonable(
+        {
+            "python_nan": float("nan"),
+            "numpy_nan": np.float32(np.nan),
+            "positive_infinity": float("inf"),
+            "nested": [np.float64("-inf"), 1.25],
+        }
+    )
+
+    assert payload == {
+        "python_nan": None,
+        "numpy_nan": None,
+        "positive_infinity": None,
+        "nested": [None, 1.25],
+    }
+    assert json.loads(json.dumps(payload, allow_nan=False)) == payload
 
 
 def test_validate_custom_eval_setup_uses_unwrapped_env_for_position_validation():
@@ -88,6 +109,76 @@ def test_validate_custom_eval_setup_accepts_constrained_rebound_skill_sampling()
         "tolerance": 0.2,
         "max_attempts": 2500,
     }
+
+
+def test_validate_custom_eval_setup_accepts_complete_ten_player_roster():
+    env = HexagonBasketballEnv(
+        players=5,
+        allow_dunks=True,
+        enable_intent_learning=True,
+        intent_null_prob=0.0,
+        training_team=Team.OFFENSE,
+    )
+    env.reset(seed=321)
+    profiles = {
+        str(player_id): {
+            "layup": 0.5 + player_id * 0.01,
+            "three_pt": 0.3 + player_id * 0.01,
+            "dunk": 0.6 + player_id * 0.01,
+            "rebound": player_id * 0.1,
+            "pressure": player_id * 0.2,
+            "steal": player_id * 0.3,
+            "ball_handling": player_id * 0.4,
+            "passing": player_id * 0.5,
+        }
+        for player_id in range(10)
+    }
+    profiles["0"]["future_contest"] = {"value": 0.25}
+
+    normalized = backend_evaluation.validate_custom_eval_setup(
+        {
+            "shooting_mode": "fixed",
+            "player_skills": profiles,
+        },
+        env,
+    )
+
+    assert normalized["player_skills"] == profiles
+    assert "offense_skills" not in normalized
+
+    incomplete = dict(profiles)
+    incomplete.pop("9")
+    with pytest.raises(Exception, match="missing ids"):
+        backend_evaluation.validate_custom_eval_setup(
+            {"player_skills": incomplete},
+            env,
+        )
+
+
+def test_sample_eval_player_skills_uses_initialized_jax_runtime(monkeypatch):
+    expected = {
+        "0": {
+            "layup": 0.6,
+            "three_pt": 0.4,
+            "dunk": 0.8,
+            "rebound": 0.1,
+            "pressure": 0.2,
+            "steal": 0.3,
+            "ball_handling": 0.4,
+            "passing": 0.5,
+        }
+    }
+
+    class FakeRuntime:
+        def sample_player_skill_profiles(self, *, seed=None):
+            assert seed == 73
+            return expected
+
+    monkeypatch.setattr(evaluation_routes.game_state, "jax_runtime", FakeRuntime())
+
+    result = evaluation_routes.sample_eval_player_skills(seed=73)
+
+    assert result == {"status": "success", "player_skills": expected}
 
 
 def test_evaluation_multi_possession_overrides_are_validated_and_disable_templates(monkeypatch):

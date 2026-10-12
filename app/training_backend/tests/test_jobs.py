@@ -1,11 +1,38 @@
 from __future__ import annotations
 
+import json
 import time
+
+import pytest
 
 from app.training_backend.config import Settings
 from app.training_backend.database import TrainingRepository
-from app.training_backend.jobs import JobManager
+from app.training_backend.jobs import JobManager, ProvenanceConfirmationRequired
 from app.training_backend.models import TrainingRunConfig
+
+
+def _write_minimal_checkpoint_metadata(path) -> None:
+    (path / "state").mkdir(parents=True, exist_ok=True)
+    (path / "metadata.json").write_text(
+        json.dumps(
+            {
+                "checkpoint_version": 2,
+                "saved_at": "2026-01-01T00:00:00+00:00",
+                "update_index": 1,
+                "trainer_config": {},
+                "frozen_config": {},
+                "policy_spec": {
+                    "model_type": "attention",
+                    "flat_obs_dim": 32,
+                    "training_player_count": 2,
+                    "action_dim_per_player": 16,
+                    "total_action_dim": 32,
+                    "observation_schema_version": 3,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_job_manager_launches_and_completes_detached_worker(tmp_path):
@@ -95,3 +122,127 @@ def test_job_manager_records_intentional_stop_as_stopped(tmp_path):
 
     assert run["status"] == "stopped"
     assert run["error_message"] is None
+
+
+def test_job_manager_continues_completed_run_in_same_mlflow_run(tmp_path):
+    repo_root = tmp_path / "repo"
+    python_bin = repo_root / ".env" / "bin" / "python"
+    python_bin.parent.mkdir(parents=True)
+    python_bin.write_text(
+        "#!/usr/bin/env bash\necho fake-training-worker\n", encoding="utf-8"
+    )
+    python_bin.chmod(0o755)
+
+    data_dir = tmp_path / "data"
+    settings = Settings(
+        repo_root=repo_root,
+        data_dir=data_dir,
+        database_path=data_dir / "training.duckdb",
+        cors_origins=("http://localhost:5174",),
+        poll_interval_seconds=0.01,
+    )
+    settings.ensure_directories()
+    repository = TrainingRepository(settings.database_path)
+    repository.initialize()
+    manager = JobManager(settings, repository)
+
+    run = manager.create_and_launch(
+        config=TrainingRunConfig(num_updates=1),
+        idempotency_key="job-continue-test",
+    )
+    for _ in range(100):
+        manager.poll()
+        run = repository.get_run(run["id"])
+        if run["status"] == "completed":
+            break
+        time.sleep(0.01)
+    assert run["status"] == "completed"
+
+    checkpoint = data_dir / "runs" / run["id"] / "checkpoints" / "latest"
+    _write_minimal_checkpoint_metadata(checkpoint)
+    repository.update_run(
+        run["id"],
+        checkpoint_path=str(checkpoint),
+        mlflow_run_id="original-mlflow-run-id",
+    )
+
+    with pytest.raises(ProvenanceConfirmationRequired):
+        manager.continue_completed(run["id"], additional_updates=10_000)
+
+    continued = manager.continue_completed(
+        run["id"], additional_updates=10_000, confirm_provenance_mismatch=True
+    )
+
+    assert continued["status"] == "running"
+    assert continued["target_updates"] == 10_001
+    assert continued["config"]["num_updates"] == 10_001
+    assert "--resume-checkpoint" in continued["command"]
+    assert str(checkpoint) in continued["command"]
+    assert "--mlflow-resume-run-id" in continued["command"]
+    assert "original-mlflow-run-id" in continued["command"]
+    events = repository.list_events(run["id"])
+    assert events[0]["event_type"] == "started"
+    assert events[1]["event_type"] == "continuation_requested"
+    payload = events[1]["payload"]
+    assert payload["additional_updates"] == 10_000
+    assert payload["previous_target_updates"] == 1
+    assert payload["target_updates"] == 10_001
+    assert payload["checkpoint_path"] == str(checkpoint)
+    assert payload["checkpoint_update"] == 1
+    assert payload["checkpoint_provenance"] is None
+    assert payload["provenance_comparison"]["status"] == "legacy"
+    assert payload["provenance_confirmation"] == {
+        "required": True,
+        "confirmed": True,
+    }
+
+
+def test_job_manager_recovers_stopped_run_from_validated_checkpoint(tmp_path):
+    repo_root = tmp_path / "repo"
+    python_bin = repo_root / ".env" / "bin" / "python"
+    python_bin.parent.mkdir(parents=True)
+    python_bin.write_text(
+        "#!/usr/bin/env bash\necho fake-training-worker\n", encoding="utf-8"
+    )
+    python_bin.chmod(0o755)
+
+    data_dir = tmp_path / "data"
+    settings = Settings(
+        repo_root=repo_root,
+        data_dir=data_dir,
+        database_path=data_dir / "training.duckdb",
+        cors_origins=("http://localhost:5174",),
+        poll_interval_seconds=0.01,
+    )
+    settings.ensure_directories()
+    repository = TrainingRepository(settings.database_path)
+    repository.initialize()
+    manager = JobManager(settings, repository)
+
+    run = manager.create_and_launch(
+        config=TrainingRunConfig(num_updates=5),
+        idempotency_key="job-stopped-recovery-test",
+    )
+    for _ in range(100):
+        manager.poll()
+        run = repository.get_run(run["id"])
+        if run["status"] == "completed":
+            break
+        time.sleep(0.01)
+    assert run["status"] == "completed"
+
+    checkpoint = data_dir / "runs" / run["id"] / "checkpoints" / "latest"
+    _write_minimal_checkpoint_metadata(checkpoint)
+    repository.update_run(
+        run["id"], status="stopped", checkpoint_path=str(checkpoint)
+    )
+
+    recovered = manager.resume(
+        run["id"], confirm_provenance_mismatch=True
+    )
+
+    assert recovered["status"] == "running"
+    events = repository.list_events(run["id"])
+    recovery = next(event for event in events if event["event_type"] == "stopped_recovery_requested")
+    assert recovery["payload"]["checkpoint_path"] == str(checkpoint)
+    assert recovery["payload"]["provenance_confirmation"]["confirmed"] is True

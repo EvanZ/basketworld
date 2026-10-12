@@ -25,7 +25,10 @@ from basketworld_jax.env.minimal import (
     step_batch_minimal,
     token_observation_dims,
 )
-from basketworld_jax.eval.native import _adapt_policy_observation_to_spec
+from basketworld_jax.eval.native import (
+    _adapt_policy_observation_to_spec,
+    _compatible_native_cross_play_specs,
+)
 from basketworld_jax.models import ActorCriticSpec
 from basketworld_jax.train.main import (
     _build_reward_component_arrays,
@@ -537,7 +540,7 @@ def test_game_context_observations_are_team_relative_and_cover_inbound_final_sta
 
 
 def test_multi_possession_observation_schema_and_cli_reject_incompatible_configs():
-    assert token_observation_dims(False, True, True) == (20, 12)
+    assert token_observation_dims(False, True, True) == (24, 12)
     args = parse_args(["--enable-multi-possession"])
     assert args.multi_possession_reward_mode == "win_loss"
     assert args.score_potential_scale == pytest.approx(1.0)
@@ -598,17 +601,63 @@ def test_multi_possession_observation_schema_and_cli_reject_incompatible_configs
         multi_possession_features=True,
         observation_schema_version=MULTI_POSSESSION_SCHEMA_VERSION,
     )
-    with pytest.raises(ValueError, match="versioned checkpoint schema"):
+    with pytest.raises(ValueError, match="smaller than checkpoint"):
         _adapt_policy_observation_to_spec(
             jnp.zeros((1, 11), dtype=jnp.float32),
             None,
             spec,
             jnp,
         )
+    v2_spec = replace(
+        spec,
+        flat_obs_dim=27,
+        observation_schema_version=2,
+    )
+    static = SimpleNamespace(
+        role_encoding=jnp.zeros((2,), dtype=jnp.float32),
+        offense_ids=jnp.zeros((1,), dtype=jnp.int32),
+    )
+    current = jnp.arange(35, dtype=jnp.float32)[None, :]
+    adapted = np.asarray(
+        _adapt_policy_observation_to_spec(current, static, v2_spec, jnp)
+    )
+    np.testing.assert_allclose(
+        adapted,
+        np.concatenate([np.arange(23), np.arange(31, 35)])[None, :],
+    )
     legacy = replace(
         spec, multi_possession_features=False, observation_schema_version=1
     )
     assert legacy != spec
+
+
+def test_native_cross_play_accepts_only_known_v2_v3_observation_width_change():
+    v3 = ActorCriticSpec(
+        flat_obs_dim=253,
+        training_player_count=5,
+        action_dim_per_player=14,
+        total_action_dim=70,
+        hidden_dims=(64,),
+        model_type="attention",
+        token_player_count=10,
+        token_dim=24,
+        global_dim=12,
+        multi_possession_features=True,
+        observation_schema_version=3,
+    )
+    v2 = replace(
+        v3,
+        flat_obs_dim=213,
+        token_dim=20,
+        observation_schema_version=2,
+    )
+
+    assert _compatible_native_cross_play_specs(v3, v2)
+    assert _compatible_native_cross_play_specs(v2, v3)
+    assert not _compatible_native_cross_play_specs(
+        v3,
+        replace(v2, action_dim_per_player=13),
+    )
 
 
 def test_reward_components_remain_separate_for_training_logging():

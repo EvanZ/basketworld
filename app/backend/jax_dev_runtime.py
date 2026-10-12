@@ -54,7 +54,9 @@ from basketworld_jax.env.minimal import (
     reset_batch_minimal,
     stack_state_snapshots,
     step_batch_minimal,
+    token_observation_labels,
 )
+from basketworld_jax.eval.skills import ACTIVE_PLAYER_SKILL_REGISTRY
 from app.backend.inference_adapters import (
     get_policy_backend_kind,
     get_policy_capabilities,
@@ -328,6 +330,22 @@ def _adapt_policy_observation_to_spec(flat_obs, static, spec, jnp):
         raise ValueError(f"Policy observation dim {current_dim} is smaller than checkpoint dim {expected_dim}.")
     n_players = int(static.role_encoding.shape[0])
     offense_count = int(static.offense_ids.shape[0])
+    schema_version = int(getattr(spec, "observation_schema_version", 1))
+    if (
+        bool(getattr(spec, "multi_possession_features", False))
+        and schema_version == 2
+        and current_dim - expected_dim == (4 * n_players)
+    ):
+        # Schema v3 appends four episode-stable skill features per player
+        # immediately before the role flag and offense shooting-skill deltas.
+        # Remove that complete block for v2 MLP checkpoints instead of blindly
+        # truncating the tail, which would shift the role and shooting fields.
+        tail_dim = 1 + (3 * offense_count)
+        remove_start = current_dim - tail_dim - (4 * n_players)
+        return jnp.concatenate(
+            [flat_obs[:, :remove_start], flat_obs[:, remove_start + (4 * n_players) :]],
+            axis=1,
+        ).astype(jnp.float32)
     tail_dim = 4 + 1 + (3 * offense_count)
     extra_dim = current_dim - expected_dim
     if (
@@ -558,6 +576,7 @@ class JaxDevRuntime:
         self.last_step_output = None
         self.last_action_results = self._empty_action_results()
         self.episode_rebounds: list[dict[str, Any]] = []
+        self._reset_box_score()
         if rng_seed is None:
             rng_seed = int(np.random.default_rng().integers(0, 2**31 - 1))
         self._rng_seed = int(rng_seed)
@@ -868,6 +887,10 @@ class JaxDevRuntime:
             "last_step_output": self._clone_jax_tree(self.last_step_output),
             "last_action_results": copy.deepcopy(self.last_action_results),
             "episode_rebounds": copy.deepcopy(self.episode_rebounds),
+            "box_score_players": copy.deepcopy(self._box_score_players),
+            "box_score_unattributed_turnovers": copy.deepcopy(
+                self._box_score_unattributed_turnovers
+            ),
             "last_policy_probs": copy.deepcopy(self._last_policy_probs),
             "last_attention_payload": copy.deepcopy(self._last_attention_payload),
             "last_attention_payloads": copy.deepcopy(self._last_attention_payloads),
@@ -903,6 +926,13 @@ class JaxDevRuntime:
             snapshot.get("last_action_results") or self._empty_action_results()
         )
         self.episode_rebounds = copy.deepcopy(snapshot.get("episode_rebounds") or [])
+        self._box_score_players = copy.deepcopy(
+            snapshot.get("box_score_players") or self._empty_box_score_players()
+        )
+        self._box_score_unattributed_turnovers = copy.deepcopy(
+            snapshot.get("box_score_unattributed_turnovers")
+            or {"team_a": 0, "team_b": 0}
+        )
         self._last_policy_probs = copy.deepcopy(snapshot.get("last_policy_probs"))
         self._last_attention_payload = copy.deepcopy(snapshot.get("last_attention_payload"))
         payloads = snapshot.get("last_attention_payloads")
@@ -1033,6 +1063,29 @@ class JaxDevRuntime:
                 game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
             game_state.prev_obs = None
 
+    def sample_player_skill_profiles(self, *, seed: int | None = None) -> dict[str, dict[str, float]]:
+        """Sample one complete roster without mutating the live game state."""
+        key = self.jax.random.PRNGKey(int(seed)) if seed is not None else self._next_key()
+        sampled_state = reset_batch_minimal(
+            self.static,
+            self.jnp.asarray([key]),
+            self.jax,
+            self.jnp,
+        )
+        skill_arrays = self.jax.device_get(
+            {
+                descriptor.key: getattr(sampled_state, descriptor.runtime_field)[0]
+                for descriptor in ACTIVE_PLAYER_SKILL_REGISTRY.descriptors
+            }
+        )
+        return {
+            str(player_id): {
+                skill_name: float(np.asarray(values)[player_id])
+                for skill_name, values in skill_arrays.items()
+            }
+            for player_id in range(self.n_players)
+        }
+
     def reset(
         self,
         *,
@@ -1050,6 +1103,7 @@ class JaxDevRuntime:
         self.last_step_output = None
         self.last_action_results = self._empty_action_results()
         self.episode_rebounds = []
+        self._reset_box_score()
         self._fast_episode_metadata_cache = None
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
@@ -1059,27 +1113,147 @@ class JaxDevRuntime:
         self._sync_display_env()
         return {"start_template": template_metadata} if template_metadata else {}
 
+    @staticmethod
+    def _empty_player_box_score() -> dict[str, int]:
+        return {
+            "pts": 0,
+            "fgm": 0,
+            "fga": 0,
+            "two_pm": 0,
+            "two_pa": 0,
+            "three_pm": 0,
+            "three_pa": 0,
+            "dunk_m": 0,
+            "dunk_a": 0,
+            "orb": 0,
+            "drb": 0,
+            "reb": 0,
+            "ast": 0,
+            "stl": 0,
+            "tov": 0,
+        }
+
+    def _empty_box_score_players(self) -> dict[str, dict[str, int]]:
+        return {
+            str(player_id): self._empty_player_box_score()
+            for player_id in range(self.n_players)
+        }
+
+    def _reset_box_score(self) -> None:
+        self._box_score_players = self._empty_box_score_players()
+        self._box_score_unattributed_turnovers = {"team_a": 0, "team_b": 0}
+
+    def _record_box_score_step(self, prev_state: Any, out: Any) -> None:
+        """Accumulate authoritative per-player events from one JAX transition."""
+
+        def player_line(raw_player_id: Any) -> dict[str, int] | None:
+            player_id = _as_int(raw_player_id)
+            if player_id < 0 or player_id >= self.n_players:
+                return None
+            return self._box_score_players[str(player_id)]
+
+        if _as_bool(out.shot_attempt[0]):
+            line = player_line(out.shot_shooter[0])
+            if line is not None:
+                shot_type = _as_int(out.shot_type[0])
+                made = _as_bool(out.shot_success[0])
+                line["fga"] += 1
+                line["fgm"] += int(made)
+                if shot_type == SHOT_TYPE_THREE:
+                    line["three_pa"] += 1
+                    line["three_pm"] += int(made)
+                else:
+                    line["two_pa"] += 1
+                    line["two_pm"] += int(made)
+                if shot_type == SHOT_TYPE_DUNK:
+                    line["dunk_a"] += 1
+                    line["dunk_m"] += int(made)
+                if made:
+                    line["pts"] += int(round(_as_float(out.shot_value[0])))
+
+        if _as_bool(getattr(out, "assist", np.asarray([0]))[0]):
+            line = player_line(getattr(out, "assist_passer", np.asarray([-1]))[0])
+            if line is not None:
+                line["ast"] += 1
+
+        if _as_bool(getattr(out, "rebound_attempt", np.asarray([0]))[0]):
+            line = player_line(getattr(out, "rebound_winner", np.asarray([-1]))[0])
+            if line is not None:
+                if _as_bool(getattr(out, "offensive_rebound", np.asarray([0]))[0]):
+                    line["orb"] += 1
+                elif _as_bool(getattr(out, "defensive_rebound", np.asarray([0]))[0]):
+                    line["drb"] += 1
+                line["reb"] += 1
+
+        if _as_bool(getattr(out, "turnover", np.asarray([0]))[0]):
+            line = player_line(getattr(out, "turnover_player", np.asarray([-1]))[0])
+            if line is not None:
+                line["tov"] += 1
+            else:
+                team_a_was_offense = (
+                    not self.multi_possession_enabled
+                    or _as_int(_field0(prev_state, "offense_team")) == TEAM_A
+                )
+                team_key = "team_a" if team_a_was_offense else "team_b"
+                self._box_score_unattributed_turnovers[team_key] += 1
+
+        stealer = player_line(getattr(out, "steal_player", np.asarray([-1]))[0])
+        if stealer is not None and _as_bool(getattr(out, "turnover", np.asarray([0]))[0]):
+            stealer["stl"] += 1
+
+    def _box_score_payload(self, *, team_a_score: float, team_b_score: float) -> dict[str, Any]:
+        def team_payload(team_key: str, player_ids: list[int], score: float) -> dict[str, Any]:
+            players = [
+                {"player_id": int(player_id), **copy.deepcopy(self._box_score_players[str(player_id)])}
+                for player_id in player_ids
+            ]
+            totals = self._empty_player_box_score()
+            for row in players:
+                for stat in totals:
+                    totals[stat] += int(row[stat])
+            player_points = int(totals["pts"])
+            totals["pts"] = int(round(float(score)))
+            totals["tov"] += int(self._box_score_unattributed_turnovers[team_key])
+            return {
+                "team": team_key,
+                "score": int(round(float(score))),
+                "unattributed_points": int(round(float(score))) - player_points,
+                "unattributed_turnovers": int(
+                    self._box_score_unattributed_turnovers[team_key]
+                ),
+                "players": players,
+                "totals": totals,
+            }
+
+        team_a = team_payload("team_a", self._team_ids(True), team_a_score)
+        team_b = team_payload("team_b", self._team_ids(False), team_b_score)
+        return {
+            "player": copy.deepcopy(team_a if self.user_team_is_a else team_b),
+            "ai": copy.deepcopy(team_b if self.user_team_is_a else team_a),
+        }
+
     def _playable_skill_updates(self, offense_skills: dict[str, Any] | None) -> dict[str, Any]:
         if not isinstance(offense_skills, dict):
             return {}
         offense_ids = np.asarray(self.offense_ids, dtype=np.int32)
         expected = int(offense_ids.size)
-        field_map = {
-            "layup": "layup_pct",
-            "three_pt": "three_pt_pct",
-            "dunk": "dunk_pct",
-        }
         updates: dict[str, Any] = {}
-        for skill_key, field_name in field_map.items():
-            raw_values = offense_skills.get(skill_key)
+        for descriptor in ACTIVE_PLAYER_SKILL_REGISTRY.descriptors:
+            if descriptor.semantic_group != "shooting":
+                continue
+            raw_values = offense_skills.get(descriptor.key)
             if raw_values is None:
                 continue
             values = np.asarray(raw_values, dtype=np.float32).reshape(-1)
             if values.size != expected:
                 continue
-            current = np.asarray(_field0(self.state, field_name), dtype=np.float32).copy()
+            current = np.asarray(
+                _field0(self.state, descriptor.runtime_field), dtype=np.float32
+            ).copy()
             current[offense_ids] = values
-            updates[field_name] = self.jnp.asarray(current[None, ...], dtype=self.jnp.float32)
+            updates[descriptor.runtime_field] = self.jnp.asarray(
+                current[None, ...], dtype=self.jnp.float32
+            )
         return updates
 
     def _apply_selector_episode_start(self, game_state: Any) -> dict[str, Any] | None:
@@ -1528,6 +1702,7 @@ class JaxDevRuntime:
             out,
             include_rebound_diagnostics=not fast_mode,
         )
+        self._record_box_score_step(prev_state, out)
         if self.last_action_results.get("rebounds"):
             self.episode_rebounds.extend(copy.deepcopy(self.last_action_results["rebounds"]))
         self._last_completed_pass_boundary = bool(
@@ -3089,6 +3264,10 @@ class JaxDevRuntime:
                     self.state,
                     "rebound_skill_specialist",
                 ),
+                "pressure_skill": _field0(self.state, "pressure_skill"),
+                "steal_skill": _field0(self.state, "steal_skill"),
+                "ball_handling_skill": _field0(self.state, "ball_handling_skill"),
+                "passing_skill": _field0(self.state, "passing_skill"),
             }
         )
         layup_pct = np.asarray(skill_host["layup_pct"], dtype=np.float32).reshape(-1)
@@ -3105,6 +3284,10 @@ class JaxDevRuntime:
             skill_host["rebound_skill_specialist"],
             dtype=np.float32,
         ).reshape(-1)
+        pressure_skill = np.asarray(skill_host["pressure_skill"], dtype=np.float32).reshape(-1)
+        steal_skill = np.asarray(skill_host["steal_skill"], dtype=np.float32).reshape(-1)
+        ball_handling_skill = np.asarray(skill_host["ball_handling_skill"], dtype=np.float32).reshape(-1)
+        passing_skill = np.asarray(skill_host["passing_skill"], dtype=np.float32).reshape(-1)
 
         def _team_skills(ids: list[int]) -> dict[str, list[float]]:
             return {
@@ -3242,6 +3425,15 @@ class JaxDevRuntime:
             },
             "player_rebound_skill_specialists": {
                 str(pid): bool(rebound_specialist[pid] > 0.0)
+                for pid in range(self.n_players)
+            },
+            "player_episode_skills": {
+                str(pid): {
+                    "pressure": float(pressure_skill[pid]),
+                    "steal": float(steal_skill[pid]),
+                    "ball_handling": float(ball_handling_skill[pid]),
+                    "passing": float(passing_skill[pid]),
+                }
                 for pid in range(self.n_players)
             },
             "shot_params": shot_params,
@@ -3487,6 +3679,10 @@ class JaxDevRuntime:
             "team_b_score": float(team_b_score),
             "user_score": float(team_a_score if user_team_is_a else team_b_score),
             "ai_score": float(team_b_score if user_team_is_a else team_a_score),
+            "box_score": self._box_score_payload(
+                team_a_score=team_a_score,
+                team_b_score=team_b_score,
+            ),
             "offense_team": "team_a" if team_a_is_offense else "team_b",
             "offense_label": "user" if self._team_is_user(team_a_is_offense) else "ai",
             "offense_ids": active_offense_ids,
@@ -3675,6 +3871,18 @@ class JaxDevRuntime:
             self.jax.device_get(_field0(self.state, "rebound_skill_specialist")),
             dtype=np.float32,
         )
+        episode_skills = self.jax.device_get(
+            {
+                "pressure": _field0(self.state, "pressure_skill"),
+                "steal": _field0(self.state, "steal_skill"),
+                "ball_handling": _field0(self.state, "ball_handling_skill"),
+                "passing": _field0(self.state, "passing_skill"),
+            }
+        )
+        pressure_skill = np.asarray(episode_skills["pressure"], dtype=np.float32)
+        steal_skill = np.asarray(episode_skills["steal"], dtype=np.float32)
+        ball_handling_skill = np.asarray(episode_skills["ball_handling"], dtype=np.float32)
+        passing_skill = np.asarray(episode_skills["passing"], dtype=np.float32)
         shooting_skills = self.jax.device_get(
             {
                 "layup": _field0(self.state, "layup_pct"),
@@ -3698,46 +3906,27 @@ class JaxDevRuntime:
             str(pid): bool(rebound_skill_specialist[int(pid)] > 0.0)
             for pid in range(int(rebound_skill_specialist.shape[0]))
         }
+        player_episode_skills = {
+            str(pid): {
+                "pressure": float(pressure_skill[pid]),
+                "steal": float(steal_skill[pid]),
+                "ball_handling": float(ball_handling_skill[pid]),
+                "passing": float(passing_skill[pid]),
+            }
+            for pid in range(self.n_players)
+        }
         metadata = get_policy_metadata(getattr(game_state, "unified_policy", None)) or {}
         counterfactual_snapshot = self._counterfactual_snapshot_summary(game_state)
         rebound_target_observation_features = bool(
             getattr(self.raw_model.spec, "rebound_target_observation_features", True)
         )
-        player_labels = [
-            "q_norm", "r_norm", "role", "has_ball", "layup_pct", "three_pt_pct",
-            "dunk_pct", "lane_steps_norm", "expected_points", "turnover_probability",
-            "pass_steal_probability", "distance_to_ball", "distance_to_best_ep_player",
-            "distance_to_nearest_opponent", "distance_to_nearest_teammate",
-        ]
-        if rebound_target_observation_features:
-            player_labels.append("distance_to_expected_rebound_target")
-        player_labels.append("rebound_skill")
-        if rebound_target_observation_features:
-            player_labels.append("rebound_skill_specialist")
-        if bool(getattr(self.raw_model.spec, "rebound_win_prob_features", False)):
-            player_labels.append("rebound_win_probability")
-        if self.multi_possession_enabled:
-            player_labels.extend(["is_inbounder", "on_court"])
-        globals_labels = ["shot_clock_norm", "pressure_exposure", "hoop_q_norm", "hoop_r_norm"]
-        if rebound_target_observation_features:
-            globals_labels.extend(
-                ["expected_rebound_target_q", "expected_rebound_target_r", "target_entropy"]
-            )
-        if bool(getattr(self.raw_model.spec, "rebound_win_prob_features", False)):
-            globals_labels.append("offensive_rebound_probability")
-        if self.multi_possession_enabled:
-            # These game-context features are appended by the JAX kernel for
-            # multi-possession training.  In particular, the inbound clock is
-            # intentionally separate from the shot-clock feature.
-            globals_labels.extend(
-                [
-                    "relative_score",
-                    "possessions_remaining_norm",
-                    "clearance_required",
-                    "restart_phase",
-                    "restart_countdown_norm",
-                ]
-            )
+        player_labels, globals_labels = token_observation_labels(
+            rebound_win_prob_features=bool(
+                getattr(self.raw_model.spec, "rebound_win_prob_features", False)
+            ),
+            rebound_target_observation_features=rebound_target_observation_features,
+            multi_possession_features=self.multi_possession_enabled,
+        )
         attention_payloads = self._attention_payloads_for_state(observer_is_offense)
         attention_payload = attention_payloads["default"]
         team_a_is_offense = self._team_is_current_offense(True)
@@ -3826,6 +4015,10 @@ class JaxDevRuntime:
             "team_b_score": float(team_b_score),
             "user_score": float(team_a_score if user_team_is_a else team_b_score),
             "ai_score": float(team_b_score if user_team_is_a else team_a_score),
+            "box_score": self._box_score_payload(
+                team_a_score=team_a_score,
+                team_b_score=team_b_score,
+            ),
             "offense_team": "team_a" if team_a_is_offense else "team_b",
             "offense_label": "user" if self._team_is_user(team_a_is_offense) else "ai",
             "active_offense_ids": active_offense_ids,
@@ -3966,9 +4159,9 @@ class JaxDevRuntime:
             "obs": np.asarray(obs_dict["obs"], dtype=np.float32).reshape(-1).tolist(),
             "obs_tokens": {
                 "players": np.asarray(obs_dict["players"], dtype=np.float32).tolist(),
-                "players_labels": player_labels,
+                "players_labels": list(player_labels),
                 "globals": np.asarray(obs_dict["globals"], dtype=np.float32).tolist(),
-                "globals_labels": globals_labels,
+                "globals_labels": list(globals_labels),
                 "attention": attention_payload,
                 "attention_by_observer": attention_payloads,
             },
@@ -3978,6 +4171,7 @@ class JaxDevRuntime:
             "player_shooting_skills": player_shooting_skills,
             "player_rebound_skills": player_rebound_skills,
             "player_rebound_skill_specialists": player_rebound_skill_specialists,
+            "player_episode_skills": player_episode_skills,
             # Preserve legacy field names for the board, while making them the
             # *current* offense/defense in continuous games.
             "offense_ids": active_offense_ids,

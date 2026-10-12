@@ -29,7 +29,7 @@ TOKEN_OBS_REBOUND_WIN_PROB_PLAYER_DIM = 1
 TOKEN_OBS_REBOUND_WIN_PROB_GLOBAL_DIM = 1
 TOKEN_OBS_REBOUND_TARGET_PLAYER_DIM = 2
 TOKEN_OBS_REBOUND_TARGET_GLOBAL_DIM = 3
-TOKEN_OBS_MULTI_POSSESSION_PLAYER_DIM = 2
+TOKEN_OBS_MULTI_POSSESSION_PLAYER_DIM = 6
 TOKEN_OBS_MULTI_POSSESSION_GLOBAL_DIM = 5
 
 
@@ -51,6 +51,77 @@ def token_observation_dims(
         player_dim += TOKEN_OBS_MULTI_POSSESSION_PLAYER_DIM
         global_dim += TOKEN_OBS_MULTI_POSSESSION_GLOBAL_DIM
     return player_dim, global_dim
+
+
+def token_observation_labels(
+    rebound_win_prob_features: bool = False,
+    rebound_target_observation_features: bool = True,
+    multi_possession_features: bool = False,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return the ordered labels for the selected token-observation schema."""
+    player_labels = [
+        "q_norm",
+        "r_norm",
+        "role",
+        "has_ball",
+        "layup_pct",
+        "three_pt_pct",
+        "dunk_pct",
+        "lane_steps_norm",
+        "expected_points",
+        "turnover_probability",
+        "pass_steal_probability",
+        "distance_to_ball",
+        "distance_to_best_ep_player",
+        "distance_to_nearest_opponent",
+        "distance_to_nearest_teammate",
+    ]
+    if bool(rebound_target_observation_features):
+        player_labels.append("distance_to_expected_rebound_target")
+    player_labels.append("rebound_skill")
+    if bool(rebound_target_observation_features):
+        player_labels.append("rebound_skill_specialist")
+    if bool(rebound_win_prob_features):
+        player_labels.append("rebound_win_probability")
+    if bool(multi_possession_features):
+        player_labels.extend(
+            (
+                "is_inbounder",
+                "on_court",
+                "pressure_skill",
+                "steal_skill",
+                "ball_handling_skill",
+                "passing_skill",
+            )
+        )
+
+    global_labels = [
+        "shot_clock_norm",
+        "pressure_exposure",
+        "hoop_q_norm",
+        "hoop_r_norm",
+    ]
+    if bool(rebound_target_observation_features):
+        global_labels.extend(
+            (
+                "expected_rebound_target_q",
+                "expected_rebound_target_r",
+                "target_entropy",
+            )
+        )
+    if bool(rebound_win_prob_features):
+        global_labels.append("offensive_rebound_probability")
+    if bool(multi_possession_features):
+        global_labels.extend(
+            (
+                "relative_score",
+                "possessions_remaining_norm",
+                "clearance_required",
+                "restart_phase",
+                "restart_countdown_norm",
+            )
+        )
+    return tuple(player_labels), tuple(global_labels)
 TURNOVER_REASON_NONE = 0
 TURNOVER_REASON_PASS_OUT_OF_BOUNDS = 1
 TURNOVER_REASON_INTERCEPTED = 2
@@ -99,7 +170,7 @@ MULTI_POSSESSION_REWARD_MODE_IDS = {
     "point_differential": MULTI_POSSESSION_REWARD_POINT_DIFFERENTIAL,
     "scoring_events": MULTI_POSSESSION_REWARD_SCORING_EVENTS,
 }
-MULTI_POSSESSION_SCHEMA_VERSION = 2
+MULTI_POSSESSION_SCHEMA_VERSION = 3
 MADE_BASKET_RESTART_BASELINE_INBOUND = 0
 MADE_BASKET_RESTART_CHECK = 1
 MADE_BASKET_RESTART_DIRECT_HANDOFF = 2
@@ -208,6 +279,11 @@ class KernelStatic(NamedTuple):
     defender_pressure_distance: Any
     defender_pressure_turnover_chance: Any
     defender_pressure_decay_lambda: Any
+    pressure_skill_mean: Any
+    pressure_skill_std: Any
+    ball_handling_skill_mean: Any
+    ball_handling_skill_std: Any
+    pressure_skill_effect_weight: Any
     base_steal_rate: Any
     steal_perp_decay: Any
     steal_distance_factor: Any
@@ -229,6 +305,11 @@ class KernelStatic(NamedTuple):
     receiver_alignment_width: Any
     max_receiver_hazard: Any
     lane_weight: Any
+    steal_skill_mean: Any
+    steal_skill_std: Any
+    passing_skill_mean: Any
+    passing_skill_std: Any
+    steal_skill_effect_weight: Any
     three_point_distance: Any
     three_pt_extra_hex_decay: Any
     shot_clock_min: Any
@@ -342,6 +423,10 @@ class KernelState(NamedTuple):
     dunk_pct: Any
     rebound_skill: Any
     rebound_skill_specialist: Any
+    pressure_skill: Any
+    steal_skill: Any
+    ball_handling_skill: Any
+    passing_skill: Any
     rebound_reward_advance_paid: Any
     # Team A/B are stable roster identities.  Offense is dynamic per
     # possession, so it deliberately does not reuse the legacy static role
@@ -609,6 +694,30 @@ def _player_rebound_skill_specialist_array(env) -> np.ndarray:
     return out
 
 
+def _player_episode_skill_array(env, name: str, default: float = 0.0) -> np.ndarray:
+    raw = getattr(env, f"{name}_by_player", None)
+    if raw is None:
+        raw = getattr(env, f"player_{name}s", None)
+    if raw is None:
+        return np.full(env.n_players, float(default), dtype=np.float32)
+    if isinstance(raw, dict):
+        out = np.full(env.n_players, float(default), dtype=np.float32)
+        for pid, value in raw.items():
+            try:
+                idx = int(pid)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < env.n_players:
+                out[idx] = float(value)
+        return out
+    arr = np.asarray(raw, dtype=np.float32).reshape(-1)
+    out = np.full(env.n_players, float(default), dtype=np.float32)
+    count = min(env.n_players, int(arr.shape[0]))
+    if count:
+        out[:count] = arr[:count]
+    return out
+
+
 def _lane_step_arrays(env) -> tuple[np.ndarray, np.ndarray]:
     offense = np.zeros(env.n_players, dtype=np.float32)
     defense = np.zeros(env.n_players, dtype=np.float32)
@@ -622,6 +731,10 @@ def snapshot_state_from_env(env) -> dict[str, np.ndarray | int]:
     layup, three, dunk = _player_skill_arrays(env)
     rebound_skill = _player_rebound_skill_array(env)
     rebound_skill_specialist = _player_rebound_skill_specialist_array(env)
+    pressure_skill = _player_episode_skill_array(env, "pressure_skill", getattr(env, "pressure_skill_mean", 0.0))
+    steal_skill = _player_episode_skill_array(env, "steal_skill", getattr(env, "steal_skill_mean", 0.0))
+    ball_handling_skill = _player_episode_skill_array(env, "ball_handling_skill", getattr(env, "ball_handling_skill_mean", 0.0))
+    passing_skill = _player_episode_skill_array(env, "passing_skill", getattr(env, "passing_skill_mean", 0.0))
     offense_lane_steps, defense_lane_steps = _lane_step_arrays(env)
     assist_candidate = getattr(env, "_assist_candidate", None)
     episode_possession_limit = max(
@@ -672,6 +785,10 @@ def snapshot_state_from_env(env) -> dict[str, np.ndarray | int]:
         "dunk_pct": dunk,
         "rebound_skill": rebound_skill,
         "rebound_skill_specialist": rebound_skill_specialist,
+        "pressure_skill": pressure_skill,
+        "steal_skill": steal_skill,
+        "ball_handling_skill": ball_handling_skill,
+        "passing_skill": passing_skill,
         "offense_team": TEAM_A,
         "starting_offense_team": TEAM_A,
         "team_a_completed_possessions": 0,
@@ -847,6 +964,22 @@ def stack_state_snapshots(
                 ],
                 axis=0,
             ),
+            dtype=xp.float32,
+        ),
+        pressure_skill=xp.asarray(
+            np.stack([np.asarray(item.get("pressure_skill", np.zeros_like(item["dunk_pct"])), dtype=np.float32) for item in snapshots], axis=0),
+            dtype=xp.float32,
+        ),
+        steal_skill=xp.asarray(
+            np.stack([np.asarray(item.get("steal_skill", np.zeros_like(item["dunk_pct"])), dtype=np.float32) for item in snapshots], axis=0),
+            dtype=xp.float32,
+        ),
+        ball_handling_skill=xp.asarray(
+            np.stack([np.asarray(item.get("ball_handling_skill", np.zeros_like(item["dunk_pct"])), dtype=np.float32) for item in snapshots], axis=0),
+            dtype=xp.float32,
+        ),
+        passing_skill=xp.asarray(
+            np.stack([np.asarray(item.get("passing_skill", np.zeros_like(item["dunk_pct"])), dtype=np.float32) for item in snapshots], axis=0),
             dtype=xp.float32,
         ),
         rebound_reward_advance_paid=xp.asarray(
@@ -1398,6 +1531,11 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
         defender_pressure_distance=xp.asarray(float(env.defender_pressure_distance), dtype=xp.float32),
         defender_pressure_turnover_chance=xp.asarray(float(env.defender_pressure_turnover_chance), dtype=xp.float32),
         defender_pressure_decay_lambda=xp.asarray(float(env.defender_pressure_decay_lambda), dtype=xp.float32),
+        pressure_skill_mean=xp.asarray(float(getattr(env, "pressure_skill_mean", 0.0)), dtype=xp.float32),
+        pressure_skill_std=xp.asarray(max(0.0, float(getattr(env, "pressure_skill_std", 0.0))), dtype=xp.float32),
+        ball_handling_skill_mean=xp.asarray(float(getattr(env, "ball_handling_skill_mean", 0.0)), dtype=xp.float32),
+        ball_handling_skill_std=xp.asarray(max(0.0, float(getattr(env, "ball_handling_skill_std", 0.0))), dtype=xp.float32),
+        pressure_skill_effect_weight=xp.asarray(max(0.0, float(getattr(env, "pressure_skill_effect_weight", 0.0))), dtype=xp.float32),
         base_steal_rate=xp.asarray(float(env.base_steal_rate), dtype=xp.float32),
         steal_perp_decay=xp.asarray(float(env.steal_perp_decay), dtype=xp.float32),
         steal_distance_factor=xp.asarray(float(env.steal_distance_factor), dtype=xp.float32),
@@ -1425,6 +1563,11 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
         receiver_alignment_width=xp.asarray(float(getattr(env, "receiver_alignment_width", 2.0)), dtype=xp.float32),
         max_receiver_hazard=xp.asarray(float(getattr(env, "max_receiver_hazard", 0.85)), dtype=xp.float32),
         lane_weight=xp.asarray(float(getattr(env, "lane_weight", 0.0)), dtype=xp.float32),
+        steal_skill_mean=xp.asarray(float(getattr(env, "steal_skill_mean", 0.0)), dtype=xp.float32),
+        steal_skill_std=xp.asarray(max(0.0, float(getattr(env, "steal_skill_std", 0.0))), dtype=xp.float32),
+        passing_skill_mean=xp.asarray(float(getattr(env, "passing_skill_mean", 0.0)), dtype=xp.float32),
+        passing_skill_std=xp.asarray(max(0.0, float(getattr(env, "passing_skill_std", 0.0))), dtype=xp.float32),
+        steal_skill_effect_weight=xp.asarray(max(0.0, float(getattr(env, "steal_skill_effect_weight", 0.0))), dtype=xp.float32),
         three_point_distance=xp.asarray(float(env.three_point_distance), dtype=xp.float32),
         three_pt_extra_hex_decay=xp.asarray(float(env.three_pt_extra_hex_decay), dtype=xp.float32),
         shot_clock_min=xp.asarray(int(env.min_shot_clock), dtype=xp.int32),
@@ -2116,6 +2259,21 @@ def build_action_masks_batch(static: KernelStatic, state: KernelState, jnp):
         state.game_phase[:, None] == GAME_PHASE_LIVE
     )
     move_masks = jnp.where(reentry_active[:, :, None], reentry_masks, move_masks)
+    # Once an entry cell is available, the inbounder must use a legal move to
+    # return to the court.  Leaving NOOP enabled here allowed policies to keep
+    # an inbounder outside indefinitely even while an adjacent cell was empty.
+    # Waiting remains legal while every adjacent court cell is occupied.
+    forced_reentry = reentry_active & jnp.any(
+        reentry_masks.astype(jnp.bool_),
+        axis=-1,
+    )
+    masks = masks.at[:, :, ActionType.NOOP.value].set(
+        jnp.where(
+            forced_reentry,
+            jnp.asarray(0, dtype=jnp.int8),
+            masks[:, :, ActionType.NOOP.value],
+        )
+    )
     current_inbounder = pending_inbounder & (
         state.game_phase[:, None] == GAME_PHASE_INBOUND
     )
@@ -2855,6 +3013,16 @@ def _finalize_step_rewards_single(
     )
 
 
+def _skill_adjust_probability(base_probability, skill_delta, effect_weight, jnp):
+    """Apply a logit-space skill matchup while preserving weight-zero parity."""
+    base = jnp.clip(base_probability.astype(jnp.float32), 0.0, 1.0)
+    safe = jnp.clip(base, 1e-6, 1.0 - 1e-6)
+    logit = jnp.log(safe) - jnp.log1p(-safe)
+    adjusted = 1.0 / (1.0 + jnp.exp(-jnp.clip(logit + (effect_weight * skill_delta), -60.0, 60.0)))
+    adjusted = jnp.where(base <= 0.0, 0.0, jnp.where(base >= 1.0, 1.0, adjusted))
+    return jnp.where(effect_weight > 0.0, adjusted, base)
+
+
 def build_turnover_probabilities_batch(static: KernelStatic, state: KernelState, jnp):
     batch_size = state.positions.shape[0]
     offense_count = static.offense_ids.shape[0]
@@ -2887,6 +3055,19 @@ def build_turnover_probabilities_batch(static: KernelStatic, state: KernelState,
     valid = has_offense_holder[:, None] & (distances <= static.defender_pressure_distance) & (cos_angle >= 0.0)
     turnover_prob = static.defender_pressure_turnover_chance * jnp.exp(
         -static.defender_pressure_decay_lambda * jnp.maximum(0.0, distances - 1.0)
+    )
+    defender_pressure_skill = jnp.take_along_axis(state.pressure_skill, defense_ids, axis=1)
+    safe_holder = jnp.clip(state.ball_holder, 0, state.positions.shape[1] - 1)
+    handler_skill = jnp.take_along_axis(
+        state.ball_handling_skill,
+        safe_holder[:, None],
+        axis=1,
+    )[:, 0]
+    turnover_prob = _skill_adjust_probability(
+        turnover_prob,
+        defender_pressure_skill - handler_skill[:, None],
+        static.pressure_skill_effect_weight,
+        jnp,
     )
     turnover_prob = jnp.where(valid, turnover_prob, 0.0)
     total_turnover = 1.0 - jnp.prod(1.0 - turnover_prob, axis=1)
@@ -3031,6 +3212,15 @@ def build_pass_steal_contributions_batch(static: KernelStatic, state: KernelStat
         * (1.0 - reaction_lane_hazard)
     )
     steal_contrib = jnp.where(reaction_model, reaction_steal_contrib, legacy_steal_contrib)
+    defender_steal_skill = jnp.take_along_axis(state.steal_skill, defense_ids, axis=1)
+    safe_passer = jnp.clip(state.ball_holder, 0, state.positions.shape[1] - 1)
+    passer_skill = jnp.take_along_axis(state.passing_skill, safe_passer[:, None], axis=1)[:, 0]
+    steal_contrib = _skill_adjust_probability(
+        steal_contrib,
+        defender_steal_skill[:, None, :] - passer_skill[:, None, None],
+        static.steal_skill_effect_weight,
+        jnp,
+    )
     steal_contrib = jnp.where(
         valid_receivers[:, :, None]
         & (~same_as_passer)
@@ -3326,7 +3516,22 @@ def build_flat_observation_batch_with_role_flag(
             role_flag_value,
             jnp,
         )
-        parts.extend([multi_players.reshape(batch_size, -1), multi_globals])
+        episode_skills = jnp.stack(
+            [
+                state.pressure_skill,
+                state.steal_skill,
+                state.ball_handling_skill,
+                state.passing_skill,
+            ],
+            axis=-1,
+        ).astype(jnp.float32)
+        parts.extend(
+            [
+                multi_players.reshape(batch_size, -1),
+                multi_globals,
+                episode_skills.reshape(batch_size, -1),
+            ]
+        )
     parts.extend(
         [
             role_flag,
@@ -3535,6 +3740,16 @@ def build_token_observation_components_batch(
         )
         players = jnp.concatenate([players, multi_players], axis=-1)
         globals_vec = jnp.concatenate([globals_vec, multi_globals], axis=-1)
+        episode_skills = jnp.stack(
+            [
+                state.pressure_skill,
+                state.steal_skill,
+                state.ball_handling_skill,
+                state.passing_skill,
+            ],
+            axis=-1,
+        ).astype(jnp.float32)
+        players = jnp.concatenate([players, episode_skills], axis=-1)
     role_flag = _broadcast_role_flag_batch(role_flag_value, batch_size, jnp)[:, None]
     return players, globals_vec, role_flag
 
@@ -3773,6 +3988,14 @@ def _pressure_turnover_probs_single(static: KernelStatic, state: KernelState, ja
     per_defender = static.defender_pressure_turnover_chance * jnp.exp(
         -static.defender_pressure_decay_lambda * jnp.maximum(0.0, distances - 1.0)
     )
+    defense_ids = _active_defense_ids_single(static, state, jax)
+    safe_holder = jnp.clip(state.ball_holder, 0, state.positions.shape[0] - 1)
+    per_defender = _skill_adjust_probability(
+        per_defender,
+        state.pressure_skill[defense_ids] - state.ball_handling_skill[safe_holder],
+        static.pressure_skill_effect_weight,
+        jnp,
+    )
     return jnp.where(valid, per_defender, 0.0), total_prob
 
 
@@ -3967,7 +4190,21 @@ def _resolve_movement_single(static: KernelStatic, state: KernelState, actions, 
         contenders = valid_move & jnp.all(intended_dest == dest, axis=-1)
         static_occupant = (~valid_move) & jnp.all(current_positions == dest, axis=-1)
         move_count = jnp.sum(contenders.astype(jnp.int32))
-        winner_idx = jnp.argmax(jnp.where(contenders, move_keys, -jnp.ones_like(move_keys)))
+        # An inbounder entering from outside has priority over an ordinary
+        # on-court player simultaneously targeting the same empty cell.  This
+        # prevents another mover from repeatedly taking the only available
+        # entry cell and stranding the inbounder behind the baseline.
+        reentry_contenders = contenders & reentering_inbounder
+        has_reentry_contender = jnp.any(reentry_contenders)
+        random_winner_idx = jnp.argmax(
+            jnp.where(contenders, move_keys, -jnp.ones_like(move_keys))
+        )
+        reentry_winner_idx = jnp.argmax(reentry_contenders.astype(jnp.int32))
+        winner_idx = jnp.where(
+            has_reentry_contender,
+            reentry_winner_idx,
+            random_winner_idx,
+        )
         winner_mask = contenders & (player_ids == winner_idx)
         single_move = contenders & (move_count == 1) & (~jnp.any(static_occupant))
         collision_move = winner_mask & (move_count > 1) & (~jnp.any(static_occupant))
@@ -5272,7 +5509,8 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     jnp.maximum(
                         jnp.asarray(0, dtype=jnp.int32),
                         static.shot_clock_max.astype(jnp.int32)
-                        - next_state.shot_clock.astype(jnp.int32),
+                        - next_state.shot_clock.astype(jnp.int32)
+                        + jnp.asarray(1, dtype=jnp.int32),
                     ),
                     zero_steps,
                 ),
@@ -6814,6 +7052,13 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         intent_visible_key,
         rebound_skill_key,
     ) = jax.random.split(key, 11)
+    # Derive new episode-skill streams without changing any of the established
+    # reset subkeys above. This preserves seed-for-seed legacy behavior when
+    # all new effect weights are zero.
+    pressure_skill_key = jax.random.fold_in(key, 101)
+    steal_skill_key = jax.random.fold_in(key, 102)
+    ball_handling_skill_key = jax.random.fold_in(key, 103)
+    passing_skill_key = jax.random.fold_in(key, 104)
 
     # Folded keys add Team B skill draws for multi-possession games without
     # perturbing legacy reset sampling or its reproducibility.
@@ -6964,6 +7209,22 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         one_high_rebound_skill_specialist,
         gaussian_rebound_skill_specialist,
     )
+    pressure_skill = static.pressure_skill_mean + (
+        jax.random.normal(pressure_skill_key, shape=(n_players,), dtype=jnp.float32)
+        * static.pressure_skill_std
+    )
+    steal_skill = static.steal_skill_mean + (
+        jax.random.normal(steal_skill_key, shape=(n_players,), dtype=jnp.float32)
+        * static.steal_skill_std
+    )
+    ball_handling_skill = static.ball_handling_skill_mean + (
+        jax.random.normal(ball_handling_skill_key, shape=(n_players,), dtype=jnp.float32)
+        * static.ball_handling_skill_std
+    )
+    passing_skill = static.passing_skill_mean + (
+        jax.random.normal(passing_skill_key, shape=(n_players,), dtype=jnp.float32)
+        * static.passing_skill_std
+    )
 
     # Continuous games sample neutral positions first, then use the 50/50
     # draw to decide which stable team won the simulated jump ball. The legacy
@@ -7082,6 +7343,10 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         dunk_pct=dunk_pct,
         rebound_skill=rebound_skill,
         rebound_skill_specialist=rebound_skill_specialist,
+        pressure_skill=pressure_skill,
+        steal_skill=steal_skill,
+        ball_handling_skill=ball_handling_skill,
+        passing_skill=passing_skill,
         rebound_reward_advance_paid=jnp.asarray(0.0, dtype=jnp.float32),
         offense_team=offense_team,
         starting_offense_team=offense_team,

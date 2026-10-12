@@ -28,6 +28,47 @@ METADATA_FILENAME = "metadata.json"
 STATE_SUBDIR = "state"
 
 
+def _adapt_observation_to_checkpoint(flat_obs, static, spec, jnp):
+    """Adapt the current v3 multi-possession observation for v2 inference."""
+    expected_dim = int(spec.flat_obs_dim)
+    current_dim = int(flat_obs.shape[-1])
+    if current_dim == expected_dim:
+        return flat_obs
+    if current_dim < expected_dim:
+        raise ValueError(
+            f"Policy observation dim {current_dim} is smaller than checkpoint dim {expected_dim}."
+        )
+    n_players = int(static.role_encoding.shape[0])
+    schema_version = int(getattr(spec, "observation_schema_version", 1))
+    if not (
+        bool(getattr(spec, "multi_possession_features", False))
+        and schema_version == 2
+        and current_dim - expected_dim == (4 * n_players)
+    ):
+        raise ValueError(
+            "Policy observation does not match a supported checkpoint schema "
+            f"adaptation (runtime={current_dim}, checkpoint={expected_dim}, schema={schema_version})."
+        )
+    if str(spec.model_type) == "attention":
+        token_count = int(spec.token_player_count)
+        current_token_dim = int(spec.token_dim) + 4
+        players = flat_obs[:, : token_count * current_token_dim].reshape(
+            flat_obs.shape[0], token_count, current_token_dim
+        )[:, :, : int(spec.token_dim)]
+        global_start = token_count * current_token_dim
+        globals_and_role = flat_obs[:, global_start:]
+        return jnp.concatenate(
+            [players.reshape(flat_obs.shape[0], -1), globals_and_role], axis=1
+        ).astype(jnp.float32)
+    offense_count = int(static.offense_ids.shape[0])
+    tail_dim = 1 + (3 * offense_count)
+    remove_start = current_dim - tail_dim - (4 * n_players)
+    return jnp.concatenate(
+        [flat_obs[:, :remove_start], flat_obs[:, remove_start + (4 * n_players) :]],
+        axis=1,
+    ).astype(jnp.float32)
+
+
 def is_checkpoint_path(path: str | Path) -> bool:
     checkpoint_path = Path(path)
     return checkpoint_path.is_dir() and (checkpoint_path / METADATA_FILENAME).is_file() and (
@@ -53,7 +94,12 @@ class JAXInferenceModel:
             "last_metrics": dict(payload.get("last_metrics", {}) or {}),
             "checkpoint_version": int(payload.get("checkpoint_version", 0)),
         }
-        for key in ("play_name_metadata", "play_name_map", "model_codename"):
+        for key in (
+            "play_name_metadata",
+            "play_name_map",
+            "model_codename",
+            "observation_metadata",
+        ):
             if key in payload:
                 self.metadata[key] = payload[key]
         self._prepared_env = None
@@ -144,6 +190,12 @@ class JAXInferenceModel:
             "layup_pct",
             "three_pt_pct",
             "dunk_pct",
+            "rebound_skill",
+            "rebound_skill_specialist",
+            "pressure_skill",
+            "steal_skill",
+            "ball_handling_skill",
+            "passing_skill",
         )
         scalar_keys = (
             "ball_holder",
@@ -193,6 +245,13 @@ class JAXInferenceModel:
             model_type=self.spec.model_type,
             rebound_win_prob_features=bool(getattr(self.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
+            multi_possession_features=bool(getattr(self.spec, "multi_possession_features", False)),
+        )
+        flat_obs = _adapt_observation_to_checkpoint(
+            flat_obs,
+            static,
+            self.spec,
+            self.jnp,
         )
         full_action_mask = build_action_masks_batch(static, state, self.jnp)
         team_ids = static.offense_ids if bool(observer_is_offense) else static.defense_ids
@@ -221,6 +280,13 @@ class JAXInferenceModel:
             model_type=self.spec.model_type,
             rebound_win_prob_features=bool(getattr(self.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
+            multi_possession_features=bool(getattr(self.spec, "multi_possession_features", False)),
+        )
+        flat_obs = _adapt_observation_to_checkpoint(
+            flat_obs,
+            static,
+            self.spec,
+            self.jnp,
         )
         return np.asarray(self.jax.device_get(flat_obs[0]), dtype=np.float32)
 
@@ -239,6 +305,7 @@ class JAXInferenceModel:
                 getattr(self.spec, "rebound_win_prob_features", False)
             ),
             rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
+            multi_possession_features=bool(getattr(self.spec, "multi_possession_features", False)),
         )
         rebound_target_observation_features = bool(
             getattr(self.spec, "rebound_target_observation_features", True)
@@ -256,6 +323,17 @@ class JAXInferenceModel:
             player_labels.append("rebound_skill_specialist")
         if bool(getattr(self.spec, "rebound_win_prob_features", False)):
             player_labels.append("rebound_win_probability")
+        if bool(getattr(self.spec, "multi_possession_features", False)):
+            player_labels.extend(
+                [
+                    "is_inbounder",
+                    "on_court",
+                    "pressure_skill",
+                    "steal_skill",
+                    "ball_handling_skill",
+                    "passing_skill",
+                ]
+            )
         global_labels = ["shot_clock_norm", "pressure_exposure", "hoop_q_norm", "hoop_r_norm"]
         if rebound_target_observation_features:
             global_labels.extend(
@@ -263,6 +341,16 @@ class JAXInferenceModel:
             )
         if bool(getattr(self.spec, "rebound_win_prob_features", False)):
             global_labels.append("offensive_rebound_probability")
+        if bool(getattr(self.spec, "multi_possession_features", False)):
+            global_labels.extend(
+                [
+                    "relative_score",
+                    "possessions_remaining_norm",
+                    "clearance_required",
+                    "restart_phase",
+                    "restart_countdown_norm",
+                ]
+            )
         return {
             "players": np.asarray(self.jax.device_get(players[0]), dtype=np.float32),
             "players_labels": player_labels,

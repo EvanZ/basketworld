@@ -345,6 +345,16 @@ def get_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Exponential decay rate for defender pressure.",
     )
+    parser.add_argument("--pressure-skill-mean", type=float, default=0.0, help="Mean episode-stable defender pressure skill.")
+    parser.add_argument("--pressure-skill-std", type=float, default=0.0, help="Stddev of episode-stable defender pressure skill.")
+    parser.add_argument("--ball-handling-skill-mean", type=float, default=0.0, help="Mean episode-stable offensive ball-handling skill.")
+    parser.add_argument("--ball-handling-skill-std", type=float, default=0.0, help="Stddev of episode-stable offensive ball-handling skill.")
+    parser.add_argument(
+        "--pressure-skill-effect-weight",
+        type=float,
+        default=0.0,
+        help="Logit-space weight on pressure skill minus ball-handling skill. Zero preserves legacy pressure probabilities.",
+    )
     parser.add_argument(
         "--tensorboard-path",
         type=str,
@@ -1322,6 +1332,16 @@ def get_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Reaction pass model: weight on the legacy line lane-risk term.",
+    )
+    parser.add_argument("--steal-skill-mean", type=float, default=0.0, help="Mean episode-stable defender interception skill.")
+    parser.add_argument("--steal-skill-std", type=float, default=0.0, help="Stddev of episode-stable defender interception skill.")
+    parser.add_argument("--passing-skill-mean", type=float, default=0.0, help="Mean episode-stable offensive passing skill.")
+    parser.add_argument("--passing-skill-std", type=float, default=0.0, help="Stddev of episode-stable offensive passing skill.")
+    parser.add_argument(
+        "--steal-skill-effect-weight",
+        type=float,
+        default=0.0,
+        help="Logit-space weight on steal skill minus passing skill. Zero preserves legacy interception probabilities.",
     )
     parser.add_argument(
         "--episode-sample-prob",

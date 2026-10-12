@@ -1,6 +1,6 @@
 <script setup>
-import { ref, watch } from 'vue';
-import { listPolicies } from '@/services/api';
+import { onMounted, onUnmounted, ref, watch } from 'vue';
+import { listPolicies, listRecentTrainingRuns } from '@/services/api';
 
 const emit = defineEmits(['game-started', 'template-sandbox-started']);
 
@@ -12,6 +12,80 @@ const selectedUnifiedPolicy = ref(null);
 const useDifferentOpponentPolicy = ref(false);
 const selectedOpponentUnifiedPolicy = ref(null);
 const isMultiPossessionRun = ref(false);
+const recentRuns = ref([]);
+const recentRunsLoading = ref(false);
+const trainerAvailable = ref(true);
+const copiedRunId = ref('');
+let recentRunsTimer = null;
+
+async function refreshRecentRuns({ showLoading = true } = {}) {
+  if (showLoading) recentRunsLoading.value = true;
+  try {
+    const result = await listRecentTrainingRuns(8);
+    trainerAvailable.value = result?.available !== false;
+    recentRuns.value = Array.isArray(result?.runs) ? result.runs : [];
+  } catch (error) {
+    trainerAvailable.value = false;
+    recentRuns.value = [];
+    console.warn('[GameSetup] Unable to load recent trainer runs:', error);
+  } finally {
+    if (showLoading) recentRunsLoading.value = false;
+  }
+}
+
+function useRecentRun(run) {
+  const mlflowRunId = String(run?.mlflow_run_id || '').trim();
+  if (mlflowRunId) runId.value = mlflowRunId;
+}
+
+async function copyRecentRunId(run) {
+  const mlflowRunId = String(run?.mlflow_run_id || '').trim();
+  if (!mlflowRunId) return;
+  try {
+    const copyInput = document.createElement('textarea');
+    copyInput.value = mlflowRunId;
+    copyInput.setAttribute('readonly', '');
+    copyInput.style.position = 'fixed';
+    copyInput.style.opacity = '0';
+    document.body.appendChild(copyInput);
+    copyInput.select();
+    const copiedBySelection = document.execCommand('copy');
+    document.body.removeChild(copyInput);
+    if (!copiedBySelection) {
+      if (!navigator.clipboard?.writeText) throw new Error('Clipboard is unavailable.');
+      await navigator.clipboard.writeText(mlflowRunId);
+    }
+    copiedRunId.value = mlflowRunId;
+    window.setTimeout(() => {
+      if (copiedRunId.value === mlflowRunId) copiedRunId.value = '';
+    }, 1600);
+  } catch (error) {
+    console.warn('[GameSetup] Unable to copy MLflow run ID:', error);
+  }
+}
+
+function formatRunProgress(run) {
+  const current = Math.max(0, Number(run?.current_update) || 0);
+  const target = Math.max(0, Number(run?.target_updates) || 0);
+  if (!target) return `U${current.toLocaleString()}`;
+  return `U${current.toLocaleString()} / ${target.toLocaleString()}`;
+}
+
+function statusClass(status) {
+  return `status-${String(status || 'unknown').toLowerCase().replace(/[^a-z0-9_-]/g, '-')}`;
+}
+
+onMounted(() => {
+  refreshRecentRuns();
+  recentRunsTimer = window.setInterval(
+    () => refreshRecentRuns({ showLoading: false }),
+    5000,
+  );
+});
+
+onUnmounted(() => {
+  if (recentRunsTimer !== null) window.clearInterval(recentRunsTimer);
+});
 
 async function fetchPolicies() {
   if (!runId.value) {
@@ -76,6 +150,59 @@ function openTemplateSandbox() {
     <div class="setup-container">
         <h2>Game Setup</h2>
         <p>Enter an MLflow Run ID to load either an SB3 model or a JAX checkpoint artifact from that run.</p>
+
+        <section class="recent-runs-panel" aria-labelledby="recent-runs-heading">
+          <div class="recent-runs-header">
+            <div>
+              <h3 id="recent-runs-heading">Recent Trainer Runs</h3>
+              <span>Click an MLflow ID to copy it, or use a run directly.</span>
+            </div>
+            <button
+              type="button"
+              class="recent-refresh-btn"
+              :disabled="recentRunsLoading"
+              @click="refreshRecentRuns()"
+            >
+              {{ recentRunsLoading ? 'Loading…' : 'Refresh' }}
+            </button>
+          </div>
+          <div v-if="!trainerAvailable" class="recent-runs-empty">
+            Trainer API is offline.
+          </div>
+          <div v-else-if="!recentRunsLoading && recentRuns.length === 0" class="recent-runs-empty">
+            No trainer-managed runs yet.
+          </div>
+          <div v-else class="recent-runs-list">
+            <article v-for="run in recentRuns" :key="run.id" class="recent-run-row">
+              <div class="recent-run-summary">
+                <div class="recent-run-title-row">
+                  <strong>{{ run.name }}</strong>
+                  <span class="run-status" :class="statusClass(run.status)">{{ run.status }}</span>
+                </div>
+                <span class="run-progress">{{ formatRunProgress(run) }}</span>
+                <button
+                  v-if="run.mlflow_run_id"
+                  type="button"
+                  class="run-id-link"
+                  :title="`Copy MLflow run ID ${run.mlflow_run_id}`"
+                  @click="copyRecentRunId(run)"
+                >
+                  {{ run.mlflow_run_id }}
+                  <span class="copy-state">{{ copiedRunId === run.mlflow_run_id ? 'Copied!' : 'Copy' }}</span>
+                </button>
+                <span v-else class="run-id-pending">Waiting for MLflow run ID…</span>
+              </div>
+              <button
+                type="button"
+                class="recent-use-btn"
+                :disabled="!run.mlflow_run_id"
+                @click="useRecentRun(run)"
+              >
+                Use
+              </button>
+            </article>
+          </div>
+        </section>
         
         <form @submit.prevent="startGame">
             <div class="form-group">
@@ -161,6 +288,160 @@ function openTemplateSandbox() {
   color: var(--app-text-muted);
   margin-bottom: 1.5rem;
   font-size: 0.9rem;
+}
+
+.recent-runs-panel {
+  margin: 1rem 0 1.4rem;
+  padding: 0.9rem;
+  border: 1px solid rgba(56, 189, 248, 0.24);
+  border-radius: 16px;
+  background: rgba(7, 13, 28, 0.72);
+}
+
+.recent-runs-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.recent-runs-header h3 {
+  margin: 0 0 0.2rem;
+  color: var(--app-text);
+  font-size: 0.82rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.recent-runs-header span,
+.recent-runs-empty {
+  color: var(--app-text-muted);
+  font-size: 0.72rem;
+}
+
+.recent-runs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-height: 18rem;
+  overflow-y: auto;
+}
+
+.recent-run-row {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.65rem;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.62);
+}
+
+.recent-run-summary {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.recent-run-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.recent-run-title-row strong {
+  overflow: hidden;
+  color: var(--app-text);
+  font-size: 0.78rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-status {
+  flex: 0 0 auto;
+  padding: 0.12rem 0.42rem;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--app-text-muted);
+  font-size: 0.62rem;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.run-status.status-running,
+.run-status.status-starting {
+  background: rgba(34, 197, 94, 0.16);
+  color: #86efac;
+}
+
+.run-status.status-paused,
+.run-status.status-pausing {
+  background: rgba(250, 204, 21, 0.15);
+  color: #fde047;
+}
+
+.run-status.status-failed,
+.run-status.status-stopped {
+  background: rgba(248, 113, 113, 0.15);
+  color: #fca5a5;
+}
+
+.run-progress,
+.run-id-pending {
+  color: var(--app-text-muted);
+  font-size: 0.68rem;
+}
+
+.run-id-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--app-accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.68rem;
+  letter-spacing: 0;
+  text-align: left;
+  text-transform: none;
+}
+
+.run-id-link:hover {
+  transform: none;
+  color: var(--app-accent-strong);
+}
+
+.copy-state {
+  flex: 0 0 auto;
+  color: var(--app-text-muted);
+  font-family: inherit;
+  font-size: 0.62rem;
+}
+
+.recent-refresh-btn,
+.recent-use-btn {
+  margin: 0;
+  padding: 0.34rem 0.65rem;
+  font-size: 0.65rem;
+}
+
+.recent-use-btn {
+  flex: 0 0 auto;
+}
+
+.recent-refresh-btn:disabled,
+.recent-use-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 .form-group {

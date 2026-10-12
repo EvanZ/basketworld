@@ -37,6 +37,10 @@ from app.backend.rollout_runtime import (
 )
 from app.backend.state import game_state
 from basketworld_jax.eval import can_run_native_jax_evaluation, run_native_jax_evaluation
+from basketworld_jax.eval.skills import (
+    ACTIVE_PLAYER_SKILL_REGISTRY,
+    PlayerSkillValidationError,
+)
 
 
 # Worker-local storage (each process has its own copy)
@@ -1002,11 +1006,9 @@ def _accumulate_assist_links(
             continue
         if shooter_id == passer_id:
             continue
-        if (
-            shooter_id not in user_team_ids_set
-            or passer_id not in user_team_ids_set
-        ):
-            continue
+        # Preserve both stable teams in the evaluation flow graph. The UI
+        # selects the Player or AI roster after evaluation instead of dropping
+        # opponent links at collection time.
 
         shot_type = "two"
         try:
@@ -1257,6 +1259,8 @@ def _build_reset_options_for_custom_setup(custom_setup: dict | None, enforce_fix
     shooting_mode = custom_setup.get("shooting_mode") or "random"
     if enforce_fixed_skills and shooting_mode == "fixed" and custom_setup.get("offense_skills"):
         opts["offense_skills"] = copy.deepcopy(custom_setup["offense_skills"])
+    if custom_setup.get("player_skills") is not None:
+        opts["player_skills"] = copy.deepcopy(custom_setup["player_skills"])
     if custom_setup.get("rebound_skills") is not None:
         opts["rebound_skills"] = [float(v) for v in custom_setup["rebound_skills"]]
     return opts
@@ -1674,6 +1678,54 @@ def validate_custom_eval_setup(custom_setup, env) -> dict:
         raise HTTPException(status_code=400, detail=f"Invalid shooting_mode: {shooting_mode}")
     normalized["shooting_mode"] = shooting_mode
 
+    if setup.get("player_skills") is not None:
+        raw_profiles = setup.get("player_skills")
+        if not isinstance(raw_profiles, dict):
+            raise HTTPException(status_code=400, detail="player_skills must be keyed by player id.")
+        expected_ids = set(range(int(base_env.n_players)))
+        parsed_ids: set[int] = set()
+        normalized_profiles: dict[str, dict[str, Any]] = {}
+        for raw_player_id, raw_profile in raw_profiles.items():
+            try:
+                player_id = int(raw_player_id)
+            except Exception:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid player_skills player id: {raw_player_id}",
+                )
+            if player_id not in expected_ids or player_id in parsed_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid or duplicate player_skills player id: {raw_player_id}",
+                )
+            if not isinstance(raw_profile, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"player_skills.{player_id} must be an object.",
+                )
+            try:
+                profile = ACTIVE_PLAYER_SKILL_REGISTRY.normalize_profile(raw_profile)
+            except PlayerSkillValidationError as exc:
+                if exc.missing_keys:
+                    detail = (
+                        f"player_skills.{player_id} is missing: "
+                        f"{', '.join(exc.missing_keys)}"
+                    )
+                elif exc.skill_key is not None:
+                    detail = f"player_skills.{player_id}.{exc.skill_key} {exc}"
+                else:
+                    detail = f"player_skills.{player_id} {exc}"
+                raise HTTPException(status_code=400, detail=detail) from exc
+            parsed_ids.add(player_id)
+            normalized_profiles[str(player_id)] = profile
+        if parsed_ids != expected_ids:
+            missing_ids = sorted(expected_ids - parsed_ids)
+            raise HTTPException(
+                status_code=400,
+                detail=f"player_skills must define every player; missing ids: {missing_ids}",
+            )
+        normalized["player_skills"] = normalized_profiles
+
     if setup.get("initial_positions") is not None:
         positions_raw = setup["initial_positions"]
         if not isinstance(positions_raw, (list, tuple)):
@@ -1746,7 +1798,7 @@ def validate_custom_eval_setup(custom_setup, env) -> dict:
             "max_attempts": max_attempts,
         }
 
-    if shooting_mode == "fixed":
+    if shooting_mode == "fixed" and normalized.get("player_skills") is None:
         offense_ids = getattr(base_env, "offense_ids", [])
         offense_count = len(offense_ids)
         skills = setup.get("offense_skills")

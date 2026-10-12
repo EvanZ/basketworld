@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from copy import copy
+from copy import copy, deepcopy
 from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
@@ -31,12 +31,18 @@ from basketworld_jax.checkpoints import (
     load_checkpoint,
     save_checkpoint,
 )
+from basketworld_jax.eval.fixed_pool_study import run_fixed_pool_study
 from basketworld_jax.config import TRAIN_FROZEN_VALUES
+from basketworld_jax.provenance import (
+    capture_source_provenance,
+    resume_config_snapshot,
+)
 from basketworld_jax.env import (
     MULTI_POSSESSION_SCHEMA_VERSION,
     PASS_ACTION_END,
     PASS_ACTION_START,
     token_observation_dims,
+    token_observation_labels,
     build_action_masks_batch,
     build_policy_intent_context_batch,
     build_policy_observation_batch,
@@ -147,6 +153,11 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "defender_pressure_distance",
         "defender_pressure_turnover_chance",
         "defender_pressure_decay_lambda",
+        "pressure_skill_mean",
+        "pressure_skill_std",
+        "ball_handling_skill_mean",
+        "ball_handling_skill_std",
+        "pressure_skill_effect_weight",
         "base_steal_rate",
         "steal_perp_decay",
         "steal_distance_factor",
@@ -168,6 +179,11 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "receiver_alignment_width",
         "max_receiver_hazard",
         "lane_weight",
+        "steal_skill_mean",
+        "steal_skill_std",
+        "passing_skill_mean",
+        "passing_skill_std",
+        "steal_skill_effect_weight",
         "spawn_distance",
         "max_spawn_distance",
         "defender_spawn_distance",
@@ -284,6 +300,11 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "defender_pressure_distance",
     "defender_pressure_turnover_chance",
     "defender_pressure_decay_lambda",
+    "pressure_skill_mean",
+    "pressure_skill_std",
+    "ball_handling_skill_mean",
+    "ball_handling_skill_std",
+    "pressure_skill_effect_weight",
     "base_steal_rate",
     "steal_perp_decay",
     "steal_distance_factor",
@@ -305,6 +326,11 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "receiver_alignment_width",
     "max_receiver_hazard",
     "lane_weight",
+    "steal_skill_mean",
+    "steal_skill_std",
+    "passing_skill_mean",
+    "passing_skill_std",
+    "steal_skill_effect_weight",
     "spawn_distance",
     "max_spawn_distance",
     "defender_spawn_distance",
@@ -681,6 +707,166 @@ def build_train_parser():
         type=int,
         default=64,
         help="Deterministic eval rollout horizon.",
+    )
+    parser.add_argument(
+        "--run-fixed-pool-study",
+        action="store_true",
+        help=(
+            "Run only the opt-in fixed-player-pool study workflow. This is "
+            "separate from normal evaluation and Elo reporting."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-pool-checkpoint",
+        action="append",
+        default=[],
+        help=(
+            "Checkpoint directory to evaluate in fixed-pool mode. Repeat for "
+            "a longitudinal study."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-pool-checkpoint-dir",
+        type=str,
+        default="",
+        help=(
+            "Checkpoint root used with --fixed-pool-checkpoint-update; when "
+            "updates are omitted its latest update_* child is evaluated."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-pool-checkpoint-update",
+        action="append",
+        type=int,
+        default=[],
+        help="Update index under --fixed-pool-checkpoint-dir to evaluate. Repeatable.",
+    )
+    parser.add_argument(
+        "--fixed-pool-path",
+        type=str,
+        default="",
+        help="Immutable player-pool JSON to load or create.",
+    )
+    parser.add_argument(
+        "--fixed-pool-create",
+        action="store_true",
+        help="Create --fixed-pool-path instead of loading an existing immutable pool.",
+    )
+    parser.add_argument(
+        "--fixed-pool-size",
+        type=int,
+        default=0,
+        help=(
+            "Players to seed when creating a pool; 0 uses the skill-scaled "
+            "study budget."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-pool-seed",
+        type=int,
+        default=0,
+        help="Deterministic seed used only when creating a player pool.",
+    )
+    parser.add_argument(
+        "--fixed-pool-schedule-path",
+        type=str,
+        default="",
+        help="Immutable balanced-lineup schedule JSON to load or create.",
+    )
+    parser.add_argument(
+        "--fixed-pool-schedule-create",
+        action="store_true",
+        help="Create --fixed-pool-schedule-path instead of loading it.",
+    )
+    parser.add_argument(
+        "--fixed-pool-games",
+        type=int,
+        default=0,
+        help=(
+            "Independent balanced games when creating a schedule; 0 uses the "
+            "skill-scaled study budget."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-pool-schedule-seed",
+        type=int,
+        default=1,
+        help="Deterministic seed used only when creating a lineup schedule.",
+    )
+    parser.add_argument(
+        "--fixed-pool-extension-source",
+        type=str,
+        default="",
+        help=(
+            "Completed raw study root to extend. Only new --fixed-pool-games are "
+            "evaluated; prior evidence is combined into a new immutable study."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-pool-action-mode",
+        choices=("direct", "sampled"),
+        default="direct",
+        help="Use direct argmax or sampled actions; modes always produce separate studies.",
+    )
+    parser.add_argument(
+        "--fixed-pool-batch-size",
+        type=int,
+        default=64,
+        help=(
+            "Games per compiled fixed-pool evaluation batch. Smaller batches "
+            "produce progress heartbeats sooner and limit CPU compile cost."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-pool-artifact-dir",
+        type=str,
+        default="",
+        help="Parent directory for isolated fixed_pool_studies raw artifacts.",
+    )
+    parser.add_argument(
+        "--fixed-pool-report-dir",
+        type=str,
+        default="",
+        help="Parent directory for isolated fixed_pool_reports; defaults to artifact dir.",
+    )
+    parser.add_argument(
+        "--fixed-pool-eval-seed",
+        type=int,
+        default=0,
+        help="Evaluation seed recorded with each requested study run.",
+    )
+    parser.add_argument(
+        "--fixed-pool-ridge-alpha",
+        type=float,
+        default=None,
+        help=(
+            "Optional manual ridge override for offline fixed-pool reports. "
+            "The default selects each model's alpha with paired-group 5-fold CV."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-pool-validation-fraction",
+        type=float,
+        default=0.2,
+        help="Paired-match validation fraction for offline reports.",
+    )
+    parser.add_argument(
+        "--fixed-pool-split-seed",
+        type=int,
+        default=0,
+        help="Deterministic paired-match train/validation split seed.",
+    )
+    parser.add_argument(
+        "--fixed-pool-bootstrap-samples",
+        type=int,
+        default=200,
+        help="Paired-group bootstrap replicates for report uncertainty.",
+    )
+    parser.add_argument(
+        "--fixed-pool-bootstrap-seed",
+        type=int,
+        default=1,
+        help="Deterministic paired-group bootstrap seed.",
     )
     parser.add_argument(
         "--eval-deploy-every-updates",
@@ -1427,6 +1613,17 @@ def build_train_config_schema(args) -> list[dict[str, Any]]:
     return fields
 
 
+def _checkpoint_resolved_training_config(args) -> dict[str, Any]:
+    """Persist the restore-relevant resolved command settings with a checkpoint."""
+
+    return resume_config_snapshot(
+        {
+            field["name"]: field["effective_value"]
+            for field in build_train_config_schema(args)
+        }
+    )
+
+
 def _values_match(actual: Any, expected: Any) -> bool:
     if isinstance(expected, float):
         return np.isclose(float(actual), float(expected), atol=1e-8, rtol=0.0)
@@ -1434,6 +1631,40 @@ def _values_match(actual: Any, expected: Any) -> bool:
 
 
 def validate_train_args(args) -> None:
+    if bool(getattr(args, "run_fixed_pool_study", False)):
+        if bool(getattr(args, "run_train_loop", False)):
+            raise SystemExit(
+                "--run-fixed-pool-study is a standalone evaluation workflow and "
+                "cannot be combined with --run-train-loop."
+            )
+        if int(getattr(args, "fixed_pool_size", 0)) < 0:
+            raise SystemExit("--fixed-pool-size must be >= 0.")
+        if int(getattr(args, "fixed_pool_games", 0)) < 0:
+            raise SystemExit("--fixed-pool-games must be >= 0.")
+        if str(getattr(args, "fixed_pool_extension_source", "") or "").strip() and int(
+            getattr(args, "fixed_pool_games", 0)
+        ) < 1:
+            raise SystemExit(
+                "--fixed-pool-games must be >= 1 when extending a fixed-pool study."
+            )
+        if int(getattr(args, "fixed_pool_batch_size", 64)) < 1:
+            raise SystemExit("--fixed-pool-batch-size must be >= 1.")
+        ridge_alpha = getattr(args, "fixed_pool_ridge_alpha", None)
+        if ridge_alpha is not None and float(ridge_alpha) < 0.0:
+            raise SystemExit("--fixed-pool-ridge-alpha must be >= 0.")
+        validation_fraction = float(
+            getattr(args, "fixed_pool_validation_fraction", 0.2)
+        )
+        if not 0.0 < validation_fraction < 1.0:
+            raise SystemExit(
+                "--fixed-pool-validation-fraction must be between 0 and 1."
+            )
+        if int(getattr(args, "fixed_pool_bootstrap_samples", 0)) < 1:
+            raise SystemExit("--fixed-pool-bootstrap-samples must be >= 1.")
+        if not str(getattr(args, "fixed_pool_artifact_dir", "") or "").strip():
+            raise SystemExit(
+                "--fixed-pool-artifact-dir is required with --run-fixed-pool-study."
+            )
     mismatches: list[str] = []
     for key, expected in TRAIN_FROZEN_VALUES.items():
         if key in JAX_ALLOWED_ENV_OVERRIDE_KEYS:
@@ -1683,6 +1914,16 @@ def validate_train_args(args) -> None:
         raise SystemExit("--rebound-basket-position-weight must be >= 0.")
     if float(getattr(args, "rebound_skill_std", 0.0)) < 0.0:
         raise SystemExit("--rebound-skill-std must be >= 0.")
+    for key in (
+        "pressure_skill_std",
+        "steal_skill_std",
+        "ball_handling_skill_std",
+        "passing_skill_std",
+        "pressure_skill_effect_weight",
+        "steal_skill_effect_weight",
+    ):
+        if float(getattr(args, key, 0.0)) < 0.0:
+            raise SystemExit(f"--{key.replace('_', '-')} must be >= 0.")
     rebound_skill_sampling_mode = (
         str(getattr(args, "rebound_skill_sampling_mode", "gaussian") or "gaussian")
         .strip()
@@ -1965,6 +2206,16 @@ _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
     "inbound_deadline_steps": 5,
     "check_deadline_steps": 5,
     "check_setup_steps": 0,
+    "pressure_skill_mean": 0.0,
+    "pressure_skill_std": 0.0,
+    "ball_handling_skill_mean": 0.0,
+    "ball_handling_skill_std": 0.0,
+    "pressure_skill_effect_weight": 0.0,
+    "steal_skill_mean": 0.0,
+    "steal_skill_std": 0.0,
+    "passing_skill_mean": 0.0,
+    "passing_skill_std": 0.0,
+    "steal_skill_effect_weight": 0.0,
 }
 
 
@@ -2248,6 +2499,22 @@ def _checkpoint_trainer_config_from_args(
             getattr(args, "rebound_winner_temperature", 1.0)
         ),
         "rebound_skill_std": float(getattr(args, "rebound_skill_std", 0.0)),
+        "pressure_skill_mean": float(getattr(args, "pressure_skill_mean", 0.0)),
+        "pressure_skill_std": float(getattr(args, "pressure_skill_std", 0.0)),
+        "ball_handling_skill_mean": float(
+            getattr(args, "ball_handling_skill_mean", 0.0)
+        ),
+        "ball_handling_skill_std": float(getattr(args, "ball_handling_skill_std", 0.0)),
+        "pressure_skill_effect_weight": float(
+            getattr(args, "pressure_skill_effect_weight", 0.0)
+        ),
+        "steal_skill_mean": float(getattr(args, "steal_skill_mean", 0.0)),
+        "steal_skill_std": float(getattr(args, "steal_skill_std", 0.0)),
+        "passing_skill_mean": float(getattr(args, "passing_skill_mean", 0.0)),
+        "passing_skill_std": float(getattr(args, "passing_skill_std", 0.0)),
+        "steal_skill_effect_weight": float(
+            getattr(args, "steal_skill_effect_weight", 0.0)
+        ),
         "rebound_skill_sampling_mode": str(
             getattr(args, "rebound_skill_sampling_mode", "gaussian") or "gaussian"
         ),
@@ -2355,6 +2622,86 @@ def _normalize_policy_spec_dict(raw_spec: dict[str, Any]) -> dict[str, Any]:
     return asdict(ActorCriticSpec(**dict(raw_spec)))
 
 
+def _migrate_v2_frozen_opponent_params(
+    payload: dict[str, Any],
+    target_spec: ActorCriticSpec,
+) -> tuple[Any, bool]:
+    """Pad v2 policy inputs so a frozen opponent can run under schema v3."""
+    source_spec = ActorCriticSpec(**dict(payload.get("policy_spec", {})))
+    if source_spec == target_spec:
+        return payload["params"], False
+
+    source_fields = asdict(source_spec)
+    target_fields = asdict(target_spec)
+    for key in ("flat_obs_dim", "token_dim", "observation_schema_version"):
+        source_fields.pop(key, None)
+        target_fields.pop(key, None)
+    source_schema = int(source_spec.observation_schema_version)
+    target_schema = int(target_spec.observation_schema_version)
+    is_attention = str(target_spec.model_type) == "attention"
+    player_count = (
+        int(target_spec.token_player_count)
+        if is_attention
+        else 2 * int(target_spec.training_player_count)
+    )
+    compatible = (
+        bool(source_spec.multi_possession_features)
+        and bool(target_spec.multi_possession_features)
+        and source_schema == 2
+        and target_schema == int(MULTI_POSSESSION_SCHEMA_VERSION)
+        and source_fields == target_fields
+        and int(target_spec.flat_obs_dim)
+        == int(source_spec.flat_obs_dim) + (4 * player_count)
+        and (
+            int(target_spec.token_dim) == int(source_spec.token_dim) + 4
+            if is_attention
+            else int(target_spec.token_dim) == int(source_spec.token_dim)
+        )
+    )
+    if not compatible:
+        raise SystemExit(
+            "Frozen opponent policy_spec does not match the current JAX trainer "
+            "policy_spec and is not the supported multi-possession schema-v2 to "
+            "schema-v3 input-width migration."
+        )
+
+    migrated = deepcopy(payload["params"])
+    if is_attention:
+        layer_name = "token_mlp_0"
+        kernel = np.asarray(migrated[layer_name]["kernel"])
+        insert_at = int(source_spec.token_dim)
+        zero_rows = np.zeros((4, kernel.shape[1]), dtype=kernel.dtype)
+    else:
+        layer_name = "Dense_0"
+        kernel = np.asarray(migrated[layer_name]["kernel"])
+        tail_dim = 1 + (3 * int(target_spec.training_player_count))
+        insert_at = int(source_spec.flat_obs_dim) - tail_dim
+        zero_rows = np.zeros((4 * player_count, kernel.shape[1]), dtype=kernel.dtype)
+    migrated[layer_name]["kernel"] = np.concatenate(
+        [kernel[:insert_at], zero_rows, kernel[insert_at:]],
+        axis=0,
+    )
+    return migrated, True
+
+
+def _checkpoint_observation_metadata(spec: ActorCriticSpec) -> dict[str, Any]:
+    player_labels, global_labels = token_observation_labels(
+        rebound_win_prob_features=bool(spec.rebound_win_prob_features),
+        rebound_target_observation_features=bool(
+            spec.rebound_target_observation_features
+        ),
+        multi_possession_features=bool(spec.multi_possession_features),
+    )
+    return {
+        "schema_version": int(spec.observation_schema_version),
+        "player_labels": list(player_labels),
+        "global_labels": list(global_labels),
+        "player_dim": len(player_labels),
+        "global_dim": len(global_labels),
+        "flat_observation_dim": int(spec.flat_obs_dim),
+    }
+
+
 def _uses_grouped_opponent_sampling(args) -> bool:
     return bool(getattr(args, "grouped_opponent_sampling", False))
 
@@ -2453,10 +2800,19 @@ def _validate_resume_checkpoint_payload(
             raise SystemExit(f"Resume checkpoint trainer_config mismatch for {key!r}.")
 
     expected_policy_spec = asdict(spec)
-    if (
-        _normalize_policy_spec_dict(payload.get("policy_spec", {}))
-        != expected_policy_spec
-    ):
+    actual_policy_spec = _normalize_policy_spec_dict(payload.get("policy_spec", {}))
+    if actual_policy_spec != expected_policy_spec:
+        actual_schema = int(actual_policy_spec.get("observation_schema_version", 1))
+        expected_schema = int(expected_policy_spec.get("observation_schema_version", 1))
+        if actual_schema != expected_schema:
+            raise SystemExit(
+                "Resume checkpoint observation schema does not match the current "
+                "JAX run "
+                f"(checkpoint={actual_schema}, current={expected_schema}). "
+                "Inference and frozen-opponent evaluation can adapt schema-v2 "
+                "multi-possession checkpoints, but training resume requires an "
+                "explicit parameter/optimizer migration."
+            )
         raise SystemExit(
             "Resume checkpoint policy_spec does not match the current JAX run."
         )
@@ -2504,7 +2860,8 @@ def _save_training_checkpoint(
     selector_opt_state=None,
     intent_discriminator_state: dict[str, Any] | None = None,
     play_name_metadata: dict[str, Any] | None = None,
-) -> tuple[str | None, str]:
+) -> tuple[str | None, str, dict[str, Any]]:
+    checkpoint_source_provenance = capture_source_provenance()
     payload = build_checkpoint_payload(
         update_index=int(update_index),
         trainer_config=_checkpoint_trainer_config_from_args(
@@ -2529,6 +2886,9 @@ def _save_training_checkpoint(
         opponent_pool_state=opponent_pool_state,
         intent_discriminator_state=intent_discriminator_state,
         play_name_metadata=play_name_metadata,
+        observation_metadata=_checkpoint_observation_metadata(spec),
+        source_provenance=checkpoint_source_provenance,
+        resolved_training_config=_checkpoint_resolved_training_config(args),
     )
     if checkpoint_dir is None:
         raise ValueError(
@@ -2540,7 +2900,7 @@ def _save_training_checkpoint(
     )
     save_checkpoint(numbered_path, payload)
     save_checkpoint(latest_path, payload)
-    return str(latest_path), str(numbered_path)
+    return str(latest_path), str(numbered_path), checkpoint_source_provenance
 
 
 def _maybe_start_mlflow_run(args, *, mode: str):
@@ -3134,11 +3494,37 @@ def _select_grouped_opponents_from_pool(
 def _log_mlflow_params(
     mlflow, args, trainer_config: TrainerConfig, spec: ActorCriticSpec
 ) -> None:
+    # The trainer app continues a local checkpoint with --resume-checkpoint and
+    # joins its existing MLflow run via --mlflow-resume-run-id.  The standalone
+    # CLI continuation path instead uses --continue-run-id.  Both reopen an
+    # existing run and must therefore avoid writing immutable parameters again.
+    continuation_run_id = str(
+        getattr(args, "continue_run_id", "")
+        or getattr(args, "mlflow_resume_run_id", "")
+        or ""
+    ).strip()
     if hasattr(mlflow, "log_dict"):
         mlflow.log_dict(
             {key: to_builtin(value) for key, value in vars(args).items()},
-            "metadata/resolved_training_config.json",
+            (
+                f"metadata/continuations/target_{int(args.num_updates):07d}.json"
+                if continuation_run_id
+                else "metadata/resolved_training_config.json"
+            ),
         )
+    # MLflow parameters are immutable within a run.  A continuation deliberately
+    # raises --num-updates and also carries continuation-only settings, so trying
+    # to log the full launch parameter set again aborts before the first update.
+    # The immutable initial parameters stay as the run's baseline; the complete
+    # continuation request is preserved as a versioned artifact and mutable tag.
+    if continuation_run_id:
+        if hasattr(mlflow, "set_tag"):
+            mlflow.set_tag(
+                "basketworld.continuation_latest_target_updates",
+                str(int(args.num_updates)),
+            )
+            mlflow.set_tag("basketworld.continuation_latest_source_run", continuation_run_id)
+        return
     params = {
         "jax/script": "basketworld_jax/train/main.py",
         "jax/mode": "train_loop" if bool(args.run_train_loop) else "scaffold",
@@ -3275,6 +3661,24 @@ def _log_mlflow_params(
             getattr(args, "intent_selector_min_play_steps", 3)
         ),
         "jax/rebound_skill_std": float(getattr(args, "rebound_skill_std", 0.0)),
+        "jax/pressure_skill_mean": float(getattr(args, "pressure_skill_mean", 0.0)),
+        "jax/pressure_skill_std": float(getattr(args, "pressure_skill_std", 0.0)),
+        "jax/ball_handling_skill_mean": float(
+            getattr(args, "ball_handling_skill_mean", 0.0)
+        ),
+        "jax/ball_handling_skill_std": float(
+            getattr(args, "ball_handling_skill_std", 0.0)
+        ),
+        "jax/pressure_skill_effect_weight": float(
+            getattr(args, "pressure_skill_effect_weight", 0.0)
+        ),
+        "jax/steal_skill_mean": float(getattr(args, "steal_skill_mean", 0.0)),
+        "jax/steal_skill_std": float(getattr(args, "steal_skill_std", 0.0)),
+        "jax/passing_skill_mean": float(getattr(args, "passing_skill_mean", 0.0)),
+        "jax/passing_skill_std": float(getattr(args, "passing_skill_std", 0.0)),
+        "jax/steal_skill_effect_weight": float(
+            getattr(args, "steal_skill_effect_weight", 0.0)
+        ),
         "jax/rebound_skill_sampling_mode": str(
             getattr(args, "rebound_skill_sampling_mode", "gaussian") or "gaussian"
         ),
@@ -3550,6 +3954,8 @@ _CORE_TRAIN_METRICS = frozenset(
         "mean_learner_turnovers_per_completed_episode",
         "mean_opponent_turnovers_per_completed_episode",
         "mean_turnovers_per_completed_episode",
+        "mean_turnovers_reason_intercepted_per_completed_episode",
+        "mean_turnovers_reason_defender_pressure_per_completed_episode",
         "mean_offensive_three_seconds_per_completed_episode",
         "mean_defensive_lane_violations_per_completed_episode",
         "offensive_three_seconds_rate_per_step",
@@ -3578,6 +3984,23 @@ _CORE_TRAIN_METRICS = frozenset(
         "mean_live_ball_handler_nearest_defender_distance",
         "mean_live_unguarded_offense_fraction",
         "live_ball_handler_pressure_rate",
+        # Episode-stable roster draw diagnostics. Equal-size teams make the
+        # overall mean plus signed A-minus-B differential sufficient to
+        # reconstruct both team means without adding twelve MLflow charts.
+        "player_skill_pressure_mean",
+        "player_skill_pressure_team_a_minus_b",
+        "player_skill_steal_mean",
+        "player_skill_steal_team_a_minus_b",
+        "player_skill_ball_handling_mean",
+        "player_skill_ball_handling_team_a_minus_b",
+        "player_skill_passing_mean",
+        "player_skill_passing_team_a_minus_b",
+        "pressure_opportunity_count",
+        "pressure_expected_turnover_count",
+        "pressure_realized_turnover_count",
+        "pass_interception_opportunity_count",
+        "pass_expected_interception_count",
+        "pass_realized_interception_count",
         # Curricula and frozen-opponent schedule.
         "task_reward_scale",
         "multi_possession_limit_active",
@@ -3624,6 +4047,51 @@ _CORE_TRAIN_METRICS = frozenset(
 )
 
 
+def _summarize_active_player_skill_rosters(
+    role_rollouts, static, jax
+) -> dict[str, float]:
+    """Summarize the episode-stable roster draws active after this rollout."""
+    team_a_ids = np.asarray(jax.device_get(static.offense_ids), dtype=np.int32)
+    team_b_ids = np.asarray(jax.device_get(static.defense_ids), dtype=np.int32)
+    metrics: dict[str, float] = {}
+    for skill_name in ("pressure", "steal", "ball_handling", "passing"):
+        values = np.concatenate(
+            [
+                np.asarray(
+                    jax.device_get(
+                        getattr(role_rollouts[role].final_state, f"{skill_name}_skill")
+                    ),
+                    dtype=np.float32,
+                )
+                for role in TRAINING_ROLES
+            ],
+            axis=0,
+        )
+        team_a_mean = float(np.mean(values[:, team_a_ids]))
+        team_b_mean = float(np.mean(values[:, team_b_ids]))
+        metrics[f"player_skill_{skill_name}_mean"] = float(np.mean(values))
+        metrics[f"player_skill_{skill_name}_team_a_minus_b"] = team_a_mean - team_b_mean
+    return metrics
+
+
+def _summarize_skill_event_calibration(rollout) -> dict[str, float]:
+    trajectory = rollout.trajectory
+    active = np.asarray(trajectory.active_mask, dtype=np.float32)
+
+    def total(field: str) -> float:
+        values = np.asarray(getattr(trajectory, field), dtype=np.float32)
+        return float(np.sum(values * active))
+
+    return {
+        "pressure_opportunity_count": total("pressure_opportunities"),
+        "pressure_expected_turnover_count": total("pressure_expected_turnovers"),
+        "pressure_realized_turnover_count": total("turnover_defender_pressure"),
+        "pass_interception_opportunity_count": total("pass_interception_opportunities"),
+        "pass_expected_interception_count": total("pass_expected_interceptions"),
+        "pass_realized_interception_count": total("turnover_intercepted"),
+    }
+
+
 _CORE_DEPLOY_METRICS = frozenset(
     {
         "update_index",
@@ -3652,6 +4120,8 @@ _CORE_DEPLOY_METRICS = frozenset(
         "passes_per_episode",
         "assists_per_episode",
         "turnovers_per_episode",
+        "turnover_intercepted_share",
+        "turnover_defender_pressure_share",
         "offensive_rebound_rate",
         "defensive_rebound_rate",
         "check_pickup_rate",
@@ -6070,6 +6540,7 @@ def run_training_loop(args) -> dict[str, Any]:
         raise SystemExit("--continue-run-id did not resolve a local resume checkpoint.")
     latest_checkpoint_path: str | None = None
     latest_checkpoint_artifact_path: str | None = None
+    latest_checkpoint_provenance: dict[str, Any] | None = None
     frozen_opponent_payload, frozen_opponent_info = _load_frozen_opponent_payload(args)
     opponent_params = None
     grouped_opponent_params = None
@@ -6082,14 +6553,14 @@ def run_training_loop(args) -> dict[str, Any]:
         opponent_pool_enabled and _uses_grouped_opponent_sampling(args)
     )
     if frozen_opponent_payload is not None:
-        if _normalize_policy_spec_dict(
-            frozen_opponent_payload.get("policy_spec", {})
-        ) != asdict(spec):
-            raise SystemExit(
-                "Frozen opponent policy_spec does not match the current JAX trainer policy_spec."
-            )
-        opponent_params = jax.device_put(frozen_opponent_payload["params"])
+        frozen_params, frozen_schema_migrated = _migrate_v2_frozen_opponent_params(
+            frozen_opponent_payload,
+            spec,
+        )
+        opponent_params = jax.device_put(frozen_params)
         active_opponent_info = dict(frozen_opponent_info or {})
+        if frozen_schema_migrated:
+            active_opponent_info["observation_schema_migration"] = "v2_to_v3_zero_input"
         _add_opponent_candidate(
             opponent_candidates,
             params=opponent_params,
@@ -6152,6 +6623,9 @@ def run_training_loop(args) -> dict[str, Any]:
     reset_resume_env_state = False
     if resume_checkpoint:
         checkpoint_payload = load_checkpoint(resume_checkpoint)
+        latest_checkpoint_provenance = dict(
+            checkpoint_payload.get("source_provenance", {}) or {}
+        ) or None
         _validate_resume_checkpoint_payload(
             checkpoint_payload,
             trainer_config=trainer_config,
@@ -6468,6 +6942,7 @@ def run_training_loop(args) -> dict[str, Any]:
             target_updates=int(args.num_updates),
             mlflow_run_id=active_mlflow_run_id,
             checkpoint_path=latest_checkpoint_path,
+            checkpoint_provenance=latest_checkpoint_provenance,
         )
         play_name_metadata = _build_training_play_name_metadata(
             args=args,
@@ -7149,6 +7624,14 @@ def run_training_loop(args) -> dict[str, Any]:
                     )
                 )
             last_metrics.update(_summarize_combined_value_diagnostics(last_metrics))
+            last_metrics.update(
+                _summarize_active_player_skill_rosters(
+                    role_rollouts,
+                    active_statics["offense"],
+                    jax,
+                )
+            )
+            last_metrics.update(_summarize_skill_event_calibration(rollout_out))
             if bool(getattr(args, "intent_selector_enabled", False)):
                 last_metrics.update(
                     summarize_selector_metrics(
@@ -7627,7 +8110,11 @@ def run_training_loop(args) -> dict[str, Any]:
                         "bonus_stats": dict(intent_bonus_stats),
                     }
                 if checkpoint_dir:
-                    latest_checkpoint_path, numbered_checkpoint_path = (
+                    (
+                        latest_checkpoint_path,
+                        numbered_checkpoint_path,
+                        latest_checkpoint_provenance,
+                    ) = (
                         _save_training_checkpoint(
                             checkpoint_dir=checkpoint_dir,
                             update_index=update_idx,
@@ -7688,7 +8175,11 @@ def run_training_loop(args) -> dict[str, Any]:
                     with TemporaryDirectory(
                         prefix="basketworld_jax_ckpt_"
                     ) as staging_dir:
-                        latest_checkpoint_path, numbered_checkpoint_path = (
+                        (
+                            latest_checkpoint_path,
+                            numbered_checkpoint_path,
+                            latest_checkpoint_provenance,
+                        ) = (
                             _save_training_checkpoint(
                                 checkpoint_dir=staging_dir,
                                 update_index=update_idx,
@@ -7861,6 +8352,7 @@ def run_training_loop(args) -> dict[str, Any]:
                 mlflow_run_id=active_mlflow_run_id,
                 checkpoint_path=latest_checkpoint_path,
                 metrics=last_metrics,
+                checkpoint_provenance=latest_checkpoint_provenance,
             )
             if pause_requested:
                 if mlflow is not None:
@@ -7960,6 +8452,7 @@ def run_training_loop(args) -> dict[str, Any]:
                 mlflow_run_id=active_mlflow_run_id,
                 checkpoint_path=latest_checkpoint_path,
                 metrics=last_metrics,
+                checkpoint_provenance=latest_checkpoint_provenance,
             )
         return result
 
@@ -8244,6 +8737,15 @@ def main(argv=None):
     args = parse_args(argv)
     if bool(getattr(args, "dump_config_schema", False)):
         print(json.dumps(build_train_config_schema(args), sort_keys=True))
+        return
+    if bool(getattr(args, "run_fixed_pool_study", False)):
+        validate_train_args(args)
+        result = run_fixed_pool_study(args)
+        print("Fixed-player-pool study")
+        print(f"pool_id: {result['pool']['id']}")
+        print(f"schedule_id: {result['schedule']['id']}")
+        print(f"checkpoint_reports: {len(result['checkpoint_reports'])}")
+        print(f"longitudinal_report: {result['longitudinal_report_path']}")
         return
     if bool(args.run_train_loop):
         result = run_training_loop(args)

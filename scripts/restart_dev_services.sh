@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Restart BasketWorld's local MLflow, FastAPI, and Vite development services.
+# Restart BasketWorld's local MLflow, gameplay, and training development services.
 
 set -euo pipefail
 
@@ -8,6 +8,8 @@ RUNTIME_DIR="${BASKETWORLD_DEV_RUNTIME_DIR:-/tmp/basketworld-dev-services}"
 MLFLOW_PORT=5000
 BACKEND_PORT=8080
 FRONTEND_PORT=5173
+TRAINING_BACKEND_PORT=8090
+TRAINING_FRONTEND_PORT=5174
 HOST=127.0.0.1
 PYTHON_BIN="${PYTHON_BIN:-$ROOT/.env/bin/python}"
 
@@ -122,16 +124,24 @@ show_start_failure() {
 MLFLOW_PID_FILE="$RUNTIME_DIR/mlflow.pid"
 BACKEND_PID_FILE="$RUNTIME_DIR/backend.pid"
 FRONTEND_PID_FILE="$RUNTIME_DIR/frontend.pid"
+TRAINING_BACKEND_PID_FILE="$RUNTIME_DIR/training-backend.pid"
+TRAINING_FRONTEND_PID_FILE="$RUNTIME_DIR/training-frontend.pid"
 MLFLOW_LOG_FILE="$RUNTIME_DIR/mlflow.log"
 BACKEND_LOG_FILE="$RUNTIME_DIR/backend.log"
 FRONTEND_LOG_FILE="$RUNTIME_DIR/frontend.log"
+TRAINING_BACKEND_LOG_FILE="$RUNTIME_DIR/training-backend.log"
+TRAINING_FRONTEND_LOG_FILE="$RUNTIME_DIR/training-frontend.log"
 
 stop_managed_process_group "MLflow" "$MLFLOW_PID_FILE" "$MLFLOW_PORT"
 stop_managed_process_group "backend" "$BACKEND_PID_FILE" "$BACKEND_PORT"
 stop_managed_process_group "frontend" "$FRONTEND_PID_FILE" "$FRONTEND_PORT"
+stop_managed_process_group "training backend" "$TRAINING_BACKEND_PID_FILE" "$TRAINING_BACKEND_PORT"
+stop_managed_process_group "training frontend" "$TRAINING_FRONTEND_PID_FILE" "$TRAINING_FRONTEND_PORT"
 stop_port_listener "MLflow" "$MLFLOW_PORT"
 stop_port_listener "backend" "$BACKEND_PORT"
 stop_port_listener "frontend" "$FRONTEND_PORT"
+stop_port_listener "training backend" "$TRAINING_BACKEND_PORT"
+stop_port_listener "training frontend" "$TRAINING_FRONTEND_PORT"
 
 # This deliberately invokes the existing profile-aware launcher so MLflow uses
 # the identical AWS profile, SQLite store, and S3 artifact destination.
@@ -156,9 +166,28 @@ if ! wait_for_port "frontend" "$FRONTEND_PORT"; then
   exit 1
 fi
 
+# The training app uses its own API and Vite frontend. Start them directly so
+# this supervisor owns their process groups; its workers remain intentionally
+# detached, matching scripts/start_training_app.sh's lifecycle semantics.
+start_service "training backend" "$ROOT" "$TRAINING_BACKEND_PID_FILE" "$TRAINING_BACKEND_LOG_FILE" \
+  "$PYTHON_BIN" -m uvicorn app.training_backend.main:app --reload --host "$HOST" --port "$TRAINING_BACKEND_PORT"
+if ! wait_for_port "training backend" "$TRAINING_BACKEND_PORT"; then
+  show_start_failure "training backend" "$TRAINING_BACKEND_LOG_FILE"
+  exit 1
+fi
+
+start_service "training frontend" "$ROOT/app/training_frontend" "$TRAINING_FRONTEND_PID_FILE" "$TRAINING_FRONTEND_LOG_FILE" \
+  npm run dev -- --host "$HOST" --port "$TRAINING_FRONTEND_PORT" --strictPort
+if ! wait_for_port "training frontend" "$TRAINING_FRONTEND_PORT"; then
+  show_start_failure "training frontend" "$TRAINING_FRONTEND_LOG_FILE"
+  exit 1
+fi
+
 echo
 echo "BasketWorld development services are ready:"
-echo "  MLflow:   http://$HOST:$MLFLOW_PORT"
-echo "  Backend:  http://$HOST:$BACKEND_PORT"
-echo "  Frontend: http://$HOST:$FRONTEND_PORT"
+echo "  MLflow:            http://$HOST:$MLFLOW_PORT"
+echo "  Gameplay backend:  http://$HOST:$BACKEND_PORT"
+echo "  Gameplay frontend: http://$HOST:$FRONTEND_PORT"
+echo "  Training backend:  http://$HOST:$TRAINING_BACKEND_PORT/docs"
+echo "  Training frontend: http://$HOST:$TRAINING_FRONTEND_PORT"
 echo "Logs and PID files: $RUNTIME_DIR"

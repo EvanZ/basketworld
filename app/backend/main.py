@@ -79,6 +79,8 @@ from app.backend.routes.admin_routes import router as admin_router
 from app.backend.routes.lifecycle_routes import router as lifecycle_router
 from app.backend.routes.policy_routes import router as policy_router
 from app.backend.routes.playable_routes import router as playable_router
+from app.backend.routes.training_routes import router as training_router
+from app.backend.routes.skill_ratings_routes import router as skill_ratings_router
 from app.backend.playable_analytics import playable_analytics_emitter
 from dotenv import load_dotenv
 
@@ -135,6 +137,8 @@ else:
     app.include_router(admin_router)
     app.include_router(lifecycle_router)
     app.include_router(policy_router)
+    app.include_router(training_router)
+    app.include_router(skill_ratings_router)
 
 
 @app.on_event("shutdown")

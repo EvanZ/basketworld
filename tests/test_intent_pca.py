@@ -219,11 +219,11 @@ def test_fit_tsne_coords_clips_perplexity_to_sample_count():
     assert effective_perplexity <= (6 - 1) / 3.0 + 1e-6
 
 
-def test_fit_umap_coords_requires_optional_dependency():
+def test_fit_umap_coords_handles_optional_dependency():
     x = np.arange(24, dtype=np.float32).reshape(6, 4)
 
     try:
-        _fit_umap_coords(
+        coords, effective_neighbors = _fit_umap_coords(
             x,
             seed=0,
             n_neighbors=10,
@@ -232,7 +232,9 @@ def test_fit_umap_coords_requires_optional_dependency():
     except ModuleNotFoundError as exc:
         assert "umap-learn" in str(exc)
     else:
-        raise AssertionError("Expected UMAP helper to require the optional dependency")
+        assert coords.shape == (6, 2)
+        assert np.all(np.isfinite(coords))
+        assert effective_neighbors == 5
 
 
 def test_resolve_discriminator_feature_dims_prefers_checkpoint_config():

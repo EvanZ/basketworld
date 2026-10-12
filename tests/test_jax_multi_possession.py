@@ -44,6 +44,7 @@ from basketworld_jax.env.minimal import (
     build_action_masks_batch,
     build_kernel_static_from_env,
     build_opponent_role_flags_batch,
+    build_pass_steal_contributions_batch,
     build_spatial_diagnostics_batch,
     build_token_observation_components_batch,
     build_training_role_flags_batch,
@@ -52,6 +53,7 @@ from basketworld_jax.env.minimal import (
     reset_batch_minimal,
     sample_state_batch,
     step_batch_minimal,
+    token_observation_dims,
 )
 
 
@@ -1225,6 +1227,7 @@ def test_inbounder_waits_for_occupied_entry_then_reenters_under_basket_and_becom
     blocked_masks = np.asarray(
         build_action_masks_batch(static, pass_out.state, jnp), dtype=np.int8
     )
+    assert blocked_masks[0, inbounder, ActionType.NOOP.value] == 1
     assert not np.any(
         blocked_masks[0, inbounder, MOVE_ACTION_START : MOVE_ACTION_START + 6]
     )
@@ -1253,6 +1256,7 @@ def test_inbounder_waits_for_occupied_entry_then_reenters_under_basket_and_becom
     entry_masks = np.asarray(
         build_action_masks_batch(static, receiver_out.state, jnp), dtype=np.int8
     )
+    assert entry_masks[0, inbounder, ActionType.NOOP.value] == 0
     assert entry_masks[0, inbounder, ActionType.MOVE_E.value] == 1
     reentry_out = step_batch_minimal(
         static,
@@ -1271,6 +1275,48 @@ def test_inbounder_waits_for_occupied_entry_then_reenters_under_basket_and_becom
         build_action_masks_batch(static, reentry_out.state, jnp), dtype=np.int8
     )
     assert eligible_masks[0, receiver, PASS_ACTION_START] == 1
+
+
+def test_reentering_inbounder_wins_a_simultaneous_move_to_the_entry_cell():
+    static = _multi_possession_static(possession_limit=4)
+    state = _inbound_state(static, seed=177)
+    inbounder = int(np.asarray(state.inbound_player)[0])
+    receiver = int(np.asarray(static.offense_ids)[1])
+    pass_out = step_batch_minimal(
+        static,
+        state,
+        _noops(state).at[0, inbounder].set(PASS_ACTION_START),
+        jax.random.split(jax.random.PRNGKey(178), 1),
+        jax,
+        jnp,
+    )
+
+    entry_position = np.asarray(static.basket_position)
+    directions = np.asarray(static.hex_directions)
+    positions = np.asarray(pass_out.state.positions).copy()
+    # Put another player one step east of the entry cell so both that player
+    # and the outside inbounder can target the basket cell simultaneously.
+    contender = int(np.asarray(static.defense_ids)[0])
+    positions[0, contender] = entry_position + directions[ActionType.MOVE_W.value - 1] * -1
+    contested_state = pass_out.state._replace(positions=jnp.asarray(positions))
+
+    actions = _noops(contested_state)
+    actions = actions.at[0, inbounder].set(ActionType.MOVE_E.value)
+    actions = actions.at[0, contender].set(ActionType.MOVE_W.value)
+    out = step_batch_minimal(
+        static,
+        contested_state,
+        actions,
+        jax.random.split(jax.random.PRNGKey(179), 1),
+        jax,
+        jnp,
+    )
+
+    np.testing.assert_array_equal(
+        np.asarray(out.state.positions)[0, inbounder],
+        entry_position,
+    )
+    assert int(np.asarray(out.state.inbound_player)[0]) == -1
 
 
 def test_rebound_eligibility_requires_an_inbounder_to_be_on_court_after_shot_movement():
@@ -1930,6 +1976,180 @@ def test_pressure_stealer_is_sampled_from_softmax_pressure_strengths():
     assert set(stealers.tolist()) == set(team_a.tolist())
     nearer_share = float(np.mean(stealers == team_a[0]))
     assert nearer_share == pytest.approx(2.0 / 3.0, abs=0.07)
+
+
+def test_episode_player_skills_are_seeded_stable_and_appended_to_tokens():
+    static = _multi_possession_static()._replace(
+        pressure_skill_mean=jnp.asarray(0.2, dtype=jnp.float32),
+        pressure_skill_std=jnp.asarray(0.7, dtype=jnp.float32),
+        steal_skill_mean=jnp.asarray(-0.1, dtype=jnp.float32),
+        steal_skill_std=jnp.asarray(0.8, dtype=jnp.float32),
+        ball_handling_skill_mean=jnp.asarray(0.3, dtype=jnp.float32),
+        ball_handling_skill_std=jnp.asarray(0.9, dtype=jnp.float32),
+        passing_skill_mean=jnp.asarray(0.4, dtype=jnp.float32),
+        passing_skill_std=jnp.asarray(1.0, dtype=jnp.float32),
+    )
+    keys = jax.random.split(jax.random.PRNGKey(131), 2)
+    state = reset_batch_minimal(static, keys, jax, jnp)
+    repeated = reset_batch_minimal(static, keys, jax, jnp)
+
+    for field in (
+        "pressure_skill",
+        "steal_skill",
+        "ball_handling_skill",
+        "passing_skill",
+    ):
+        np.testing.assert_array_equal(np.asarray(getattr(state, field)), np.asarray(getattr(repeated, field)))
+        assert float(np.std(np.asarray(getattr(state, field)))) > 0.0
+
+    players, globals_vec, _ = build_token_observation_components_batch(
+        static,
+        state,
+        1.0,
+        jnp,
+        multi_possession_features=True,
+    )
+    assert token_observation_dims(False, True, True) == (24, 12)
+    assert players.shape[-1] == 24
+    assert globals_vec.shape[-1] == 12
+    np.testing.assert_allclose(np.asarray(players)[..., -4], np.asarray(state.pressure_skill))
+    np.testing.assert_allclose(np.asarray(players)[..., -3], np.asarray(state.steal_skill))
+    np.testing.assert_allclose(np.asarray(players)[..., -2], np.asarray(state.ball_handling_skill))
+    np.testing.assert_allclose(np.asarray(players)[..., -1], np.asarray(state.passing_skill))
+
+    stepped = step_batch_minimal(
+        static,
+        state,
+        _noops(state),
+        jax.random.split(jax.random.PRNGKey(133), state.positions.shape[0]),
+        jax,
+        jnp,
+    ).state
+    switched = stepped._replace(
+        offense_team=(1 - stepped.offense_team).astype(jnp.int8),
+    )
+    switched_players, _, _ = build_token_observation_components_batch(
+        static,
+        switched,
+        -1.0,
+        jnp,
+        multi_possession_features=True,
+    )
+    for offset, field in zip(
+        (-4, -3, -2, -1),
+        ("pressure_skill", "steal_skill", "ball_handling_skill", "passing_skill"),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(
+            np.asarray(getattr(stepped, field)),
+            np.asarray(getattr(state, field)),
+        )
+        np.testing.assert_allclose(
+            np.asarray(switched_players)[..., offset],
+            np.asarray(getattr(state, field)),
+        )
+
+
+def test_pressure_skill_matchup_changes_each_defender_contribution():
+    static = _multi_possession_static()._replace(
+        defender_pressure_distance=jnp.asarray(100.0, dtype=jnp.float32),
+        defender_pressure_turnover_chance=jnp.asarray(0.1, dtype=jnp.float32),
+        defender_pressure_decay_lambda=jnp.asarray(0.0, dtype=jnp.float32),
+        pressure_skill_effect_weight=jnp.asarray(1.0, dtype=jnp.float32),
+    )
+    state = _forced_pressure_turnover_state(static)
+    team_a = np.asarray(static.offense_ids, dtype=np.int32)
+    holder = int(np.asarray(static.defense_ids, dtype=np.int32)[0])
+    pressure = np.zeros_like(np.asarray(state.pressure_skill))
+    handling = np.zeros_like(np.asarray(state.ball_handling_skill))
+    pressure[0, int(team_a[0])] = 1.0
+    pressure[0, int(team_a[1])] = -1.0
+    state = state._replace(
+        pressure_skill=jnp.asarray(pressure, dtype=jnp.float32),
+        ball_handling_skill=jnp.asarray(handling, dtype=jnp.float32),
+    )
+    from basketworld_jax.env.minimal import _pressure_turnover_probs_single
+
+    per_defender, _ = _pressure_turnover_probs_single(
+        static,
+        jax.tree_util.tree_map(lambda value: value[0], state),
+        jax,
+        jnp,
+    )
+    assert float(np.asarray(per_defender)[0]) > 0.1
+    assert float(np.asarray(per_defender)[1]) < 0.1
+    total = 1.0 - float(np.prod(1.0 - np.asarray(per_defender)))
+    expected = float(np.asarray(build_turnover_probabilities_batch(static, state, jnp))[0].max())
+    assert expected == pytest.approx(total, abs=1e-7)
+
+
+def test_zero_skill_effect_weights_preserve_legacy_probabilities_exactly():
+    static = _multi_possession_static()._replace(
+        defender_pressure_distance=jnp.asarray(100.0, dtype=jnp.float32),
+        defender_pressure_turnover_chance=jnp.asarray(0.125, dtype=jnp.float32),
+        defender_pressure_decay_lambda=jnp.asarray(0.0, dtype=jnp.float32),
+        pressure_skill_effect_weight=jnp.asarray(0.0, dtype=jnp.float32),
+        steal_skill_effect_weight=jnp.asarray(0.0, dtype=jnp.float32),
+    )
+    state = _forced_pressure_turnover_state(static)._replace(
+        pressure_skill=jnp.full((1, 4), 100.0, dtype=jnp.float32),
+        steal_skill=jnp.full((1, 4), 100.0, dtype=jnp.float32),
+        ball_handling_skill=jnp.full((1, 4), -100.0, dtype=jnp.float32),
+        passing_skill=jnp.full((1, 4), -100.0, dtype=jnp.float32),
+    )
+    from basketworld_jax.env.minimal import _pressure_turnover_probs_single
+
+    per_defender, _ = _pressure_turnover_probs_single(
+        static,
+        jax.tree_util.tree_map(lambda value: value[0], state),
+        jax,
+        jnp,
+    )
+    np.testing.assert_array_equal(np.asarray(per_defender), np.asarray([0.125, 0.125], dtype=np.float32))
+
+
+def test_steal_and_passing_skill_matchup_adjusts_eligible_pass_contributions():
+    static = _multi_possession_static()._replace(
+        base_steal_rate=jnp.asarray(0.2, dtype=jnp.float32),
+        steal_perp_decay=jnp.asarray(1.0, dtype=jnp.float32),
+        steal_distance_factor=jnp.asarray(0.0, dtype=jnp.float32),
+        steal_position_weight_min=jnp.asarray(1.0, dtype=jnp.float32),
+        steal_skill_effect_weight=jnp.asarray(1.0, dtype=jnp.float32),
+    )
+    state = reset_batch_minimal(
+        static,
+        jax.random.split(jax.random.PRNGKey(132), 1),
+        jax,
+        jnp,
+    )
+    team_a = np.asarray(static.offense_ids, dtype=np.int32)
+    team_b = np.asarray(static.defense_ids, dtype=np.int32)
+    positions = np.asarray(state.positions).copy()
+    positions[0, int(team_a[0])] = np.asarray([0, 0], dtype=np.int32)
+    positions[0, int(team_a[1])] = np.asarray([4, 0], dtype=np.int32)
+    positions[0, int(team_b[0])] = np.asarray([2, 0], dtype=np.int32)
+    positions[0, int(team_b[1])] = np.asarray([2, 1], dtype=np.int32)
+    steal = np.zeros_like(np.asarray(state.steal_skill))
+    passing = np.zeros_like(np.asarray(state.passing_skill))
+    steal[0, int(team_b[0])] = 1.0
+    steal[0, int(team_b[1])] = -1.0
+    state = state._replace(
+        positions=jnp.asarray(positions, dtype=jnp.int32),
+        offense_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
+        ball_holder=jnp.asarray([int(team_a[0])], dtype=jnp.int32),
+        steal_skill=jnp.asarray(steal, dtype=jnp.float32),
+        passing_skill=jnp.asarray(passing, dtype=jnp.float32),
+    )
+    contributions = np.asarray(build_pass_steal_contributions_batch(static, state, jnp))[0, 1]
+    assert contributions[0] > contributions[1]
+
+    stronger_passer = state._replace(
+        passing_skill=state.passing_skill.at[0, int(team_a[0])].set(2.0)
+    )
+    stronger_contributions = np.asarray(
+        build_pass_steal_contributions_batch(static, stronger_passer, jnp)
+    )[0, 1]
+    assert np.all(stronger_contributions < contributions)
 
 
 def test_rebounds_and_dead_ball_offensive_violation_have_distinct_lifecycle_transitions():

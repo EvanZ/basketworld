@@ -99,6 +99,11 @@ class HexagonBasketballEnv(gym.Env):
         defender_pressure_distance: int = 1,
         defender_pressure_turnover_chance: float = 0.05,
         defender_pressure_decay_lambda: float = 1.0,  # Exponential decay rate for pressure
+        pressure_skill_mean: float = 0.0,
+        pressure_skill_std: float = 0.0,
+        ball_handling_skill_mean: float = 0.0,
+        ball_handling_skill_std: float = 0.0,
+        pressure_skill_effect_weight: float = 0.0,
         # Realistic passing steal parameters
         base_steal_rate: float = 0.35,
         steal_perp_decay: float = 1.5,
@@ -121,6 +126,11 @@ class HexagonBasketballEnv(gym.Env):
         receiver_alignment_width: float = 2.0,
         max_receiver_hazard: float = 0.85,
         lane_weight: float = 0.0,
+        steal_skill_mean: float = 0.0,
+        steal_skill_std: float = 0.0,
+        passing_skill_mean: float = 0.0,
+        passing_skill_std: float = 0.0,
+        steal_skill_effect_weight: float = 0.0,
         three_point_distance: float = 4.0,
         three_point_short_distance: Optional[float] = None,
         three_pt_extra_hex_decay: float = 0.05,
@@ -243,6 +253,11 @@ class HexagonBasketballEnv(gym.Env):
         self.defender_pressure_distance = defender_pressure_distance
         self.defender_pressure_turnover_chance = defender_pressure_turnover_chance
         self.defender_pressure_decay_lambda = defender_pressure_decay_lambda
+        self.pressure_skill_mean = float(pressure_skill_mean)
+        self.pressure_skill_std = max(0.0, float(pressure_skill_std))
+        self.ball_handling_skill_mean = float(ball_handling_skill_mean)
+        self.ball_handling_skill_std = max(0.0, float(ball_handling_skill_std))
+        self.pressure_skill_effect_weight = max(0.0, float(pressure_skill_effect_weight))
         # Realistic passing steal parameters
         self.base_steal_rate = base_steal_rate
         self.steal_perp_decay = steal_perp_decay
@@ -265,6 +280,11 @@ class HexagonBasketballEnv(gym.Env):
         self.receiver_alignment_width = max(0.1, float(receiver_alignment_width))
         self.max_receiver_hazard = max(0.0, min(1.0, float(max_receiver_hazard)))
         self.lane_weight = max(0.0, min(1.0, float(lane_weight)))
+        self.steal_skill_mean = float(steal_skill_mean)
+        self.steal_skill_std = max(0.0, float(steal_skill_std))
+        self.passing_skill_mean = float(passing_skill_mean)
+        self.passing_skill_std = max(0.0, float(passing_skill_std))
+        self.steal_skill_effect_weight = max(0.0, float(steal_skill_effect_weight))
         self.spawn_distance = spawn_distance
         self.max_spawn_distance = max_spawn_distance
         self.defender_spawn_distance = defender_spawn_distance

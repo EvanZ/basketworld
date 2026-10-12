@@ -88,10 +88,17 @@ def _action_mode_matrix_cell(raw_results: dict, *, player_deterministic: bool, a
 
 def _normalize_jsonable(value):
     """Convert common scientific-Python containers before FastAPI encoding."""
+    # Starlette deliberately rejects NaN and infinities when rendering JSON.
+    # Long evaluations can legitimately produce an undefined diagnostic (for
+    # example, a rate with no eligible samples), so normalize those values to
+    # JSON null instead of allowing the otherwise successful evaluation
+    # response to fail after progress has already reached 100%.
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
     if isinstance(value, np.ndarray):
         return [_normalize_jsonable(v) for v in value.tolist()]
     if isinstance(value, np.generic):
-        return value.item()
+        return _normalize_jsonable(value.item())
     value_module = getattr(type(value), "__module__", "")
     if value_module.startswith(("jax", "jaxlib")) and hasattr(value, "tolist"):
         return _normalize_jsonable(value.tolist())
@@ -377,6 +384,25 @@ def pass_steal_preview(req: PassStealPreviewRequest):
         raise HTTPException(status_code=500, detail=f"Failed to compute pass steal preview: {e}")
 
 
+@router.post("/api/sample_eval_player_skills")
+def sample_eval_player_skills(seed: int | None = None):
+    """Draw one complete JAX roster for a pinned custom evaluation."""
+    runtime = getattr(game_state, "jax_runtime", None)
+    if runtime is None or not hasattr(runtime, "sample_player_skill_profiles"):
+        raise HTTPException(
+            status_code=400,
+            detail="A JAX game must be initialized before sampling an evaluation roster.",
+        )
+    try:
+        profiles = runtime.sample_player_skill_profiles(seed=seed)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to sample evaluation roster: {exc}",
+        ) from exc
+    return _to_jsonable({"status": "success", "player_skills": profiles})
+
+
 @router.post("/api/run_evaluation")
 def run_evaluation(request: EvaluationRequest):
     """Run N episodes of self-play for evaluation purposes."""
@@ -407,6 +433,23 @@ def run_evaluation(request: EvaluationRequest):
         else int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
     )
     custom_setup = eval_validate_custom_eval_setup(request.custom_setup, game_state.env)
+    if custom_setup.get("player_skills") is not None and not can_run_native_jax_evaluation(
+        unified_policy_path=game_state.unified_policy_path,
+        opponent_policy_path=game_state.opponent_policy_path,
+        custom_setup=custom_setup,
+        randomize_offense_permutation=bool(
+            getattr(request, "randomize_offense_permutation", False)
+        ),
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Pinned 10-player skill profiles require the JAX-native evaluation path.",
+        )
+    if custom_setup.get("player_skills") is not None:
+        print(
+            "[Evaluation] Complete pinned player roster received: "
+            f"count={len(custom_setup.get('player_skills') or {})}"
+        )
     if custom_setup.get("rebound_skills") is not None:
         rebound_skill_values = [float(v) for v in custom_setup.get("rebound_skills") or []]
         print(

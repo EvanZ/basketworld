@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -16,19 +17,26 @@ from app.training_backend.application_training import (
     resolve_run_config_schema,
 )
 from app.training_backend.database import TrainingRepository
-from app.training_backend.jobs import JobManager
+from app.training_backend.jobs import JobManager, ProvenanceConfirmationRequired
 from app.training_backend.mlflow_import import import_mlflow_run
 from app.training_backend.mlflow_metrics import (
     MAX_HISTORY_POINTS,
     metric_catalog,
     metric_histories,
 )
+from app.training_backend.historical_elo import (
+    HISTORICAL_EVAL_FILENAME,
+    historical_elo_summary,
+)
 from app.training_backend.presets import format_display_command
 from app.training_backend.run_timing import active_training_seconds
 from app.training_backend.models import (
     HealthResponse,
+    HistoricalEloSummary,
     MlflowImportRequest,
     RunActionResponse,
+    RunContinuationRequest,
+    RunResumeRequest,
     RunCreateRequest,
     RunDetail,
     RunPreview,
@@ -88,6 +96,15 @@ def _action(run_id: str, callback, message: str) -> RunActionResponse:
         run = callback(run_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Training run not found.") from None
+    except ProvenanceConfirmationRequired as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "provenance_confirmation_required",
+                "message": str(exc),
+                "provenance_comparison": exc.comparison,
+            },
+        ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return RunActionResponse(run=TrainingRun.model_validate(run), message=message)
@@ -169,6 +186,7 @@ def get_run(run_id: str) -> RunDetail:
             ),
             "resolved_config": resolve_run_config_schema(tuple(run["command"])),
             "training_elapsed_seconds": active_training_seconds(events),
+            "provenance_comparison": manager.provenance_comparison(run),
         }
     )
 
@@ -215,6 +233,29 @@ def get_run_metric_histories(
     return {"series": series}
 
 
+@app.get(
+    "/api/v1/runs/{run_id}/elo",
+    response_model=HistoricalEloSummary,
+)
+def get_run_historical_elo(run_id: str) -> HistoricalEloSummary:
+    run = _run_or_404(run_id)
+    run_root = Path(run["status_file"]).resolve().parent
+    allowed_root = (settings.data_dir / "runs").resolve()
+    if not run_root.is_relative_to(allowed_root):
+        raise HTTPException(
+            status_code=400, detail="Run data path is outside the training data directory."
+        )
+    artifact_path = run_root / "checkpoints" / HISTORICAL_EVAL_FILENAME
+    try:
+        summary = historical_elo_summary(artifact_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Unable to calculate historical-evaluation Elo: {exc}",
+        ) from exc
+    return HistoricalEloSummary.model_validate(summary)
+
+
 @app.get("/api/v1/runs/{run_id}/logs", response_class=PlainTextResponse)
 def get_run_logs(
     run_id: str,
@@ -248,8 +289,31 @@ def pause_run(run_id: str) -> RunActionResponse:
 
 
 @app.post("/api/v1/runs/{run_id}/resume", response_model=RunActionResponse)
-def resume_run(run_id: str) -> RunActionResponse:
-    return _action(run_id, manager.resume, "Training resumed.")
+def resume_run(
+    run_id: str, request: RunResumeRequest = RunResumeRequest()
+) -> RunActionResponse:
+    return _action(
+        run_id,
+        lambda value: manager.resume(
+            value, confirm_provenance_mismatch=request.confirm_provenance_mismatch
+        ),
+        "Training resumed.",
+    )
+
+
+@app.post("/api/v1/runs/{run_id}/continue", response_model=RunActionResponse)
+def continue_run(
+    run_id: str, request: RunContinuationRequest
+) -> RunActionResponse:
+    return _action(
+        run_id,
+        lambda value: manager.continue_completed(
+            value,
+            additional_updates=request.additional_updates,
+            confirm_provenance_mismatch=request.confirm_provenance_mismatch,
+        ),
+        "Training continuation started.",
+    )
 
 
 @app.post("/api/v1/runs/{run_id}/stop", response_model=RunActionResponse)

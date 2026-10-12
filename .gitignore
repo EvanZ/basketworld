@@ -60,6 +60,8 @@ checkpoints/phase_a_dev/*
 
 # data
 data/
+artifacts/
+elo_analysis/
 analytics/__pycache__/
 analytics/intent_pca/
 analytics/intent_*
@@ -107,6 +109,11 @@ episodes/
 # Standalone training-control app runtime data.
 var/training_app/
 app/training_frontend/dist/
+
+# Local soundtrack drafts; the app uses roundball-rock-playback.wav.
+app/frontend/public/BeepBox-Song*.wav
+app/frontend/public/rickroll.wav
+app/frontend/public/roundball-rock.wav
 
 # Auxiliary Git worktrees created for local comparison/debugging.
 .worktrees/

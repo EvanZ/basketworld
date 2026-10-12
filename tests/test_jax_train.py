@@ -42,6 +42,7 @@ from basketworld_jax.train.types import (
 from basketworld_jax.train.main import (
     TRAIN_FROZEN_VALUES,
     _checkpoint_interval_for_update,
+    _checkpoint_observation_metadata,
     _checkpoint_trainer_config_from_args,
     _entropy_coef_for_update,
     _filter_mlflow_deploy_metrics,
@@ -57,6 +58,7 @@ from basketworld_jax.train.main import (
     _phi_beta_for_update,
     _log_mlflow_params,
     _jax_env_config_from_args,
+    _migrate_v2_frozen_opponent_params,
     _multi_possession_curriculum_enabled,
     _multi_possession_limit_for_update,
     _selector_learning_rate_for_args,
@@ -540,6 +542,92 @@ def test_checkpoint_payload_preserves_selector_optimizer_state():
     )
 
     assert payload["state"]["selector_opt_state"]["count"] == np.asarray(3, dtype=np.int32)
+
+
+def test_checkpoint_observation_metadata_labels_multi_possession_skill_schema():
+    spec = ActorCriticSpec(
+        flat_obs_dim=132,
+        training_player_count=5,
+        action_dim_per_player=16,
+        total_action_dim=80,
+        hidden_dims=(64, 64),
+        model_type="attention",
+        token_player_count=10,
+        token_dim=24,
+        global_dim=12,
+        multi_possession_features=True,
+        observation_schema_version=3,
+    )
+
+    metadata = _checkpoint_observation_metadata(spec)
+
+    assert metadata["schema_version"] == 3
+    assert metadata["player_dim"] == 24
+    assert metadata["global_dim"] == 12
+    assert metadata["flat_observation_dim"] == 132
+    assert metadata["player_labels"][-6:] == [
+        "is_inbounder",
+        "on_court",
+        "pressure_skill",
+        "steal_skill",
+        "ball_handling_skill",
+        "passing_skill",
+    ]
+    assert metadata["global_labels"][-5:] == [
+        "relative_score",
+        "possessions_remaining_norm",
+        "clearance_required",
+        "restart_phase",
+        "restart_countdown_norm",
+    ]
+
+
+@pytest.mark.parametrize("model_type", ["mlp", "attention"])
+def test_v2_frozen_opponent_params_are_zero_padded_for_v3_skills(model_type):
+    is_attention = model_type == "attention"
+    source_spec = ActorCriticSpec(
+        flat_obs_dim=211 if is_attention else 92,
+        training_player_count=2,
+        action_dim_per_player=16,
+        total_action_dim=32,
+        hidden_dims=(8,),
+        model_type=model_type,
+        token_player_count=10 if is_attention else 0,
+        token_dim=20 if is_attention else 0,
+        global_dim=10 if is_attention else 0,
+        multi_possession_features=True,
+        observation_schema_version=2,
+    )
+    target_spec = replace(
+        source_spec,
+        flat_obs_dim=source_spec.flat_obs_dim + (
+            4 * (source_spec.token_player_count if is_attention else 4)
+        ),
+        token_dim=source_spec.token_dim + (4 if is_attention else 0),
+        observation_schema_version=3,
+    )
+    layer_name = "token_mlp_0" if is_attention else "Dense_0"
+    source_rows = (
+        source_spec.token_dim + source_spec.global_dim
+        if is_attention
+        else source_spec.flat_obs_dim
+    )
+    kernel = np.arange(source_rows * 3, dtype=np.float32).reshape(source_rows, 3)
+    payload = {
+        "policy_spec": source_spec.__dict__,
+        "params": {layer_name: {"kernel": kernel, "bias": np.zeros(3, dtype=np.float32)}},
+    }
+
+    migrated, changed = _migrate_v2_frozen_opponent_params(payload, target_spec)
+
+    assert changed is True
+    result = migrated[layer_name]["kernel"]
+    insert_at = source_spec.token_dim if is_attention else source_spec.flat_obs_dim - 7
+    zero_count = 4 if is_attention else 16
+    assert result.shape == (source_rows + zero_count, 3)
+    np.testing.assert_array_equal(result[:insert_at], kernel[:insert_at])
+    np.testing.assert_array_equal(result[insert_at : insert_at + zero_count], 0.0)
+    np.testing.assert_array_equal(result[insert_at + zero_count :], kernel[insert_at:])
 
 
 def test_checkpoint_trainer_config_persists_selector_runtime_fields():
@@ -2486,6 +2574,9 @@ def test_core_mlflow_deploy_metric_filter_keeps_compact_aggregates():
         "shot_attempts": 100,
         "rebound_avg_target_logit_offense": -1.0,
         "turnover_intercepted_count": 5,
+        "turnover_intercepted_share": 0.25,
+        "turnover_defender_pressure_count": 3,
+        "turnover_defender_pressure_share": 0.15,
     }
 
     filtered = _filter_mlflow_deploy_metrics(metrics)
@@ -2495,8 +2586,27 @@ def test_core_mlflow_deploy_metric_filter_keeps_compact_aggregates():
         "mean_offense_score": 17.0,
         "mean_live_boundary_player_fraction": 0.4,
         "shot_make_rate": 0.5,
+        "turnover_intercepted_share": 0.25,
+        "turnover_defender_pressure_share": 0.15,
     }
     assert _filter_mlflow_deploy_metrics(metrics, profile="full") == metrics
+
+
+def test_core_mlflow_train_metric_filter_keeps_turnover_reason_breakdown():
+    metrics = {
+        "mean_turnovers_per_completed_episode": 2.0,
+        "mean_turnovers_reason_intercepted_per_completed_episode": 0.75,
+        "mean_turnovers_reason_defender_pressure_per_completed_episode": 0.5,
+        "mean_turnovers_reason_shot_clock_per_completed_episode": 0.25,
+    }
+
+    filtered = _filter_mlflow_train_metrics(metrics)
+
+    assert filtered == {
+        "mean_turnovers_per_completed_episode": 2.0,
+        "mean_turnovers_reason_intercepted_per_completed_episode": 0.75,
+        "mean_turnovers_reason_defender_pressure_per_completed_episode": 0.5,
+    }
 
 
 def test_mlflow_params_include_jax_env_skill_stds():
@@ -2626,6 +2736,54 @@ def test_mlflow_params_include_jax_env_skill_stds():
     assert recorder.params["jax/rebound_win_prob_features"] is True
     assert recorder.params["jax/rebound_target_observation_features"] is False
     assert recorder.params["jax/mlflow_metric_profile"] == "core"
+
+
+def test_mlflow_continuation_preserves_immutable_params_and_logs_its_config():
+    class Recorder:
+        def __init__(self):
+            self.params = None
+            self.artifacts = []
+            self.tags = {}
+
+        def log_params(self, params):
+            self.params = dict(params)
+
+        def log_dict(self, payload, path):
+            self.artifacts.append((dict(payload), path))
+
+        def set_tag(self, key, value):
+            self.tags[key] = value
+
+    args = parse_args(
+        [
+            "--num-updates",
+            "31000",
+            "--mlflow-resume-run-id",
+            "existing-mlflow-run",
+        ]
+    )
+    recorder = Recorder()
+
+    _log_mlflow_params(
+        recorder,
+        args,
+        build_trainer_config(args),
+        ActorCriticSpec(
+            flat_obs_dim=91,
+            training_player_count=3,
+            action_dim_per_player=14,
+            total_action_dim=42,
+            hidden_dims=(128, 128),
+        ),
+    )
+
+    assert recorder.params is None
+    assert recorder.artifacts[0][1] == "metadata/continuations/target_0031000.json"
+    assert recorder.artifacts[0][0]["num_updates"] == 31_000
+    assert recorder.tags == {
+        "basketworld.continuation_latest_target_updates": "31000",
+        "basketworld.continuation_latest_source_run": "existing-mlflow-run",
+    }
 
 
 def test_train_scaffold_emits_rollout_trajectory_shapes():

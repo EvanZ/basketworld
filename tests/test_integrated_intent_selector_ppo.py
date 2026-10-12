@@ -144,6 +144,19 @@ class _DummySelectorEnv(gym.Env):
         self.intent_active = bool(intent_active)
         self.set_intent_calls.append((int(intent_index), bool(intent_active), int(intent_age)))
 
+    def get_intent_observation_fields(self, observer_is_offense: bool):
+        visible = bool(observer_is_offense and self.intent_visible)
+        return {
+            "intent_index": np.asarray(
+                [float(self.intent_index if visible else 0)], dtype=np.float32
+            ),
+            "intent_active": np.asarray(
+                [1.0 if self.intent_active else 0.0], dtype=np.float32
+            ),
+            "intent_visible": np.asarray([1.0 if visible else 0.0], dtype=np.float32),
+            "intent_age_norm": np.asarray([0.0], dtype=np.float32),
+        }
+
 
 def _make_model(env, **algo_kwargs):
     kwargs = dict(

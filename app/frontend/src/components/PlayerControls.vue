@@ -3,6 +3,7 @@ import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { defineExpose } from 'vue';
 import HexagonControlPad from './HexagonControlPad.vue';
 import MathEquation from './MathEquation.vue';
+import SkillRatingsWorkbench from './SkillRatingsWorkbench.vue';
 import {
   applyStartTemplate,
   cancelPlaybookAnalysis,
@@ -14,6 +15,7 @@ import {
   mctsAdvise,
   runPlaybookAnalysis,
   saveStartTemplateLibrary,
+  sampleEvalPlayerSkills,
   setOffenseSkills,
   setPassTargetStrategy,
   setPassLogitBias,
@@ -37,6 +39,7 @@ import {
   saveStats,
   resetStatsStorage,
 } from '@/services/stats';
+import { isJaxModelState } from '@/utils/modelBackend';
 
 function formatParamCount(n) {
   if (n === null || n === undefined) return 'N/A';
@@ -85,6 +88,14 @@ function prettyJson(value) {
 const props = defineProps({
   gameState: Object,
   activePlayerId: Number,
+  playerDisplayNames: {
+    type: Object,
+    default: () => ({}),
+  },
+  playerJerseyNumbers: {
+    type: Object,
+    default: () => ({}),
+  },
   disabled: {
     type: Boolean,
     default: false,
@@ -211,6 +222,20 @@ const props = defineProps({
     default: '',
   },
 });
+
+function formatPlayerIdentity(playerId) {
+  const id = Number(playerId);
+  if (!Number.isFinite(id)) return 'Unknown player';
+  const names = props.playerDisplayNames || {};
+  const numbers = props.playerJerseyNumbers || {};
+  const rawName = names[id] ?? names[String(id)];
+  const rawNumber = numbers[id] ?? numbers[String(id)] ?? id;
+  const name = typeof rawName === 'string' ? rawName.trim().toUpperCase() : '';
+  const jersey = String(rawNumber ?? '').trim();
+  if (name && jersey) return `${name} #${jersey}`;
+  if (name) return name;
+  return `Player #${jersey || id}`;
+}
 
 const emit = defineEmits(['actions-submitted', 'update:activePlayerId', 'move-recorded', 'policy-swap-requested', 'swap-teams-requested', 'selections-changed', 'refresh-policies', 'mcts-options-changed', 'mcts-toggle-changed', 'state-updated', 'eval-config-changed', 'template-config-changed', 'eval-run', 'template-self-play', 'active-tab-changed', 'ball-holder-updating', 'ball-holder-changed', 'stats-reset', 'counterfactual-replay-loaded', 'playbook-analysis-loaded', 'pass-lab-config-changed', 'multi-possession-limit-requested']);
 
@@ -1738,6 +1763,39 @@ const sampledReboundSkillRows = computed(() => {
   });
 });
 
+const sampledEpisodeSkillRows = computed(() => {
+  const liveSkills = props.gameState?.player_episode_skills;
+  if (!liveSkills || typeof liveSkills !== 'object') return [];
+  const stableUserIds = Array.isArray(props.gameState?.user_player_ids)
+    ? props.gameState.user_player_ids.map(Number)
+    : [];
+  const stableAiIds = Array.isArray(props.gameState?.ai_player_ids)
+    ? props.gameState.ai_player_ids.map(Number)
+    : [];
+  const userSet = new Set(stableUserIds);
+  const aiSet = new Set(stableAiIds);
+  const orderedIds = stableUserIds.length || stableAiIds.length
+    ? [...stableUserIds, ...stableAiIds]
+    : [...allPlayerIds.value].map(Number).sort((a, b) => a - b);
+  return orderedIds.flatMap((playerId) => {
+    const raw = liveSkills?.[String(playerId)] ?? liveSkills?.[playerId];
+    if (!raw || typeof raw !== 'object') return [];
+    return [{
+      playerId,
+      team: userSet.has(playerId) ? 'Player' : (aiSet.has(playerId) ? 'AI' : 'Unknown'),
+      pressure: Number(raw.pressure),
+      steal: Number(raw.steal),
+      ballHandling: Number(raw.ball_handling),
+      passing: Number(raw.passing),
+    }];
+  });
+});
+
+function formatEpisodeSkill(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toFixed(2) : 'N/A';
+}
+
 function percentToProb(percent) {
   const num = Number(percent ?? 0);
   if (Number.isNaN(num)) return 0.01;
@@ -1753,6 +1811,9 @@ const reboundSkillSampler = ref({
 });
 const reboundSkillSamplerStatus = ref('');
 const reboundSkillSamplerError = ref('');
+const evalRosterSampling = ref(false);
+const evalRosterStatus = ref('');
+const evalRosterError = ref('');
 
 const defaultEvalConfig = () => ({
   mode: 'default',
@@ -1761,6 +1822,9 @@ const defaultEvalConfig = () => ({
   ballHolder: null,
   shootingMode: 'random',
   skills: { layup: [], three_pt: [], dunk: [] },
+  playerSkillsPinned: false,
+  playerSkills: {},
+  playerSkillsSource: '',
   reboundSkills: [],
   reboundSkillsPinned: false,
   reboundSkillSampling: {
@@ -2296,6 +2360,7 @@ const evalConfigSafe = computed(() => {
     ...base,
     ...incoming,
     skills: { ...base.skills, ...(incoming.skills || {}) },
+    playerSkills: { ...base.playerSkills, ...(incoming.playerSkills || {}) },
     reboundSkillSampling: { ...base.reboundSkillSampling, ...(incoming.reboundSkillSampling || {}) },
     reboundSkills: Array.isArray(incoming.reboundSkills) ? incoming.reboundSkills : base.reboundSkills,
     reboundSkillsPinned: Boolean(incoming.reboundSkillsPinned ?? base.reboundSkillsPinned),
@@ -2399,6 +2464,16 @@ const templateConfigSafe = computed(() => {
 const evalPlacementEditing = computed(() => evalConfigSafe.value.placementEditing && evalConfigSafe.value.mode === 'custom');
 const evalModeIsCustom = computed(() => evalConfigSafe.value.mode === 'custom');
 const evalOffenseIds = computed(() => props.gameState?.offense_ids || []);
+const evalRosterPlayerIds = computed(() => {
+  const userIds = Array.isArray(props.gameState?.user_player_ids)
+    ? props.gameState.user_player_ids.map(Number)
+    : [];
+  const aiIds = Array.isArray(props.gameState?.ai_player_ids)
+    ? props.gameState.ai_player_ids.map(Number)
+    : [];
+  if (userIds.length || aiIds.length) return [...userIds, ...aiIds];
+  return [...new Set(allPlayerIds.value.map(Number))].sort((a, b) => a - b);
+});
 const templateOffenseIds = computed(() => props.gameState?.offense_ids || []);
 const templateDefenseIds = computed(() => props.gameState?.defense_ids || []);
 const ballStartOptions = computed(() => {
@@ -3137,6 +3212,130 @@ function updateEvalEpisodes(val) {
   evalEpisodesInput.value = safe;
 }
 
+function normalizeEvalRosterProfiles(rawProfiles, { probabilities = true } = {}) {
+  const profiles = rawProfiles && typeof rawProfiles === 'object' ? rawProfiles : {};
+  const normalized = {};
+  for (const playerId of evalRosterPlayerIds.value) {
+    const raw = profiles[String(playerId)] ?? profiles[playerId];
+    if (!raw || typeof raw !== 'object') {
+      throw new Error(`Roster skills are missing Player ${playerId}.`);
+    }
+    const shootingValue = (key) => {
+      const numeric = Number(raw[key]);
+      if (!Number.isFinite(numeric)) throw new Error(`Player ${playerId} has no ${key} skill.`);
+      return probabilities ? percentFromProb(numeric) : numeric;
+    };
+    const rawValue = (key) => {
+      const numeric = Number(raw[key]);
+      if (!Number.isFinite(numeric)) throw new Error(`Player ${playerId} has no ${key} skill.`);
+      return numeric;
+    };
+    normalized[String(playerId)] = {
+      layup: shootingValue('layup'),
+      three_pt: shootingValue('three_pt'),
+      dunk: shootingValue('dunk'),
+      rebound: rawValue('rebound'),
+      pressure: rawValue('pressure'),
+      steal: rawValue('steal'),
+      ball_handling: rawValue('ball_handling'),
+      passing: rawValue('passing'),
+    };
+  }
+  return normalized;
+}
+
+function currentEvalRosterProfiles() {
+  const shooting = props.gameState?.player_shooting_skills || {};
+  const rebounds = props.gameState?.player_rebound_skills || {};
+  const episodeSkills = props.gameState?.player_episode_skills || {};
+  const combined = {};
+  for (const playerId of evalRosterPlayerIds.value) {
+    const shot = shooting[String(playerId)] ?? shooting[playerId];
+    const episode = episodeSkills[String(playerId)] ?? episodeSkills[playerId];
+    const rebound = rebounds[String(playerId)] ?? rebounds[playerId];
+    combined[String(playerId)] = {
+      ...(shot || {}),
+      ...(episode || {}),
+      rebound,
+    };
+  }
+  return normalizeEvalRosterProfiles(combined, { probabilities: true });
+}
+
+function copyCurrentEvalRoster() {
+  evalRosterError.value = '';
+  try {
+    const playerSkills = currentEvalRosterProfiles();
+    emitEvalConfigUpdate({
+      mode: 'custom',
+      playerSkillsPinned: true,
+      playerSkills,
+      playerSkillsSource: 'current',
+      randomizeOffensePermutation: false,
+    });
+    evalRosterStatus.value = `Current ${evalRosterPlayerIds.value.length}-player roster captured and frozen.`;
+  } catch (err) {
+    evalRosterError.value = err?.message || 'Current player skills are unavailable.';
+  }
+}
+
+async function generateEvalRoster() {
+  evalRosterSampling.value = true;
+  evalRosterError.value = '';
+  evalRosterStatus.value = '';
+  try {
+    const response = await sampleEvalPlayerSkills();
+    const playerSkills = normalizeEvalRosterProfiles(response?.player_skills || {}, {
+      probabilities: true,
+    });
+    emitEvalConfigUpdate({
+      mode: 'custom',
+      playerSkillsPinned: true,
+      playerSkills,
+      playerSkillsSource: 'random',
+      randomizeOffensePermutation: false,
+    });
+    evalRosterStatus.value = `New ${evalRosterPlayerIds.value.length}-player roster sampled and frozen.`;
+  } catch (err) {
+    evalRosterError.value = err?.message || 'Failed to sample a new roster.';
+  } finally {
+    evalRosterSampling.value = false;
+  }
+}
+
+function setEvalPlayerSkillsPinned(value) {
+  const pinned = Boolean(value);
+  if (pinned && Object.keys(evalConfigSafe.value.playerSkills || {}).length === 0) {
+    copyCurrentEvalRoster();
+    return;
+  }
+  emitEvalConfigUpdate({
+    mode: 'custom',
+    playerSkillsPinned: pinned,
+  });
+  evalRosterStatus.value = pinned
+    ? 'Pinned roster enabled.'
+    : 'Roster skills will be resampled on episode reset.';
+}
+
+function updateEvalPlayerSkill(playerId, skillName, value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return;
+  const profiles = deepCloneJson(evalConfigSafe.value.playerSkills || {}, {}) || {};
+  const key = String(playerId);
+  profiles[key] = {
+    ...(profiles[key] || profiles[playerId] || {}),
+    [skillName]: numeric,
+  };
+  emitEvalConfigUpdate({
+    mode: 'custom',
+    playerSkillsPinned: true,
+    playerSkills: profiles,
+    playerSkillsSource: 'manual',
+  });
+  evalRosterStatus.value = 'Pinned roster edited manually.';
+}
+
 function emitEvalConfigUpdate(patch = {}) {
   const base = evalConfigSafe.value;
   const next = {
@@ -3145,6 +3344,10 @@ function emitEvalConfigUpdate(patch = {}) {
     skills: {
       ...base.skills,
       ...(patch.skills || {}),
+    },
+    playerSkills: {
+      ...base.playerSkills,
+      ...(patch.playerSkills || {}),
     },
   };
   if (next.mode !== 'custom') {
@@ -3429,13 +3632,13 @@ function handleEvalModeChange(mode) {
     if (!evalConfigSafe.value.positions || evalConfigSafe.value.positions.length === 0) {
       seedEvalConfigFromGameState(true);
     }
-    // Default to fixed skills when entering custom mode so controls appear
-    const nextMode = evalConfigSafe.value.shootingMode || 'random';
-    const patch = { mode: 'custom' };
-    if (nextMode === 'random') {
-      patch.shootingMode = 'fixed';
+    const hasPinnedRoster = Object.keys(evalConfigSafe.value.playerSkills || {}).length > 0;
+    if (hasPinnedRoster) {
+      emitEvalConfigUpdate({ mode: 'custom', playerSkillsPinned: true });
+    } else {
+      copyCurrentEvalRoster();
+      if (evalRosterError.value) emitEvalConfigUpdate({ mode: 'custom' });
     }
-    emitEvalConfigUpdate(patch);
     activeTab.value = 'eval';
   } else {
     emitEvalConfigUpdate({ mode: 'default', placementEditing: false });
@@ -3457,7 +3660,38 @@ const evalOffenseSkillRows = computed(() => {
     layup: Number(lay[idx] ?? 0),
     threePt: Number(three[idx] ?? 0),
     dunk: Number(dunk[idx] ?? 0),
-  }));
+}));
+});
+
+const evalPlayerSkillRows = computed(() => {
+  const profiles = evalConfigSafe.value.playerSkills || {};
+  const userIds = new Set(
+    (Array.isArray(props.gameState?.user_player_ids) ? props.gameState.user_player_ids : [])
+      .map(Number),
+  );
+  const aiIds = new Set(
+    (Array.isArray(props.gameState?.ai_player_ids) ? props.gameState.ai_player_ids : [])
+      .map(Number),
+  );
+  return evalRosterPlayerIds.value.map((playerId) => {
+    const raw = profiles[String(playerId)] ?? profiles[playerId] ?? {};
+    const numberOrZero = (key) => {
+      const numeric = Number(raw[key]);
+      return Number.isFinite(numeric) ? numeric : 0;
+    };
+    return {
+      playerId,
+      team: userIds.has(Number(playerId)) ? 'Player' : (aiIds.has(Number(playerId)) ? 'AI' : 'Unknown'),
+      layup: numberOrZero('layup'),
+      threePt: numberOrZero('three_pt'),
+      dunk: numberOrZero('dunk'),
+      rebound: numberOrZero('rebound'),
+      pressure: numberOrZero('pressure'),
+      steal: numberOrZero('steal'),
+      ballHandling: numberOrZero('ball_handling'),
+      passing: numberOrZero('passing'),
+    };
+  });
 });
 
 const evalReboundSkillRows = computed(() => {
@@ -4312,6 +4546,7 @@ const DEFAULT_DEV_TABS = Object.freeze([
   { id: 'moves', label: 'Moves' },
   { id: 'pass_lab', label: 'Pass Lab' },
   { id: 'eval', label: 'Eval' },
+  { id: 'skill_ratings', label: 'Skill Ratings' },
   { id: 'training', label: 'Training' },
   { id: 'phi', label: 'Phi Shaping' },
   { id: 'observation', label: 'Observation' },
@@ -4368,11 +4603,11 @@ const modelCapabilities = computed(() => {
   const raw = props.gameState?.model_capabilities;
   return raw && typeof raw === 'object' ? raw : {};
 });
-const isJaxModel = computed(() => String(props.gameState?.model_backend || '').startsWith('jax'));
 const jaxModelMetadata = computed(() => {
   const raw = props.gameState?.model_metadata;
   return raw && typeof raw === 'object' ? raw : null;
 });
+const isJaxModel = computed(() => isJaxModelState(props.gameState));
 const jaxEnvConfig = computed(() => {
   const meta = jaxModelMetadata.value || {};
   const env = meta.env_config || meta.frozen_config || {};
@@ -4819,6 +5054,7 @@ function isDevTabVisible(tabId) {
   }
   if (tabId === 'observation') return caps.observation_panel !== false;
   if (tabId === 'eval') return caps.eval !== false;
+  if (tabId === 'skill_ratings') return isJaxModel.value;
   return true;
 }
 
@@ -5707,6 +5943,9 @@ function buildEvalAggregateRow(entry) {
   const reboundWinProbabilityCount = Number(entry?.rebound_win_probability_count || 0);
   const reboundSkillSum = Number(entry?.rebound_skill_sum || 0);
   const reboundSkillCount = Number(entry?.rebound_skill_count || 0);
+  const sampledSkills = entry?.sampled_skills && typeof entry.sampled_skills === 'object'
+    ? entry.sampled_skills
+    : {};
   return {
     attempts,
     makes,
@@ -5733,6 +5972,8 @@ function buildEvalAggregateRow(entry) {
     avgEligibleReboundSkill: reboundSkillCount > 0
       ? reboundSkillSum / reboundSkillCount
       : null,
+    sampledSkills,
+    sampledSkillCount: Number(entry?.sampled_skill_count || 0),
     orbPct: reboundChances > 0 ? (offensiveRebounds / reboundChances) * 100 : 0,
     drbPct: reboundChances > 0 ? (defensiveRebounds / reboundChances) * 100 : 0,
     episodes,
@@ -5817,32 +6058,43 @@ const selectedEvalSummary = computed(() => {
   };
 });
 
-const offensePlayerStatsTable = computed(() => {
-  const stats = props.perPlayerEvalStats || {};
-  const offenseIds = offensePlayerIdsForStats.value;
-  if (!stats || offenseIds.length === 0) return [];
-  return offenseIds.map((pid) => {
-    const entry = stats[pid] || stats[String(pid)] || {};
-    const row = buildEvalAggregateRow(entry);
-    return {
-      playerId: pid,
-      ...row,
-    };
-  });
-});
+function evalPlayerTeam(playerId) {
+  const pid = Number(playerId);
+  const userIds = new Set((props.gameState?.user_player_ids || []).map(Number));
+  const aiIds = new Set((props.gameState?.ai_player_ids || []).map(Number));
+  if (userIds.has(pid)) return { label: 'Player', order: 0, className: 'player-team' };
+  if (aiIds.has(pid)) return { label: 'AI', order: 1, className: 'ai-team' };
+  const teamAIds = new Set((props.gameState?.team_a_ids || []).map(Number));
+  if (teamAIds.has(pid)) return { label: 'Team A', order: 0, className: 'player-team' };
+  return { label: 'Team B', order: 1, className: 'ai-team' };
+}
 
-const defensePlayerStatsTable = computed(() => {
+function formatEvalProbabilitySkill(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? `${(numeric * 100).toFixed(1)}%` : '—';
+}
+
+function formatEvalLatentSkill(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toFixed(2) : '—';
+}
+
+const allPlayerStatsTable = computed(() => {
   const stats = props.perPlayerEvalStats || {};
-  const defenseIds = defensePlayerIdsForStats.value;
-  if (!stats || defenseIds.length === 0) return [];
-  return defenseIds.map((pid) => {
+  if (!stats || Object.keys(stats).length === 0) return [];
+  return Object.keys(stats).map(Number).filter(Number.isFinite).map((pid) => {
     const entry = stats[pid] || stats[String(pid)] || {};
     const row = buildEvalAggregateRow(entry);
+    const team = evalPlayerTeam(pid);
     return {
       playerId: pid,
+      playerLabel: formatPlayerIdentity(pid),
+      team,
       ...row,
     };
-  }).filter((row) => row.reboundChances > 0 || row.defensiveRebounds > 0 || row.steals > 0);
+  }).sort((left, right) => (
+    left.team.order - right.team.order || left.playerId - right.playerId
+  ));
 });
 
 const perIntentEvalStatsTable = computed(() => {
@@ -6563,6 +6815,10 @@ function applyEvaluationStats(
   saveStats(statsState.value);
 }
 
+function showStatsTab() {
+  activeTab.value = 'stats';
+}
+
 function resetStats() {
   statsState.value = resetStatsStorage();
   emit('stats-reset');
@@ -6714,6 +6970,7 @@ defineExpose({
   submitActions,
   recordEpisodeStats,
   applyEvaluationStats,
+  showStatsTab,
   getSelectedActions,
   getRandomStartTemplateOptions,
   getRandomSelfPlayStartTemplateOptions,
@@ -8892,81 +9149,70 @@ function offenseSkillDeltaLabel(idx) {
 
     <!-- Stats Tab -->
     <div v-if="activeTab === 'stats'" class="tab-content">
-      <div v-if="offensePlayerStatsTable.length" class="per-player-stats">
-        <h4>Per-Player Offense Stats (Eval)</h4>
-        <table class="per-player-table">
-          <thead>
-            <tr>
-              <th>Player</th>
-              <th>FG</th>
-              <th>Dunk</th>
-              <th>2PT</th>
-              <th>3PT</th>
-              <th>Assists</th>
-              <th>Pot. Ast</th>
-              <th>TOV</th>
-              <th>ORB</th>
-              <th title="This player's offensive rebounds divided by all resolved rebound chances; unlike ORBE%, it is not conditioned on eligibility.">ORB%</th>
-              <th title="Times this offensive player was eligible for the rebound winner softmax.">Eligible chances</th>
-              <th title="Offensive rebounds divided by softmax-eligible rebound chances; this is a player eligibility rate, not team ORB%.">ORBE%</th>
-              <th title="Average distance to the sampled rebound target when this player was eligible for the rebound softmax.">Avg eligible dist</th>
-              <th title="Average rebound skill for this player on eligible rebound chances.">Avg skill</th>
-              <th title="Average winner probability assigned by the rebound softmax when this player was eligible.">Avg win P</th>
-              <th>Points</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="row in offensePlayerStatsTable" :key="`stat-${row.playerId}`">
-              <td>Player {{ row.playerId }}</td>
-              <td>{{ row.makes }}/{{ row.attempts }} ({{ row.fg.toFixed(1) }}%)</td>
-              <td>{{ row.dunk.mk }}/{{ row.dunk.att }} ({{ row.unassisted.dunk }})</td>
-              <td>{{ row.two.mk }}/{{ row.two.att }} ({{ row.unassisted.two }})</td>
-              <td>{{ row.three.mk }}/{{ row.three.att }} ({{ row.unassisted.three }})</td>
-              <td>{{ row.assists }}</td>
-              <td>{{ row.potentialAssists }}</td>
-              <td>{{ row.turnovers }}</td>
-              <td>{{ row.offensiveRebounds }}</td>
-              <td>{{ (safeDiv(row.offensiveRebounds, totalReboundChances) * 100).toFixed(1) }}%</td>
-              <td>{{ row.reboundChances }}</td>
-              <td>{{ row.orbPct.toFixed(1) }}%</td>
-              <td>{{ row.avgReboundTargetDistance !== null ? row.avgReboundTargetDistance.toFixed(2) : 'N/A' }}</td>
-              <td>{{ row.avgEligibleReboundSkill !== null ? row.avgEligibleReboundSkill.toFixed(2) : 'N/A' }}</td>
-              <td>{{ row.avgReboundWinProb !== null ? row.avgReboundWinProb.toFixed(1) + '%' : 'N/A' }}</td>
-              <td>{{ row.points.toFixed(1) }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-      <div v-if="defensePlayerStatsTable.length" class="per-player-stats">
-        <h4>Per-Player Defense Stats</h4>
-        <table class="per-player-table">
-          <thead>
-            <tr>
-              <th>Player</th>
-              <th>Steals</th>
-              <th>DRB</th>
-              <th title="This player's defensive rebounds divided by all resolved rebound chances; unlike DRBE%, it is not conditioned on eligibility.">DRB%</th>
-              <th title="Times this defender was eligible for the rebound winner softmax.">Eligible chances</th>
-              <th title="Defensive rebounds divided by softmax-eligible rebound chances; this is a player eligibility rate, not team DRB%.">DRBE%</th>
-              <th title="Average distance to the sampled rebound target when this player was eligible for the rebound softmax.">Avg eligible dist</th>
-              <th title="Average rebound skill for this player on eligible rebound chances.">Avg skill</th>
-              <th title="Average winner probability assigned by the rebound softmax when this player was eligible.">Avg win P</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="row in defensePlayerStatsTable" :key="`def-reb-stat-${row.playerId}`">
-              <td>Player {{ row.playerId }}</td>
-              <td>{{ row.steals }}</td>
-              <td>{{ row.defensiveRebounds }}</td>
-              <td>{{ (safeDiv(row.defensiveRebounds, totalReboundChances) * 100).toFixed(1) }}%</td>
-              <td>{{ row.reboundChances }}</td>
-              <td>{{ row.drbPct.toFixed(1) }}%</td>
-              <td>{{ row.avgReboundTargetDistance !== null ? row.avgReboundTargetDistance.toFixed(2) : 'N/A' }}</td>
-              <td>{{ row.avgEligibleReboundSkill !== null ? row.avgEligibleReboundSkill.toFixed(2) : 'N/A' }}</td>
-              <td>{{ row.avgReboundWinProb !== null ? row.avgReboundWinProb.toFixed(1) + '%' : 'N/A' }}</td>
-            </tr>
-          </tbody>
-        </table>
+      <div v-if="allPlayerStatsTable.length" class="per-player-stats eval-box-score">
+        <h4>All-Player Box Score &amp; Skills (Eval)</h4>
+        <div class="status-note">
+          Box-score totals cover the full evaluation. Skills are each player's mean sampled value across {{ allPlayerStatsTable[0]?.sampledSkillCount || 0 }} episode rosters; fixed-skill evaluations therefore show the exact configured values.
+        </div>
+        <div class="per-player-table-scroll">
+          <table class="per-player-table eval-box-score-table">
+            <thead>
+              <tr class="column-groups">
+                <th rowspan="2">Player</th>
+                <th rowspan="2">Team</th>
+                <th colspan="11">Box score</th>
+                <th colspan="5">Offensive skills</th>
+                <th colspan="3">Defensive / shared skills</th>
+              </tr>
+              <tr>
+                <th>PTS</th>
+                <th>FG</th>
+                <th>Dunk</th>
+                <th>2PT</th>
+                <th>3PT</th>
+                <th>AST</th>
+                <th title="Potential assists">Pot AST</th>
+                <th>TOV</th>
+                <th>STL</th>
+                <th>ORB</th>
+                <th>DRB</th>
+                <th title="Mean sampled layup make probability">Layup</th>
+                <th title="Mean sampled three-point make probability">3PT</th>
+                <th title="Mean sampled dunk make probability">Dunk</th>
+                <th title="Mean sampled ball-handling skill; higher values resist pressure turnovers">Handle</th>
+                <th title="Mean sampled passing skill; higher values resist interceptions">Pass</th>
+                <th title="Mean sampled turnover-pressure skill">Pressure</th>
+                <th title="Mean sampled steal skill">Steal</th>
+                <th title="Mean sampled rebounding skill">Rebound</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in allPlayerStatsTable" :key="`eval-box-${row.playerId}`">
+                <td class="player-identity-cell">{{ row.playerLabel }}</td>
+                <td :class="['team-cell', row.team.className]">{{ row.team.label }}</td>
+                <td>{{ row.points.toFixed(0) }}</td>
+                <td>{{ row.makes }}/{{ row.attempts }}</td>
+                <td>{{ row.dunk.mk }}/{{ row.dunk.att }}</td>
+                <td>{{ row.two.mk }}/{{ row.two.att }}</td>
+                <td>{{ row.three.mk }}/{{ row.three.att }}</td>
+                <td>{{ row.assists }}</td>
+                <td>{{ row.potentialAssists }}</td>
+                <td>{{ row.turnovers }}</td>
+                <td>{{ row.steals }}</td>
+                <td>{{ row.offensiveRebounds }}</td>
+                <td>{{ row.defensiveRebounds }}</td>
+                <td class="skill-cell offense-skill">{{ formatEvalProbabilitySkill(row.sampledSkills.layup) }}</td>
+                <td class="skill-cell offense-skill">{{ formatEvalProbabilitySkill(row.sampledSkills.three_pt) }}</td>
+                <td class="skill-cell offense-skill">{{ formatEvalProbabilitySkill(row.sampledSkills.dunk) }}</td>
+                <td class="skill-cell offense-skill">{{ formatEvalLatentSkill(row.sampledSkills.ball_handling) }}</td>
+                <td class="skill-cell offense-skill">{{ formatEvalLatentSkill(row.sampledSkills.passing) }}</td>
+                <td class="skill-cell defense-skill">{{ formatEvalLatentSkill(row.sampledSkills.turnover_pressure) }}</td>
+                <td class="skill-cell defense-skill">{{ formatEvalLatentSkill(row.sampledSkills.steal) }}</td>
+                <td class="skill-cell shared-skill">{{ formatEvalLatentSkill(row.sampledSkills.rebound) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </div>
       <div v-if="perIntentEvalStatsTable.length" class="per-player-stats">
         <h4>Per-Intent Offense Stats (Eval)</h4>
@@ -9483,8 +9729,9 @@ function offenseSkillDeltaLabel(idx) {
             </select>
 
             <button
+              type="button"
               class="ghost-btn"
-              @click="$emit('refresh-policies')"
+              @click.stop="$emit('refresh-policies')"
               :disabled="policiesLoading || props.isPolicySwapping || !props.gameState?.run_id"
               title="Refresh checkpoint list from MLflow"
             >
@@ -10985,6 +11232,22 @@ function offenseSkillDeltaLabel(idx) {
 
     <!-- Eval Tab -->
     <div v-if="activeTab === 'eval'" class="tab-content eval-tab">
+      <div
+        v-if="props.isEvaluating"
+        class="eval-running-notice"
+        role="status"
+        aria-live="assertive"
+      >
+        <span class="eval-running-spinner" aria-hidden="true"></span>
+        <div>
+          <strong>Evaluation started</strong>
+          <span>
+            Running {{ evalProgressSafe.completed }}/{{ evalProgressSafe.total || evalEpisodesInput }} episodes
+            <template v-if="evalProgressSafe.total > 0"> ({{ evalProgressPercent }})</template>
+          </span>
+        </div>
+      </div>
+
       <div class="eval-row">
         <label class="inline-label">
           <input type="radio" value="default" :checked="!evalModeIsCustom" @change="handleEvalModeChange('default')" />
@@ -11034,6 +11297,7 @@ function offenseSkillDeltaLabel(idx) {
           <input
             type="checkbox"
             :checked="evalConfigSafe.randomizeOffensePermutation"
+            :disabled="props.isEvaluating || evalConfigSafe.playerSkillsPinned"
             @change="setEvalRandomizePermutation($event.target.checked)"
           />
           Randomize offense player slots each episode (shuffle positions)
@@ -11231,7 +11495,69 @@ function offenseSkillDeltaLabel(idx) {
           </select>
         </div>
 
-        <div class="eval-row">
+        <div class="eval-row eval-roster-actions">
+          <label class="inline-label">
+            <input
+              type="checkbox"
+              :checked="evalConfigSafe.playerSkillsPinned"
+              :disabled="props.isEvaluating"
+              @change="setEvalPlayerSkillsPinned($event.target.checked)"
+            />
+            Freeze all {{ evalRosterPlayerIds.length }} player profiles for the entire evaluation
+          </label>
+          <button class="ghost-btn" :disabled="props.isEvaluating" @click="copyCurrentEvalRoster">
+            Use current roster
+          </button>
+          <button
+            class="ghost-btn"
+            :disabled="props.isEvaluating || evalRosterSampling"
+            @click="generateEvalRoster"
+          >
+            {{ evalRosterSampling ? 'Sampling…' : 'Generate random roster' }}
+          </button>
+        </div>
+        <div v-if="evalRosterStatus" class="rebound-sampler-status">{{ evalRosterStatus }}</div>
+        <div v-if="evalRosterError" class="rebound-sampler-error">{{ evalRosterError }}</div>
+
+        <div v-if="evalConfigSafe.playerSkillsPinned" class="eval-player-roster-wrap">
+          <div class="status-note eval-roster-note">
+            One profile per stable jersey. Editing any value makes this a manual roster; every episode reuses these exact values.
+          </div>
+          <div class="eval-player-roster-scroll">
+            <table class="eval-player-roster-table">
+              <thead>
+                <tr>
+                  <th>Team</th>
+                  <th>Player</th>
+                  <th title="Layup make probability">Layup %</th>
+                  <th title="Three-point make probability">3PT %</th>
+                  <th title="Dunk make probability">Dunk %</th>
+                  <th title="Rebounding skill">Rebound</th>
+                  <th title="Turnover-pressure skill">Pressure</th>
+                  <th title="Steal/interception skill">Steal</th>
+                  <th title="Ball-handling skill">Handle</th>
+                  <th title="Passing accuracy skill">Pass</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in evalPlayerSkillRows" :key="`eval-player-profile-${row.playerId}`">
+                  <td>{{ row.team }}</td>
+                  <td>#{{ row.playerId }}</td>
+                  <td><input type="number" min="1" max="99" step="0.1" :value="row.layup" @input="updateEvalPlayerSkill(row.playerId, 'layup', $event.target.value)" /></td>
+                  <td><input type="number" min="1" max="99" step="0.1" :value="row.threePt" @input="updateEvalPlayerSkill(row.playerId, 'three_pt', $event.target.value)" /></td>
+                  <td><input type="number" min="1" max="99" step="0.1" :value="row.dunk" @input="updateEvalPlayerSkill(row.playerId, 'dunk', $event.target.value)" /></td>
+                  <td><input type="number" step="0.05" :value="row.rebound" @input="updateEvalPlayerSkill(row.playerId, 'rebound', $event.target.value)" /></td>
+                  <td><input type="number" step="0.05" :value="row.pressure" @input="updateEvalPlayerSkill(row.playerId, 'pressure', $event.target.value)" /></td>
+                  <td><input type="number" step="0.05" :value="row.steal" @input="updateEvalPlayerSkill(row.playerId, 'steal', $event.target.value)" /></td>
+                  <td><input type="number" step="0.05" :value="row.ballHandling" @input="updateEvalPlayerSkill(row.playerId, 'ball_handling', $event.target.value)" /></td>
+                  <td><input type="number" step="0.05" :value="row.passing" @input="updateEvalPlayerSkill(row.playerId, 'passing', $event.target.value)" /></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div v-if="!evalConfigSafe.playerSkillsPinned" class="eval-row">
           <label>Shooting skills</label>
           <div class="radio-row">
             <label class="inline-label">
@@ -11245,7 +11571,7 @@ function offenseSkillDeltaLabel(idx) {
           </div>
         </div>
 
-        <div v-if="evalConfigSafe.shootingMode === 'fixed'" class="eval-skills">
+        <div v-if="!evalConfigSafe.playerSkillsPinned && evalConfigSafe.shootingMode === 'fixed'" class="eval-skills">
           <div class="skills-header">
             <span>Player</span>
             <span>Layup %</span>
@@ -11265,14 +11591,14 @@ function offenseSkillDeltaLabel(idx) {
           </div>
         </div>
 
-        <div class="eval-row">
+        <div v-if="!evalConfigSafe.playerSkillsPinned" class="eval-row">
           <label class="inline-label">
             <input type="checkbox" :checked="evalConfigSafe.showReboundSkillsOnBoard" @change="setEvalShowReboundSkillsOnBoard($event.target.checked)" />
             Show rebound skill badges on board
           </label>
         </div>
 
-        <div class="eval-skills">
+        <div v-if="!evalConfigSafe.playerSkillsPinned" class="eval-skills">
           <div class="rebound-sampler" data-tooltip="Draw iid Gaussian rebound skills until the lineup skill edge sum(offense)-sum(defense) lands in the requested bucket. This pins eval rebound skills and does not change training/reset sampling.">
             <div class="rebound-sampler-title">Constrained Gaussian sampler</div>
             <label>
@@ -11314,6 +11640,15 @@ function offenseSkillDeltaLabel(idx) {
           </div>
         </div>
       </div>
+    </div>
+
+    <!-- Skill Ratings Tab -->
+    <div v-if="activeTab === 'skill_ratings'" class="tab-content skill-ratings-tab">
+      <SkillRatingsWorkbench
+        :checkpoint-path="jaxModelMetadata?.checkpoint_path || jaxModelMetadata?.unified_checkpoint_path || ''"
+        :checkpoint-update="jaxModelMetadata?.update_index"
+        :model-backend="props.gameState?.model_backend || ''"
+      />
     </div>
 
     <!-- Environment Tab -->
@@ -11506,7 +11841,7 @@ function offenseSkillDeltaLabel(idx) {
             </div>
             <div class="param-item" data-tooltip="The player currently in possession of the ball">
               <span class="param-name">Ball holder:</span>
-              <span class="param-value">Player {{ props.gameState.ball_holder }}</span>
+              <span class="param-value">{{ props.gameState.ball_holder == null ? 'None' : formatPlayerIdentity(props.gameState.ball_holder) }}</span>
             </div>
             <div class="param-item" data-tooltip="Remaining steps before shot clock violation (turnover). Decrements each turn.">
               <span class="param-name">Shot clock:</span>
@@ -11670,8 +12005,9 @@ function offenseSkillDeltaLabel(idx) {
             </div>
             <div class="policy-actions">
               <button 
+                type="button"
                 class="refresh-policies-btn"
-                @click="$emit('refresh-policies')"
+                @click.stop="$emit('refresh-policies')"
                 :disabled="policiesLoading || props.isPolicySwapping"
                 title="Refresh policy list from MLflow"
               >
@@ -11751,7 +12087,7 @@ function offenseSkillDeltaLabel(idx) {
                 :key="`skill-${row.playerId}`"
                 data-tooltip="Individual shooting percentages sampled from μ±σ distributions. Editable to override per-player skills."
               >
-                <span class="skills-player">Player {{ row.playerId }}</span>
+                <span class="skills-player">{{ formatPlayerIdentity(row.playerId) }}</span>
                 <div class="offense-skill-input">
                   <input type="number" min="1" max="99" step="0.1" v-model.number="offenseSkillInputs.layup[idx]" :disabled="skillsUpdating" />
                   <span class="offense-skill-default">Sampled {{ row.sampledLayup.toFixed(1) }}%</span>
@@ -11803,11 +12139,55 @@ function offenseSkillDeltaLabel(idx) {
                 :key="`sampled-shooting-skill-${row.playerId}`"
                 data-tooltip="Per-episode shooting skills sampled at game creation. These remain fixed while Player and AI alternate between offense and defense."
               >
-                <span class="skills-player">Player {{ row.playerId }}</span>
+                <span class="skills-player">{{ formatPlayerIdentity(row.playerId) }}</span>
                 <span class="param-value" :class="`skill-team-${row.team.toLowerCase()}`">{{ row.team }}</span>
                 <span class="param-value">{{ formatSampledShootingSkill(row.layup) }}</span>
                 <span class="param-value">{{ formatSampledShootingSkill(row.threePt) }}</span>
                 <span class="param-value">{{ formatSampledShootingSkill(row.dunk) }}</span>
+              </div>
+            </div>
+          </div>
+          <div class="param-category" v-if="sampledEpisodeSkillRows.length">
+            <h5>Offensive Skills (Episode)</h5>
+            <div class="offense-skills-editor">
+              <div class="offense-skills-row header sampled-episode-skills-row">
+                <span>Player</span>
+                <span>Team</span>
+                <span>Handle</span>
+                <span>Passing</span>
+              </div>
+              <div
+                class="offense-skills-row sampled-episode-skills-row"
+                v-for="row in sampledEpisodeSkillRows"
+                :key="`sampled-offense-skill-${row.playerId}`"
+                data-tooltip="Episode-stable offensive attributes. Ball handling resists live-ball pressure turnovers; passing reduces interception risk."
+              >
+                <span class="skills-player">{{ formatPlayerIdentity(row.playerId) }}</span>
+                <span class="param-value" :class="`skill-team-${row.team.toLowerCase()}`">{{ row.team }}</span>
+                <span class="param-value">{{ formatEpisodeSkill(row.ballHandling) }}</span>
+                <span class="param-value">{{ formatEpisodeSkill(row.passing) }}</span>
+              </div>
+            </div>
+          </div>
+          <div class="param-category" v-if="sampledEpisodeSkillRows.length">
+            <h5>Defensive Skills (Episode)</h5>
+            <div class="offense-skills-editor">
+              <div class="offense-skills-row header sampled-episode-skills-row">
+                <span>Player</span>
+                <span>Team</span>
+                <span>Pressure</span>
+                <span>Steal</span>
+              </div>
+              <div
+                class="offense-skills-row sampled-episode-skills-row"
+                v-for="row in sampledEpisodeSkillRows"
+                :key="`sampled-defense-skill-${row.playerId}`"
+                data-tooltip="Episode-stable defensive attributes. Pressure increases live-ball turnover contribution; steal increases pass-interception contribution."
+              >
+                <span class="skills-player">{{ formatPlayerIdentity(row.playerId) }}</span>
+                <span class="param-value" :class="`skill-team-${row.team.toLowerCase()}`">{{ row.team }}</span>
+                <span class="param-value">{{ formatEpisodeSkill(row.pressure) }}</span>
+                <span class="param-value">{{ formatEpisodeSkill(row.steal) }}</span>
               </div>
             </div>
           </div>
@@ -11850,7 +12230,7 @@ function offenseSkillDeltaLabel(idx) {
                 :key="`sampled-rebound-skill-${row.playerId}`"
                 data-tooltip="Current per-episode rebound skill. Positive values reduce effective distance to the rebound target when rebound skill weight is above zero. Apply writes these values into the live JAX state without resetting."
               >
-                <span class="skills-player">Player {{ row.playerId }}</span>
+                <span class="skills-player">{{ formatPlayerIdentity(row.playerId) }}</span>
                 <span class="param-value">{{ row.team }}</span>
                 <input
                   class="env-param-input"
@@ -14430,6 +14810,10 @@ function offenseSkillDeltaLabel(idx) {
   grid-template-columns: 0.9fr 0.75fr repeat(3, 1fr);
 }
 
+.offense-skills-row.sampled-episode-skills-row {
+  grid-template-columns: 0.9fr 0.75fr repeat(2, 1fr);
+}
+
 .skill-team-player {
   color: #60a5fa;
 }
@@ -14829,6 +15213,47 @@ function offenseSkillDeltaLabel(idx) {
   gap: 0.5rem;
   min-width: 0;
 }
+.eval-running-notice {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 0.85rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid rgba(56, 189, 248, 0.72);
+  border-radius: 12px;
+  background: rgba(3, 105, 161, 0.22);
+  color: #e0f2fe;
+  box-shadow: 0 0 20px rgba(56, 189, 248, 0.16);
+}
+.eval-running-notice div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.eval-running-notice strong {
+  color: #7dd3fc;
+  font-size: 0.95rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.eval-running-notice span:not(.eval-running-spinner) {
+  color: #cbd5e1;
+  font-size: 0.85rem;
+}
+.eval-running-spinner {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  border: 3px solid rgba(125, 211, 252, 0.25);
+  border-top-color: #38bdf8;
+  border-radius: 50%;
+  animation: eval-running-spin 0.8s linear infinite;
+}
+@keyframes eval-running-spin {
+  to { transform: rotate(360deg); }
+}
 .eval-progress-bar {
   width: 180px;
   height: 6px;
@@ -14878,6 +15303,48 @@ function offenseSkillDeltaLabel(idx) {
   display: flex;
   flex-direction: column;
   gap: 0.4rem;
+}
+.eval-roster-actions {
+  flex-wrap: wrap;
+}
+.eval-roster-note {
+  margin-bottom: 0.55rem;
+}
+.eval-player-roster-wrap {
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  border-radius: 12px;
+  padding: 0.75rem;
+  background: rgba(8, 47, 73, 0.16);
+}
+.eval-player-roster-scroll {
+  overflow-x: auto;
+}
+.eval-player-roster-table {
+  width: 100%;
+  min-width: 1050px;
+  border-collapse: separate;
+  border-spacing: 0 0.3rem;
+  font-size: 0.78rem;
+}
+.eval-player-roster-table th {
+  color: #94a3b8;
+  font-weight: 700;
+  text-align: left;
+  white-space: nowrap;
+  padding: 0 0.25rem;
+}
+.eval-player-roster-table td {
+  color: #e2e8f0;
+  padding: 0 0.25rem;
+  white-space: nowrap;
+}
+.eval-player-roster-table input {
+  width: 78px;
+  padding: 0.3rem 0.4rem;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(15, 23, 42, 0.78);
+  color: #e2e8f0;
 }
 .skills-header,
 .skills-row {
@@ -15217,6 +15684,12 @@ function offenseSkillDeltaLabel(idx) {
 .per-player-stats {
   margin-top: 0.75rem;
 }
+.per-player-table-scroll {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+}
 .per-player-table {
   width: 100%;
   border-collapse: collapse;
@@ -15233,6 +15706,47 @@ function offenseSkillDeltaLabel(idx) {
 }
 .per-player-table td {
   color: #e2e8f0;
+}
+.eval-box-score-table {
+  min-width: 1580px;
+  font-size: 0.82rem;
+}
+.eval-box-score-table th,
+.eval-box-score-table td {
+  white-space: nowrap;
+  text-align: center;
+}
+.eval-box-score-table th:first-child,
+.eval-box-score-table td:first-child {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  min-width: 130px;
+  text-align: left;
+  background: #101a2b;
+}
+.eval-box-score-table thead th:first-child {
+  z-index: 4;
+}
+.eval-box-score-table .column-groups th {
+  color: #7dd3fc;
+  text-align: center;
+  border-bottom-color: rgba(125, 211, 252, 0.35);
+}
+.eval-box-score-table .team-cell.player-team {
+  color: #60a5fa;
+}
+.eval-box-score-table .team-cell.ai-team {
+  color: #fb7185;
+}
+.eval-box-score-table .skill-cell.offense-skill {
+  background: rgba(59, 130, 246, 0.07);
+}
+.eval-box-score-table .skill-cell.defense-skill {
+  background: rgba(244, 63, 94, 0.07);
+}
+.eval-box-score-table .skill-cell.shared-skill {
+  background: rgba(250, 204, 21, 0.07);
 }
 
 .group-steal td:first-child { background-color: rgba(251, 113, 133, 0.08); }

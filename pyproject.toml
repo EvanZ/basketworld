@@ -29,3 +29,12 @@ dependencies = [
     "isort",
     "httpx",
 ]
+
+[tool.pytest.ini_options]
+testpaths = [
+    "tests",
+    "app/backend/tests",
+    "app/training_backend/tests",
+    "test_shot_movement_fix.py",
+    "test_turnover_movement.py",
+]

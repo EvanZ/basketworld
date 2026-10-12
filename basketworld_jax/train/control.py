@@ -80,6 +80,7 @@ def write_training_status(
     mlflow_run_id: str | None,
     checkpoint_path: str | None,
     metrics: dict[str, Any] | None = None,
+    checkpoint_provenance: dict[str, Any] | None = None,
 ) -> None:
     if not path:
         return
@@ -101,6 +102,7 @@ def write_training_status(
             "target_updates": int(target_updates),
             "mlflow_run_id": mlflow_run_id,
             "checkpoint_path": checkpoint_path,
+            "checkpoint_provenance": checkpoint_provenance,
             "metrics": summary,
             "updated_at": utc_timestamp(),
         },

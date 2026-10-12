@@ -26,6 +26,16 @@ MULTI_POSSESSION_LIMIT_START="${MULTI_POSSESSION_LIMIT_START:-1}"
 MULTI_POSSESSION_LIMIT_END="${MULTI_POSSESSION_LIMIT_END:-25}"
 MULTI_POSSESSION_LIMIT_RAMP_UPDATES="${MULTI_POSSESSION_LIMIT_RAMP_UPDATES:-5000}"
 MULTI_POSSESSION_OVERTIME_ROUND_CAP="${MULTI_POSSESSION_OVERTIME_ROUND_CAP:-0}"
+PRESSURE_SKILL_MEAN="${PRESSURE_SKILL_MEAN:-0.0}"
+PRESSURE_SKILL_STD="${PRESSURE_SKILL_STD:-1.0}"
+BALL_HANDLING_SKILL_MEAN="${BALL_HANDLING_SKILL_MEAN:-0.0}"
+BALL_HANDLING_SKILL_STD="${BALL_HANDLING_SKILL_STD:-1.0}"
+PRESSURE_SKILL_EFFECT_WEIGHT="${PRESSURE_SKILL_EFFECT_WEIGHT:-0.5}"
+STEAL_SKILL_MEAN="${STEAL_SKILL_MEAN:-0.0}"
+STEAL_SKILL_STD="${STEAL_SKILL_STD:-1.0}"
+PASSING_SKILL_MEAN="${PASSING_SKILL_MEAN:-0.0}"
+PASSING_SKILL_STD="${PASSING_SKILL_STD:-1.0}"
+STEAL_SKILL_EFFECT_WEIGHT="${STEAL_SKILL_EFFECT_WEIGHT:-0.5}"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 # Additive milestone evaluation defaults to the 30K schedule below. For example:
@@ -105,6 +115,11 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --defender-pressure-distance 1 \
   --defender-pressure-turnover-chance 0.025 \
   --defender-pressure-decay-lambda 2 \
+  --pressure-skill-mean "$PRESSURE_SKILL_MEAN" \
+  --pressure-skill-std "$PRESSURE_SKILL_STD" \
+  --ball-handling-skill-mean "$BALL_HANDLING_SKILL_MEAN" \
+  --ball-handling-skill-std "$BALL_HANDLING_SKILL_STD" \
+  --pressure-skill-effect-weight "$PRESSURE_SKILL_EFFECT_WEIGHT" \
   --base-steal-rate 0.2 \
   --steal-perp-decay 1.5 \
   --steal-distance-factor 0.5 \
@@ -122,6 +137,11 @@ exec "$PYTHON_BIN" -m basketworld_jax.train.main \
   --receiver-alignment-width 2.0 \
   --max-receiver-hazard 0.85 \
   --lane-weight 0.0 \
+  --steal-skill-mean "$STEAL_SKILL_MEAN" \
+  --steal-skill-std "$STEAL_SKILL_STD" \
+  --passing-skill-mean "$PASSING_SKILL_MEAN" \
+  --passing-skill-std "$PASSING_SKILL_STD" \
+  --steal-skill-effect-weight "$STEAL_SKILL_EFFECT_WEIGHT" \
   --assist-window 3 \
   --mask-occupied-moves false \
   --enable-pass-gating true \
