@@ -202,9 +202,34 @@ The individual issues contain detailed scope, primary code areas, and acceptance
 
 ### 7. [randomized check location and check clearance (#62)](https://github.com/EvanZ/basketworld/issues/62)
 
-Status: rules updated after design discussion on 2026-10-12; implementation
-has not started. All identified rule decisions are agreed, including the
-double-violation limit, random penalty, and pickup/reentry precedence.
+Status: the initial implementation landed on 2026-10-12 in
+`f10805b` (`Implement configurable check clearance`). All identified rule
+decisions are agreed, including the double-violation limit, random penalty,
+and pickup/reentry precedence. The unchecked acceptance items below remain
+the release-validation and learning-study work; they are intentionally not
+claimed by the implementation commit.
+
+#### Completion review (2026-10-12)
+
+- [x] Add `check_clearance`, separate setup/pickup timers, legacy-compatible
+  defaults, environment validation, and eligible outside-arc pickup sampling
+  with a full clearance-plus-one inbounds margin.
+- [x] Implement per-environment sampled check locations and retry counters,
+  setup/pickup state transitions, single-team technical consequences, two
+  no-score double-violation retries, and the seeded third-violation draw.
+- [x] Wire the new state through JAX training, native evaluation, inference,
+  checkpoint snapshots, aggregate check diagnostics, and the JAX dev-runtime
+  state payload.
+- [x] Add the schema-five policy features: sampled coordinates, clearance
+  radius, double-violation count, actual active-phase time, dynamic
+  ball-distance, and `inside_check_clearance`.
+- [x] Add trainer form/backend/preset/import support for the three settings,
+  including five-second new-run defaults and the nonzero-clearance setup-time
+  validation.
+- [x] Document the implemented rule in the repository overview and trainer
+  application guide, and run the initial focused JAX mechanics and trainer
+  application checks.
+
 This section governs the new check-clearance behavior rather than changing
 the historical implementation decisions above.
 
@@ -468,8 +493,9 @@ the historical implementation decisions above.
 
 #### Decision status
 
-No identified rule decisions remain open. Implementation and the acceptance
-checks above are still pending.
+No identified rule decisions remain open. The implementation work listed in
+the completion review is complete; the unchecked acceptance checks above are
+still pending.
 
 ## Validation strategy
 
