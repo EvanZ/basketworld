@@ -11,6 +11,13 @@ At reset, each offensive player's layup, three-point, and dunk percentages are
 sampled from configurable normal distributions and clipped to
 \([0.01, 0.99]\). A standard deviation of zero makes a skill deterministic.
 
+Every player also receives an episode-stable shot-contest skill sampled from
+`Normal(shot_contest_skill_mean, shot_contest_skill_std)`. Contest skill is an
+unbounded latent value: positive values strengthen a defender's eligible shot
+pressure and negative values weaken it. In continuous multi-possession games,
+the value stays attached to the stable player roster when offense and defense
+switch.
+
 Defense player entries retain the environment's base percentages internally,
 but offensive skill features are gated to zero in policy tokens for defense.
 
@@ -83,7 +90,7 @@ half the configured pressure arc, the angular factor is:
 a = \frac{c-c_{\min}}{1-c_{\min}}.
 \]
 
-For defender hex distance \(d\), its proposed reduction is:
+For defender hex distance \(d\), its geometric reduction is:
 
 \[
 \rho(d,a)=\rho_{\max}\exp\left[-\lambda(d-1)\right]a^2.
@@ -93,11 +100,23 @@ The code uses
 `shot_pressure_max` for \(\rho_{\max}\) and
 `shot_pressure_lambda` for \(\lambda\).
 
+When the shot-contest effect weight \(w_c\) is positive, eligible defender
+\(i\)'s reduction is adjusted in logit space using its sampled contest skill
+\(s_i\):
+
+\[
+\rho_i' = \sigma\left(\operatorname{logit}(\rho_i) + w_c s_i\right).
+\]
+
+The adjustment applies to each eligible defender before selecting the largest
+reduction. A zero effect weight preserves the geometric pressure calculation
+exactly.
+
 Only the largest valid defender reduction is used:
 
 \[
 m_{\text{pressure}} =
-\max\left(0,\,1-\max_i\rho_i\right).
+\max\left(0,\,1-\max_i\rho_i'\right).
 \]
 
 When shot pressure is disabled or no defender qualifies,
@@ -123,6 +142,21 @@ where \(v_{\text{shot}}\) is two or three. EP is always retained as a
 diagnostic. Whether it is also the task reward depends on rebound settings and
 the configured rebound terminal reward mode; see
 [Rewards and termination](rewards-termination.md).
+
+## Shot-contest configuration and inspection
+
+| Environment field | Training CLI flag | Meaning |
+|---|---|---|
+| `shot_contest_skill_mean` | `--shot-contest-skill-mean` | Mean of the per-player episode draw |
+| `shot_contest_skill_std` | `--shot-contest-skill-std` | Standard deviation of the independent per-player draw; must be non-negative |
+| `shot_contest_skill_effect_weight` | `--shot-contest-skill-effect-weight` | Non-negative logit-space weight \(w_c\); zero disables the skill effect |
+
+These values are stored in checkpoint configuration and logged to MLflow. The
+gameplay Environment tab exposes the three controls under **Shot Pressure** and
+shows each sampled value in the **Defensive Skills (Episode)** table under
+**Contest**. The Observation tab exposes `shot_contest_skill` when the current
+multi-possession observation schema includes episode-stable player skills.
+Evaluation player profiles use the key `shot_contest`.
 
 !!! note "Model boundary"
 

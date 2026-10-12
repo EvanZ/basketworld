@@ -82,9 +82,12 @@ players. Tokens are ordered by player ID: offense first, then defense.
 | Default | 18 | 7 | `(P × 18) + 7 + 1` |
 | Skill-only rebound observations (`--no-rebound-target-observation-features`) | 16 | 4 | `(P × 16) + 4 + 1` |
 | `--rebound-win-prob-features` | 19 | 8 | `(P × 19) + 8 + 1` |
+| Multi-possession | 25 | 12 | `(P × 25) + 12 + 1` |
 
 For 5-on-5, these dimensions are 188 by default, 165 in skill-only mode, and
-199 with the optional rebound probability features.
+199 with the optional rebound probability features. The multi-possession
+schema is 263 by default for 5-on-5. It appends seven player features and five
+global features to the selected rebound-feature schema.
 
 `--rebound-target-observation-features` defaults to enabled; disable it for the
 skill-only ablation. It removes all target-derived policy inputs and the
@@ -122,6 +125,26 @@ Every player token uses this exact order:
 Shooting and passing features are deliberately zeroed on defensive rows.
 Rebound skill and rebound probability apply to both teams.
 
+### Multi-possession player features
+
+The continuous-game schema appends these features to every player token, after
+the selected rebound features:
+
+| Feature | Range or normalization | Meaning |
+|---|---|---|
+| `is_inbounder` | 0 or 1 | Player assigned to execute the current inbound |
+| `on_court` | 0 or 1 | Player currently occupies a valid court cell |
+| `pressure_skill` | sampled scalar | Defensive live-ball pressure skill |
+| `steal_skill` | sampled scalar | Defensive pass-interception skill |
+| `ball_handling_skill` | sampled scalar | Offensive resistance to live-ball pressure |
+| `passing_skill` | sampled scalar | Offensive resistance to pass interception |
+| `shot_contest_skill` | sampled scalar | Defensive logit-space adjustment to eligible geometric shot pressure |
+
+The episode-stable skills remain attached to player identity when teams switch
+offense and defense. `shot_contest_skill` is also shown as **Contest** in the
+Environment tab's **Defensive Skills (Episode)** table and as its own column in
+the Observation tab.
+
 ### Global features
 
 The global vector uses this exact order:
@@ -136,6 +159,11 @@ The global vector uses this exact order:
 | 5 | `expected_rebound_target_r` | expected `r / court_norm_den` | **Target-observation feature.** Mean target coordinate under the rebound table |
 | 6 | `rebound_target_entropy` | entropy / `log(number_of_cells)` | **Target-observation feature.** Uncertainty of the rebound-target distribution |
 | 7 | `offensive_rebound_probability` | probability | **Optional.** Conditional probability any offensive player wins the rebound if the current holder misses now |
+
+The multi-possession schema then appends `relative_score`,
+`possessions_remaining_norm`, `clearance_required`, `restart_phase`, and
+`restart_countdown_norm`. These begin at index 7 without the optional rebound
+probability feature, or index 8 with it.
 
 ### Observer-role flag
 
@@ -196,6 +224,9 @@ selector.
 Its default dimension is `5N² + 19N + 10`. Disabling rebound-target
 observations removes `4N + 3` values, producing `5N² + 15N + 7`. Enabling
 `--rebound-win-prob-features` adds `2N + 1` values to either schema.
+Multi-possession observations additionally append `14N + 5` values: two
+status features per player, five globals, four previously defined latent
+skills per player, and the per-player shot-contest skill.
 
 | Order | Feature group | Width |
 |---:|---|---:|
@@ -220,8 +251,12 @@ observations removes `4N + 3` values, producing `5N² + 15N + 7`. Enabling
 | 19 | **Target-observation feature:** expected rebound target `q`, `r`, and entropy | 3 |
 | 20 | **Optional:** per-player rebound-win probability | `2N` |
 | 21 | **Optional:** offensive-rebound probability | 1 |
-| 22 | Observer-role flag | 1 |
-| 23 | Offensive layup, three-point, and dunk deltas from base skill | `3N` |
+| 22 | **Multi-possession:** per-player inbounder and on-court status | `4N` |
+| 23 | **Multi-possession:** relative score, possessions remaining, clearance, restart phase, and restart countdown | 5 |
+| 24 | **Multi-possession:** per-player pressure, steal, ball-handling, and passing skills | `8N` |
+| 25 | **Multi-possession:** per-player shot-contest skill | `2N` |
+| 26 | Observer-role flag | 1 |
+| 27 | Offensive layup, three-point, and dunk deltas from base skill | `3N` |
 
 Unlike player token feature 7, the flat lane-counter group contains the raw
 active counters rather than values divided by the configured maximum.
@@ -234,3 +269,8 @@ The selected schema is persisted as `rebound_win_prob_features` and
 in MLflow. Training, deploy evaluation, checkpoint inference, and the web
 application Observation tab reconstruct the schema from the saved policy
 specification.
+
+Multi-possession schema version 4 adds `shot_contest_skill` after the four
+existing latent player skills. Supported schema-version migrations pad the new
+policy input with zeros so older compatible checkpoints preserve their prior
+behavior.

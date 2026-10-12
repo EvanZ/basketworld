@@ -35,7 +35,8 @@ values that change every step.
 `KernelState`
 : Player positions, ball holder, shot clock, step count, terminal flag,
   pressure exposure, lane counters, scores, assist state, intent state,
-  per-episode shooting and rebound skills, and rebound reward bookkeeping.
+  per-episode shooting, pressure, shot-contest, steal, ball-handling, passing,
+  and rebound skills, and rebound reward bookkeeping.
 
 Every state field is batched. If `kernel_batch_size = B`, positions have shape
 `(B, 2N, 2)`, the ball holder has shape `(B,)`, and so on. Static tables have
@@ -62,10 +63,11 @@ A reset samples or constructs:
 
 1. a shot clock between `min_shot_clock` and `shot_clock`;
 2. per-offense-player layup, three-point, and dunk percentages;
-3. per-player rebound skills;
-4. legal offense positions and matched defense positions;
-5. an offensive ball holder;
-6. optional offensive and defensive intent state.
+3. per-player pressure, shot-contest, steal, ball-handling, and passing skills;
+4. per-player rebound skills;
+5. legal offense positions and matched defense positions;
+6. an offensive ball holder;
+7. optional offensive and defensive intent state.
 
 When start templates are enabled and selected, the template replaces the
 random positions, ball holder, and optionally the shot clock. Player-to-template
