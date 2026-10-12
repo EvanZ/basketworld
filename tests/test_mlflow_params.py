@@ -62,6 +62,25 @@ def test_get_mlflow_params_includes_set_obs_and_mirror_settings():
     assert optional["mirror_episode_prob"] == 0.35
 
 
+def test_get_mlflow_params_includes_shot_contest_skill_settings():
+    client = _FakeClient(
+        {
+            "grid_size": "16",
+            "players": "3",
+            "shot_clock": "24",
+            "shot_contest_skill_mean": "-0.2",
+            "shot-contest-skill-std": "0.7",
+            "shot_contest_skill_effect_weight": "1.3",
+        }
+    )
+
+    _, optional = get_mlflow_params(client, "dummy")
+
+    assert optional["shot_contest_skill_mean"] == -0.2
+    assert optional["shot_contest_skill_std"] == 0.7
+    assert optional["shot_contest_skill_effect_weight"] == 1.3
+
+
 def test_get_mlflow_training_params_includes_disc_eval_batch_output():
     client = _FakeClient(
         {

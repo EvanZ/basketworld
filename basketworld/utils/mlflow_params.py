@@ -133,6 +133,27 @@ def get_mlflow_params(
     optional["shot_pressure_arc_degrees"] = _get_param(
         params, ["shot_pressure_arc_degrees", "shot-pressure-arc-degrees"], float, 60.0
     )
+    optional["shot_contest_skill_mean"] = _get_param(
+        params,
+        ["shot_contest_skill_mean", "shot-contest-skill-mean"],
+        float,
+        0.0,
+    )
+    optional["shot_contest_skill_std"] = _get_param(
+        params,
+        ["shot_contest_skill_std", "shot-contest-skill-std"],
+        float,
+        0.0,
+    )
+    optional["shot_contest_skill_effect_weight"] = _get_param(
+        params,
+        [
+            "shot_contest_skill_effect_weight",
+            "shot-contest-skill-effect-weight",
+        ],
+        float,
+        0.0,
+    )
     optional["defender_pressure_distance"] = _get_param(
         params, ["defender_pressure_distance", "defender-pressure-distance"], int, 1
     )

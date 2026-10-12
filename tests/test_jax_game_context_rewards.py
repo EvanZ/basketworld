@@ -540,7 +540,7 @@ def test_game_context_observations_are_team_relative_and_cover_inbound_final_sta
 
 
 def test_multi_possession_observation_schema_and_cli_reject_incompatible_configs():
-    assert token_observation_dims(False, True, True) == (24, 12)
+    assert token_observation_dims(False, True, True) == (25, 12)
     args = parse_args(["--enable-multi-possession"])
     assert args.multi_possession_reward_mode == "win_loss"
     assert args.score_potential_scale == pytest.approx(1.0)
@@ -617,13 +617,25 @@ def test_multi_possession_observation_schema_and_cli_reject_incompatible_configs
         role_encoding=jnp.zeros((2,), dtype=jnp.float32),
         offense_ids=jnp.zeros((1,), dtype=jnp.int32),
     )
-    current = jnp.arange(35, dtype=jnp.float32)[None, :]
+    current = jnp.arange(37, dtype=jnp.float32)[None, :]
     adapted = np.asarray(
         _adapt_policy_observation_to_spec(current, static, v2_spec, jnp)
     )
     np.testing.assert_allclose(
         adapted,
-        np.concatenate([np.arange(23), np.arange(31, 35)])[None, :],
+        np.concatenate([np.arange(23), np.arange(33, 37)])[None, :],
+    )
+    v3_spec = replace(
+        spec,
+        flat_obs_dim=35,
+        observation_schema_version=3,
+    )
+    adapted_v3 = np.asarray(
+        _adapt_policy_observation_to_spec(current, static, v3_spec, jnp)
+    )
+    np.testing.assert_allclose(
+        adapted_v3,
+        np.concatenate([np.arange(31), np.arange(33, 37)])[None, :],
     )
     legacy = replace(
         spec, multi_possession_features=False, observation_schema_version=1
@@ -631,31 +643,41 @@ def test_multi_possession_observation_schema_and_cli_reject_incompatible_configs
     assert legacy != spec
 
 
-def test_native_cross_play_accepts_only_known_v2_v3_observation_width_change():
-    v3 = ActorCriticSpec(
-        flat_obs_dim=253,
+def test_native_cross_play_accepts_known_additive_observation_width_changes():
+    v4 = ActorCriticSpec(
+        flat_obs_dim=263,
         training_player_count=5,
         action_dim_per_player=14,
         total_action_dim=70,
         hidden_dims=(64,),
         model_type="attention",
         token_player_count=10,
-        token_dim=24,
+        token_dim=25,
         global_dim=12,
         multi_possession_features=True,
-        observation_schema_version=3,
+        observation_schema_version=4,
     )
     v2 = replace(
-        v3,
+        v4,
         flat_obs_dim=213,
         token_dim=20,
         observation_schema_version=2,
     )
+    v3 = replace(
+        v4,
+        flat_obs_dim=253,
+        token_dim=24,
+        observation_schema_version=3,
+    )
 
+    assert _compatible_native_cross_play_specs(v4, v2)
+    assert _compatible_native_cross_play_specs(v2, v4)
+    assert _compatible_native_cross_play_specs(v4, v3)
+    assert _compatible_native_cross_play_specs(v3, v4)
     assert _compatible_native_cross_play_specs(v3, v2)
     assert _compatible_native_cross_play_specs(v2, v3)
     assert not _compatible_native_cross_play_specs(
-        v3,
+        v4,
         replace(v2, action_dim_per_player=13),
     )
 

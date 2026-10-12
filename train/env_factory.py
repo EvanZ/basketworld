@@ -38,9 +38,14 @@ def setup_environment(args, training_team, env_idx=None):
         defender_pressure_decay_lambda=getattr(args, "defender_pressure_decay_lambda", 1.0),
         pressure_skill_mean=getattr(args, "pressure_skill_mean", 0.0),
         pressure_skill_std=getattr(args, "pressure_skill_std", 0.0),
+        shot_contest_skill_mean=getattr(args, "shot_contest_skill_mean", 0.0),
+        shot_contest_skill_std=getattr(args, "shot_contest_skill_std", 0.0),
         ball_handling_skill_mean=getattr(args, "ball_handling_skill_mean", 0.0),
         ball_handling_skill_std=getattr(args, "ball_handling_skill_std", 0.0),
         pressure_skill_effect_weight=getattr(args, "pressure_skill_effect_weight", 0.0),
+        shot_contest_skill_effect_weight=getattr(
+            args, "shot_contest_skill_effect_weight", 0.0
+        ),
         base_steal_rate=getattr(args, "base_steal_rate", 0.35),
         steal_perp_decay=getattr(args, "steal_perp_decay", 1.5),
         steal_distance_factor=getattr(args, "steal_distance_factor", 0.08),

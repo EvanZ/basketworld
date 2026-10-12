@@ -210,6 +210,7 @@ def test_native_custom_setup_freezes_every_skill_for_every_player():
             "dunk": 0.40 + player_id * 0.01,
             "rebound": -0.30 + player_id * 0.10,
             "pressure": -0.20 + player_id * 0.10,
+            "shot_contest": -0.15 + player_id * 0.10,
             "steal": -0.10 + player_id * 0.10,
             "ball_handling": player_id * 0.10,
             "passing": 0.10 + player_id * 0.10,

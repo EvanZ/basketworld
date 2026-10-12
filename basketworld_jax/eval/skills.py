@@ -271,6 +271,22 @@ ACTIVE_PLAYER_SKILL_REGISTRY = PlayerSkillRegistry(
             runtime_field="pressure_skill",
         ),
         PlayerSkillDescriptor(
+            key="shot_contest",
+            display_label="Shot Contest",
+            numeric_type="float",
+            minimum=None,
+            maximum=None,
+            sampling_distribution="normal",
+            sampling_defaults=_sampling_defaults(
+                default_mean=0.0,
+                default_std=0.0,
+                mean_field="shot_contest_skill_mean",
+                std_field="shot_contest_skill_std",
+            ),
+            semantic_group="defense",
+            runtime_field="shot_contest_skill",
+        ),
+        PlayerSkillDescriptor(
             key="steal",
             display_label="Steal",
             numeric_type="float",

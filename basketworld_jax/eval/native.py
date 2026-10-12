@@ -105,7 +105,7 @@ def _compatible_native_cross_play_specs(
     first: ActorCriticSpec,
     second: ActorCriticSpec,
 ) -> bool:
-    """Allow the intentional v2/v3 observation-width difference only."""
+    """Allow intentional multi-possession skill-schema width differences."""
     if first == second:
         return True
     first_schema = int(getattr(first, "observation_schema_version", 1))
@@ -113,7 +113,8 @@ def _compatible_native_cross_play_specs(
     if (
         not bool(getattr(first, "multi_possession_features", False))
         or not bool(getattr(second, "multi_possession_features", False))
-        or {first_schema, second_schema} != {2, int(MULTI_POSSESSION_SCHEMA_VERSION)}
+        or first_schema not in {2, 3, int(MULTI_POSSESSION_SCHEMA_VERSION)}
+        or second_schema not in {2, 3, int(MULTI_POSSESSION_SCHEMA_VERSION)}
     ):
         return False
     first_fields = dict(vars(first))
@@ -123,7 +124,7 @@ def _compatible_native_cross_play_specs(
         second_fields.pop(key, None)
     if first_fields != second_fields:
         return False
-    newer = first if first_schema == int(MULTI_POSSESSION_SCHEMA_VERSION) else second
+    newer = first if first_schema > second_schema else second
     older = second if newer is first else first
     is_attention = str(getattr(newer, "model_type", "mlp")) == "attention"
     player_count = (
@@ -131,13 +132,20 @@ def _compatible_native_cross_play_specs(
         if is_attention
         else 2 * int(getattr(newer, "training_player_count", 0))
     )
+    episode_skill_width = {2: 0, 3: 4, int(MULTI_POSSESSION_SCHEMA_VERSION): 5}
+    newer_schema = first_schema if newer is first else second_schema
+    older_schema = first_schema if older is first else second_schema
+    added_skill_count = (
+        episode_skill_width[newer_schema] - episode_skill_width[older_schema]
+    )
     token_width_matches = (
-        int(newer.token_dim) == int(older.token_dim) + 4
+        int(newer.token_dim) == int(older.token_dim) + added_skill_count
         if is_attention
         else int(newer.token_dim) == int(older.token_dim)
     )
     return token_width_matches and (
-        int(newer.flat_obs_dim) == int(older.flat_obs_dim) + (4 * player_count)
+        int(newer.flat_obs_dim)
+        == int(older.flat_obs_dim) + (added_skill_count * player_count)
     )
 
 
@@ -451,20 +459,22 @@ def _adapt_policy_observation_to_spec(flat_obs, static, spec: ActorCriticSpec, j
             f"Policy observation dim {current_dim} is smaller than checkpoint dim {expected_dim}."
         )
 
-    # Flat obs legacy compatibility for additive per-player rebound features
-    # inserted immediately before rebound globals, role flag, and offense skill deltas.
+    # Additive episode-skill schemas place their new MLP feature block
+    # immediately before the role flag and offense shooting-skill deltas.
     n_players = int(static.role_encoding.shape[0])
     offense_count = int(static.offense_ids.shape[0])
     schema_version = int(getattr(spec, "observation_schema_version", 1))
+    added_player_features = {2: 5, 3: 1}.get(schema_version)
     if (
         bool(getattr(spec, "multi_possession_features", False))
-        and schema_version == 2
-        and current_dim - expected_dim == (4 * n_players)
+        and added_player_features is not None
+        and current_dim - expected_dim == (added_player_features * n_players)
     ):
         tail_dim = 1 + (3 * offense_count)
-        remove_start = current_dim - tail_dim - (4 * n_players)
+        remove_width = added_player_features * n_players
+        remove_start = current_dim - tail_dim - remove_width
         return jnp.concatenate(
-            [flat_obs[:, :remove_start], flat_obs[:, remove_start + (4 * n_players) :]],
+            [flat_obs[:, :remove_start], flat_obs[:, remove_start + remove_width :]],
             axis=1,
         ).astype(jnp.float32)
 
@@ -2957,7 +2967,7 @@ def run_native_jax_evaluation(
             raise ValueError(
                 "JAX opponent checkpoint policy_spec is not cross-play compatible "
                 "with the unified checkpoint. Only identical specs or the known "
-                "multi-possession schema-v2/schema-v3 observation-width change "
+                "additive multi-possession observation-schema width changes "
                 "are supported."
             )
     else:
@@ -3047,7 +3057,7 @@ def run_native_jax_evaluation(
             dtype=np.int32,
         ).reshape(-1)[0]
     )
-    compatible_checkpoint_schemas = {2, int(MULTI_POSSESSION_SCHEMA_VERSION)}
+    compatible_checkpoint_schemas = {2, 3, int(MULTI_POSSESSION_SCHEMA_VERSION)}
     if static_multi and (
         not checkpoint_schema_versions.issubset(compatible_checkpoint_schemas)
         or environment_schema_version != int(MULTI_POSSESSION_SCHEMA_VERSION)

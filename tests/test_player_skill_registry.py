@@ -17,6 +17,7 @@ def _valid_profile() -> dict[str, float]:
         "dunk": 0.90,
         "rebound": 0.10,
         "pressure": -0.20,
+        "shot_contest": 0.35,
         "steal": 0.15,
         "ball_handling": 0.25,
         "passing": -0.05,

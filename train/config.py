@@ -347,6 +347,8 @@ def get_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--pressure-skill-mean", type=float, default=0.0, help="Mean episode-stable defender pressure skill.")
     parser.add_argument("--pressure-skill-std", type=float, default=0.0, help="Stddev of episode-stable defender pressure skill.")
+    parser.add_argument("--shot-contest-skill-mean", type=float, default=0.0, help="Mean episode-stable defensive shot-contest skill.")
+    parser.add_argument("--shot-contest-skill-std", type=float, default=0.0, help="Stddev of episode-stable defensive shot-contest skill.")
     parser.add_argument("--ball-handling-skill-mean", type=float, default=0.0, help="Mean episode-stable offensive ball-handling skill.")
     parser.add_argument("--ball-handling-skill-std", type=float, default=0.0, help="Stddev of episode-stable offensive ball-handling skill.")
     parser.add_argument(
@@ -354,6 +356,12 @@ def get_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Logit-space weight on pressure skill minus ball-handling skill. Zero preserves legacy pressure probabilities.",
+    )
+    parser.add_argument(
+        "--shot-contest-skill-effect-weight",
+        type=float,
+        default=0.0,
+        help="Logit-space weight applied to each eligible defender's geometric shot-contest reduction. Zero preserves legacy shot pressure exactly.",
     )
     parser.add_argument(
         "--tensorboard-path",

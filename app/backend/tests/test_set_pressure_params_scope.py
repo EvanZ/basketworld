@@ -16,6 +16,9 @@ ALL_PARAM_KEYS = [
     "shot_pressure_max",
     "shot_pressure_lambda",
     "shot_pressure_arc_degrees",
+    "shot_contest_skill_mean",
+    "shot_contest_skill_std",
+    "shot_contest_skill_effect_weight",
     "base_steal_rate",
     "steal_perp_decay",
     "steal_distance_factor",
@@ -80,6 +83,9 @@ class DummyPressureEnv:
     shot_pressure_max: float = 0.91
     shot_pressure_lambda: float = 9.0
     shot_pressure_arc_degrees: float = 111.0
+    shot_contest_skill_mean: float = 0.4
+    shot_contest_skill_std: float = 0.5
+    shot_contest_skill_effect_weight: float = 0.6
     base_steal_rate: float = 0.81
     steal_perp_decay: float = 8.0
     steal_distance_factor: float = 0.71
@@ -144,6 +150,9 @@ class TestSetPressureParamsScope(unittest.TestCase):
             "shot_pressure_max": 0.25,
             "shot_pressure_lambda": 1.0,
             "shot_pressure_arc_degrees": 300.0,
+            "shot_contest_skill_mean": 0.0,
+            "shot_contest_skill_std": 0.25,
+            "shot_contest_skill_effect_weight": 1.0,
             "base_steal_rate": 0.3,
             "steal_perp_decay": 1.5,
             "steal_distance_factor": 0.2,
@@ -303,14 +312,28 @@ class TestSetPressureParamsScope(unittest.TestCase):
         response = admin_routes.set_shot_pressure_params(
             SetPressureParamsRequest(
                 shot_pressure_max=0.33,
+                shot_contest_skill_mean=-0.2,
+                shot_contest_skill_std=0.7,
+                shot_contest_skill_effect_weight=1.3,
                 base_steal_rate=0.77,  # should be ignored by shot route
             )
         )
 
         self.assertEqual(response["status"], "success")
         self.assertEqual(response["applied_scope"], "shot_pressure")
-        self.assertEqual(response["updated_keys"], ["shot_pressure_max"])
+        self.assertEqual(
+            response["updated_keys"],
+            [
+                "shot_contest_skill_effect_weight",
+                "shot_contest_skill_mean",
+                "shot_contest_skill_std",
+                "shot_pressure_max",
+            ],
+        )
         self.assertAlmostEqual(env.shot_pressure_max, 0.33)
+        self.assertAlmostEqual(env.shot_contest_skill_mean, -0.2)
+        self.assertAlmostEqual(env.shot_contest_skill_std, 0.7)
+        self.assertAlmostEqual(env.shot_contest_skill_effect_weight, 1.3)
         self.assertEqual(env.base_steal_rate, before["base_steal_rate"])
 
 

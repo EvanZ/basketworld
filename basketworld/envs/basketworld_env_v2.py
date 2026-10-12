@@ -101,9 +101,12 @@ class HexagonBasketballEnv(gym.Env):
         defender_pressure_decay_lambda: float = 1.0,  # Exponential decay rate for pressure
         pressure_skill_mean: float = 0.0,
         pressure_skill_std: float = 0.0,
+        shot_contest_skill_mean: float = 0.0,
+        shot_contest_skill_std: float = 0.0,
         ball_handling_skill_mean: float = 0.0,
         ball_handling_skill_std: float = 0.0,
         pressure_skill_effect_weight: float = 0.0,
+        shot_contest_skill_effect_weight: float = 0.0,
         # Realistic passing steal parameters
         base_steal_rate: float = 0.35,
         steal_perp_decay: float = 1.5,
@@ -255,9 +258,14 @@ class HexagonBasketballEnv(gym.Env):
         self.defender_pressure_decay_lambda = defender_pressure_decay_lambda
         self.pressure_skill_mean = float(pressure_skill_mean)
         self.pressure_skill_std = max(0.0, float(pressure_skill_std))
+        self.shot_contest_skill_mean = float(shot_contest_skill_mean)
+        self.shot_contest_skill_std = max(0.0, float(shot_contest_skill_std))
         self.ball_handling_skill_mean = float(ball_handling_skill_mean)
         self.ball_handling_skill_std = max(0.0, float(ball_handling_skill_std))
         self.pressure_skill_effect_weight = max(0.0, float(pressure_skill_effect_weight))
+        self.shot_contest_skill_effect_weight = max(
+            0.0, float(shot_contest_skill_effect_weight)
+        )
         # Realistic passing steal parameters
         self.base_steal_rate = base_steal_rate
         self.steal_perp_decay = steal_perp_decay
@@ -658,6 +666,9 @@ class HexagonBasketballEnv(gym.Env):
         self.offense_dunk_pct_by_player: List[float] = [
             float(self.dunk_pct)
         ] * self.players_per_side
+        self.shot_contest_skill_by_player: List[float] = [
+            float(self.shot_contest_skill_mean)
+        ] * self.n_players
 
     @staticmethod
     def _offset_to_axial_formula(col: int, row: int) -> Tuple[int, int]:
@@ -1153,6 +1164,25 @@ class HexagonBasketballEnv(gym.Env):
                 self.offense_dunk_pct_by_player[i] = _sample_prob(
                     self.dunk_pct, self.dunk_std
                 )
+
+        opt_contest_skills = options.get("shot_contest_skills") if options else None
+        if opt_contest_skills is not None:
+            values = list(opt_contest_skills)
+            if len(values) != self.n_players:
+                raise ValueError(
+                    f"shot_contest_skills must contain {self.n_players} values."
+                )
+            self.shot_contest_skill_by_player = [float(value) for value in values]
+        elif self.shot_contest_skill_std > 0.0:
+            self.shot_contest_skill_by_player = self._rng.normal(
+                loc=self.shot_contest_skill_mean,
+                scale=self.shot_contest_skill_std,
+                size=self.n_players,
+            ).astype(np.float32).tolist()
+        else:
+            self.shot_contest_skill_by_player = [
+                float(self.shot_contest_skill_mean)
+            ] * self.n_players
 
         # Initialize positions
         if opt_positions is not None:

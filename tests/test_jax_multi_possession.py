@@ -42,6 +42,7 @@ from basketworld_jax.env.minimal import (
     _select_technical_inbound_position_single,
     _prepare_check_positions_single,
     build_action_masks_batch,
+    build_flat_observation_batch_with_role_flag,
     build_kernel_static_from_env,
     build_opponent_role_flags_batch,
     build_pass_steal_contributions_batch,
@@ -1988,6 +1989,8 @@ def test_episode_player_skills_are_seeded_stable_and_appended_to_tokens():
         ball_handling_skill_std=jnp.asarray(0.9, dtype=jnp.float32),
         passing_skill_mean=jnp.asarray(0.4, dtype=jnp.float32),
         passing_skill_std=jnp.asarray(1.0, dtype=jnp.float32),
+        shot_contest_skill_mean=jnp.asarray(0.5, dtype=jnp.float32),
+        shot_contest_skill_std=jnp.asarray(1.1, dtype=jnp.float32),
     )
     keys = jax.random.split(jax.random.PRNGKey(131), 2)
     state = reset_batch_minimal(static, keys, jax, jnp)
@@ -1998,6 +2001,7 @@ def test_episode_player_skills_are_seeded_stable_and_appended_to_tokens():
         "steal_skill",
         "ball_handling_skill",
         "passing_skill",
+        "shot_contest_skill",
     ):
         np.testing.assert_array_equal(np.asarray(getattr(state, field)), np.asarray(getattr(repeated, field)))
         assert float(np.std(np.asarray(getattr(state, field)))) > 0.0
@@ -2009,13 +2013,26 @@ def test_episode_player_skills_are_seeded_stable_and_appended_to_tokens():
         jnp,
         multi_possession_features=True,
     )
-    assert token_observation_dims(False, True, True) == (24, 12)
-    assert players.shape[-1] == 24
+    assert token_observation_dims(False, True, True) == (25, 12)
+    assert players.shape[-1] == 25
     assert globals_vec.shape[-1] == 12
-    np.testing.assert_allclose(np.asarray(players)[..., -4], np.asarray(state.pressure_skill))
-    np.testing.assert_allclose(np.asarray(players)[..., -3], np.asarray(state.steal_skill))
-    np.testing.assert_allclose(np.asarray(players)[..., -2], np.asarray(state.ball_handling_skill))
-    np.testing.assert_allclose(np.asarray(players)[..., -1], np.asarray(state.passing_skill))
+    np.testing.assert_allclose(np.asarray(players)[..., -5], np.asarray(state.pressure_skill))
+    np.testing.assert_allclose(np.asarray(players)[..., -4], np.asarray(state.steal_skill))
+    np.testing.assert_allclose(np.asarray(players)[..., -3], np.asarray(state.ball_handling_skill))
+    np.testing.assert_allclose(np.asarray(players)[..., -2], np.asarray(state.passing_skill))
+    np.testing.assert_allclose(np.asarray(players)[..., -1], np.asarray(state.shot_contest_skill))
+    flat = build_flat_observation_batch_with_role_flag(
+        static,
+        state,
+        1.0,
+        jnp,
+        multi_possession_features=True,
+    )
+    tail_width = 1 + (3 * int(static.offense_ids.shape[0]))
+    np.testing.assert_allclose(
+        np.asarray(flat)[:, -(tail_width + state.positions.shape[1]) : -tail_width],
+        np.asarray(state.shot_contest_skill),
+    )
 
     stepped = step_batch_minimal(
         static,
@@ -2036,8 +2053,8 @@ def test_episode_player_skills_are_seeded_stable_and_appended_to_tokens():
         multi_possession_features=True,
     )
     for offset, field in zip(
-        (-4, -3, -2, -1),
-        ("pressure_skill", "steal_skill", "ball_handling_skill", "passing_skill"),
+        (-5, -4, -3, -2, -1),
+        ("pressure_skill", "steal_skill", "ball_handling_skill", "passing_skill", "shot_contest_skill"),
         strict=True,
     ):
         np.testing.assert_array_equal(

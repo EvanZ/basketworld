@@ -2969,6 +2969,7 @@ function buildCustomEvalSetup() {
       'dunk',
       'rebound',
       'pressure',
+      'shot_contest',
       'steal',
       'ball_handling',
       'passing',

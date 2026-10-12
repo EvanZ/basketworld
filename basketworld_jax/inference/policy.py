@@ -29,7 +29,7 @@ STATE_SUBDIR = "state"
 
 
 def _adapt_observation_to_checkpoint(flat_obs, static, spec, jnp):
-    """Adapt the current v3 multi-possession observation for v2 inference."""
+    """Adapt the current multi-possession observation for older inference."""
     expected_dim = int(spec.flat_obs_dim)
     current_dim = int(flat_obs.shape[-1])
     if current_dim == expected_dim:
@@ -40,10 +40,11 @@ def _adapt_observation_to_checkpoint(flat_obs, static, spec, jnp):
         )
     n_players = int(static.role_encoding.shape[0])
     schema_version = int(getattr(spec, "observation_schema_version", 1))
+    added_player_features = {2: 5, 3: 1}.get(schema_version)
     if not (
         bool(getattr(spec, "multi_possession_features", False))
-        and schema_version == 2
-        and current_dim - expected_dim == (4 * n_players)
+        and added_player_features is not None
+        and current_dim - expected_dim == (added_player_features * n_players)
     ):
         raise ValueError(
             "Policy observation does not match a supported checkpoint schema "
@@ -51,7 +52,7 @@ def _adapt_observation_to_checkpoint(flat_obs, static, spec, jnp):
         )
     if str(spec.model_type) == "attention":
         token_count = int(spec.token_player_count)
-        current_token_dim = int(spec.token_dim) + 4
+        current_token_dim = int(spec.token_dim) + added_player_features
         players = flat_obs[:, : token_count * current_token_dim].reshape(
             flat_obs.shape[0], token_count, current_token_dim
         )[:, :, : int(spec.token_dim)]
@@ -62,9 +63,10 @@ def _adapt_observation_to_checkpoint(flat_obs, static, spec, jnp):
         ).astype(jnp.float32)
     offense_count = int(static.offense_ids.shape[0])
     tail_dim = 1 + (3 * offense_count)
-    remove_start = current_dim - tail_dim - (4 * n_players)
+    remove_width = added_player_features * n_players
+    remove_start = current_dim - tail_dim - remove_width
     return jnp.concatenate(
-        [flat_obs[:, :remove_start], flat_obs[:, remove_start + (4 * n_players) :]],
+        [flat_obs[:, :remove_start], flat_obs[:, remove_start + remove_width :]],
         axis=1,
     ).astype(jnp.float32)
 
@@ -196,6 +198,7 @@ class JAXInferenceModel:
             "steal_skill",
             "ball_handling_skill",
             "passing_skill",
+            "shot_contest_skill",
         )
         scalar_keys = (
             "ball_holder",
@@ -332,6 +335,7 @@ class JAXInferenceModel:
                     "steal_skill",
                     "ball_handling_skill",
                     "passing_skill",
+                    "shot_contest_skill",
                 ]
             )
         global_labels = ["shot_clock_norm", "pressure_exposure", "hoop_q_norm", "hoop_r_norm"]

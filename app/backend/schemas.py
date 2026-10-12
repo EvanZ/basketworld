@@ -258,6 +258,9 @@ class SetPressureParamsRequest(BaseModel):
     shot_pressure_max: float | None = None
     shot_pressure_lambda: float | None = None
     shot_pressure_arc_degrees: float | None = None
+    shot_contest_skill_mean: float | None = None
+    shot_contest_skill_std: float | None = None
+    shot_contest_skill_effect_weight: float | None = None
     # Pass interception
     base_steal_rate: float | None = None
     steal_perp_decay: float | None = None

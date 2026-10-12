@@ -84,6 +84,10 @@ function buildSkillRows(ids, skillSet) {
     layup: skillSet.layup[idx] ?? null,
     threePt: skillSet.three_pt[idx] ?? null,
     dunk: skillSet.dunk[idx] ?? null,
+    shotContest: asNumber(
+      props.gameState?.player_episode_skills?.[String(playerId)]?.shot_contest
+        ?? props.gameState?.player_episode_skills?.[playerId]?.shot_contest,
+    ),
   }));
 }
 
@@ -171,7 +175,7 @@ const usesLobAwarePassModel = computed(() => passInterceptionModel.value === 'lo
 
     <div v-else class="env-grid">
       <article class="env-card env-card-wide">
-        <h4>Sampled Shooting Skills (Game Start)</h4>
+        <h4>Sampled Player Skills (Game Start)</h4>
         <div class="skills-grid">
           <div class="skill-team">
             <h5>You (Blue)</h5>
@@ -181,6 +185,7 @@ const usesLobAwarePassModel = computed(() => passInterceptionModel.value === 'lo
                 <span>Layup</span>
                 <span>3PT</span>
                 <span>Dunk</span>
+                <span>Contest</span>
               </div>
               <div
                 v-for="row in userSkillRows"
@@ -191,6 +196,7 @@ const usesLobAwarePassModel = computed(() => passInterceptionModel.value === 'lo
                 <span>{{ formatPercent(row.layup) }}</span>
                 <span>{{ formatPercent(row.threePt) }}</span>
                 <span>{{ formatPercent(row.dunk) }}</span>
+                <span>{{ formatValue(row.shotContest) }}</span>
               </div>
             </div>
           </div>
@@ -203,6 +209,7 @@ const usesLobAwarePassModel = computed(() => passInterceptionModel.value === 'lo
                 <span>Layup</span>
                 <span>3PT</span>
                 <span>Dunk</span>
+                <span>Contest</span>
               </div>
               <div
                 v-for="row in aiSkillRows"
@@ -213,6 +220,7 @@ const usesLobAwarePassModel = computed(() => passInterceptionModel.value === 'lo
                 <span>{{ formatPercent(row.layup) }}</span>
                 <span>{{ formatPercent(row.threePt) }}</span>
                 <span>{{ formatPercent(row.dunk) }}</span>
+                <span>{{ formatValue(row.shotContest) }}</span>
               </div>
             </div>
           </div>
@@ -293,6 +301,9 @@ const usesLobAwarePassModel = computed(() => passInterceptionModel.value === 'lo
         <div class="param-row"><span>Max pressure</span><strong>{{ formatPercent(gameState.shot_pressure_max, 2) }}</strong></div>
         <div class="param-row"><span>Pressure lambda</span><strong>{{ formatValue(gameState.shot_pressure_lambda) }}</strong></div>
         <div class="param-row"><span>Pressure arc degrees</span><strong>{{ formatValue(gameState.shot_pressure_arc_degrees) }}°</strong></div>
+        <div class="param-row"><span>Contest skill mean</span><strong>{{ formatValue(gameState.shot_contest_skill_mean) }}</strong></div>
+        <div class="param-row"><span>Contest skill std</span><strong>{{ formatValue(gameState.shot_contest_skill_std) }}</strong></div>
+        <div class="param-row"><span>Contest effect weight</span><strong>{{ formatValue(gameState.shot_contest_skill_effect_weight) }}</strong></div>
       </article>
 
       <article class="env-card">
@@ -483,7 +494,7 @@ const usesLobAwarePassModel = computed(() => passInterceptionModel.value === 'lo
 
 .skill-row {
   display: grid;
-  grid-template-columns: 72px repeat(3, 1fr);
+  grid-template-columns: 72px repeat(4, 1fr);
   gap: 0.35rem;
   align-items: center;
   padding: 0.33rem 0.45rem;

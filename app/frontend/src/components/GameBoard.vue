@@ -392,6 +392,9 @@ function playerSkillGauges(player) {
   const reboundGauge = Number.isFinite(Number(reboundSkill))
     ? [{ key: 'rebound', label: 'R', value: normalizedLatentSkill(reboundSkill) }]
     : [];
+  const contestGauge = Number.isFinite(Number(raw.shot_contest))
+    ? [{ key: 'shot-contest', label: 'C', value: normalizedLatentSkill(raw.shot_contest) }]
+    : [];
   if (player.isOffense) {
     const shooting = metadata.player_shooting_skills?.[String(player.id)]
       ?? metadata.player_shooting_skills?.[player.id]
@@ -407,6 +410,7 @@ function playerSkillGauges(player) {
   }
   return [
     { key: 'pressure', label: 'P', value: normalizedLatentSkill(raw.pressure) },
+    ...contestGauge,
     { key: 'steal', label: 'S', value: normalizedLatentSkill(raw.steal) },
     ...reboundGauge,
   ];

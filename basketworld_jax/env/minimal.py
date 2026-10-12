@@ -29,7 +29,7 @@ TOKEN_OBS_REBOUND_WIN_PROB_PLAYER_DIM = 1
 TOKEN_OBS_REBOUND_WIN_PROB_GLOBAL_DIM = 1
 TOKEN_OBS_REBOUND_TARGET_PLAYER_DIM = 2
 TOKEN_OBS_REBOUND_TARGET_GLOBAL_DIM = 3
-TOKEN_OBS_MULTI_POSSESSION_PLAYER_DIM = 6
+TOKEN_OBS_MULTI_POSSESSION_PLAYER_DIM = 7
 TOKEN_OBS_MULTI_POSSESSION_GLOBAL_DIM = 5
 
 
@@ -92,6 +92,7 @@ def token_observation_labels(
                 "steal_skill",
                 "ball_handling_skill",
                 "passing_skill",
+                "shot_contest_skill",
             )
         )
 
@@ -170,7 +171,7 @@ MULTI_POSSESSION_REWARD_MODE_IDS = {
     "point_differential": MULTI_POSSESSION_REWARD_POINT_DIFFERENTIAL,
     "scoring_events": MULTI_POSSESSION_REWARD_SCORING_EVENTS,
 }
-MULTI_POSSESSION_SCHEMA_VERSION = 3
+MULTI_POSSESSION_SCHEMA_VERSION = 4
 MADE_BASKET_RESTART_BASELINE_INBOUND = 0
 MADE_BASKET_RESTART_CHECK = 1
 MADE_BASKET_RESTART_DIRECT_HANDOFF = 2
@@ -281,9 +282,12 @@ class KernelStatic(NamedTuple):
     defender_pressure_decay_lambda: Any
     pressure_skill_mean: Any
     pressure_skill_std: Any
+    shot_contest_skill_mean: Any
+    shot_contest_skill_std: Any
     ball_handling_skill_mean: Any
     ball_handling_skill_std: Any
     pressure_skill_effect_weight: Any
+    shot_contest_skill_effect_weight: Any
     base_steal_rate: Any
     steal_perp_decay: Any
     steal_distance_factor: Any
@@ -427,6 +431,7 @@ class KernelState(NamedTuple):
     steal_skill: Any
     ball_handling_skill: Any
     passing_skill: Any
+    shot_contest_skill: Any
     rebound_reward_advance_paid: Any
     # Team A/B are stable roster identities.  Offense is dynamic per
     # possession, so it deliberately does not reuse the legacy static role
@@ -735,6 +740,11 @@ def snapshot_state_from_env(env) -> dict[str, np.ndarray | int]:
     steal_skill = _player_episode_skill_array(env, "steal_skill", getattr(env, "steal_skill_mean", 0.0))
     ball_handling_skill = _player_episode_skill_array(env, "ball_handling_skill", getattr(env, "ball_handling_skill_mean", 0.0))
     passing_skill = _player_episode_skill_array(env, "passing_skill", getattr(env, "passing_skill_mean", 0.0))
+    shot_contest_skill = _player_episode_skill_array(
+        env,
+        "shot_contest_skill",
+        getattr(env, "shot_contest_skill_mean", 0.0),
+    )
     offense_lane_steps, defense_lane_steps = _lane_step_arrays(env)
     assist_candidate = getattr(env, "_assist_candidate", None)
     episode_possession_limit = max(
@@ -789,6 +799,7 @@ def snapshot_state_from_env(env) -> dict[str, np.ndarray | int]:
         "steal_skill": steal_skill,
         "ball_handling_skill": ball_handling_skill,
         "passing_skill": passing_skill,
+        "shot_contest_skill": shot_contest_skill,
         "offense_team": TEAM_A,
         "starting_offense_team": TEAM_A,
         "team_a_completed_possessions": 0,
@@ -980,6 +991,10 @@ def stack_state_snapshots(
         ),
         passing_skill=xp.asarray(
             np.stack([np.asarray(item.get("passing_skill", np.zeros_like(item["dunk_pct"])), dtype=np.float32) for item in snapshots], axis=0),
+            dtype=xp.float32,
+        ),
+        shot_contest_skill=xp.asarray(
+            np.stack([np.asarray(item.get("shot_contest_skill", np.zeros_like(item["dunk_pct"])), dtype=np.float32) for item in snapshots], axis=0),
             dtype=xp.float32,
         ),
         rebound_reward_advance_paid=xp.asarray(
@@ -1533,9 +1548,12 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
         defender_pressure_decay_lambda=xp.asarray(float(env.defender_pressure_decay_lambda), dtype=xp.float32),
         pressure_skill_mean=xp.asarray(float(getattr(env, "pressure_skill_mean", 0.0)), dtype=xp.float32),
         pressure_skill_std=xp.asarray(max(0.0, float(getattr(env, "pressure_skill_std", 0.0))), dtype=xp.float32),
+        shot_contest_skill_mean=xp.asarray(float(getattr(env, "shot_contest_skill_mean", 0.0)), dtype=xp.float32),
+        shot_contest_skill_std=xp.asarray(max(0.0, float(getattr(env, "shot_contest_skill_std", 0.0))), dtype=xp.float32),
         ball_handling_skill_mean=xp.asarray(float(getattr(env, "ball_handling_skill_mean", 0.0)), dtype=xp.float32),
         ball_handling_skill_std=xp.asarray(max(0.0, float(getattr(env, "ball_handling_skill_std", 0.0))), dtype=xp.float32),
         pressure_skill_effect_weight=xp.asarray(max(0.0, float(getattr(env, "pressure_skill_effect_weight", 0.0))), dtype=xp.float32),
+        shot_contest_skill_effect_weight=xp.asarray(max(0.0, float(getattr(env, "shot_contest_skill_effect_weight", 0.0))), dtype=xp.float32),
         base_steal_rate=xp.asarray(float(env.base_steal_rate), dtype=xp.float32),
         steal_perp_decay=xp.asarray(float(env.steal_perp_decay), dtype=xp.float32),
         steal_distance_factor=xp.asarray(float(env.steal_distance_factor), dtype=xp.float32),
@@ -2370,6 +2388,18 @@ def build_shot_profile_batch(static: KernelStatic, state: KernelState, jnp):
         -static.shot_pressure_lambda * (defender_distance - 1.0)
     )
     pressure_reduction = distance_reduction * (angle_factor**2)
+    contest_adjusted_reduction = _skill_adjust_probability(
+        pressure_reduction,
+        state.shot_contest_skill[:, None, :],
+        static.shot_contest_skill_effect_weight,
+        jnp,
+    )
+    pressure_reduction = jnp.where(
+        (static.shot_contest_skill_effect_weight == 0.0)
+        | (pressure_reduction <= 0.0),
+        pressure_reduction,
+        contest_adjusted_reduction,
+    )
     masked_reduction = jnp.where(
         valid_defender,
         pressure_reduction,
@@ -3530,6 +3560,7 @@ def build_flat_observation_batch_with_role_flag(
                 multi_players.reshape(batch_size, -1),
                 multi_globals,
                 episode_skills.reshape(batch_size, -1),
+                state.shot_contest_skill.astype(jnp.float32),
             ]
         )
     parts.extend(
@@ -3746,6 +3777,7 @@ def build_token_observation_components_batch(
                 state.steal_skill,
                 state.ball_handling_skill,
                 state.passing_skill,
+                state.shot_contest_skill,
             ],
             axis=-1,
         ).astype(jnp.float32)
@@ -7059,6 +7091,7 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
     steal_skill_key = jax.random.fold_in(key, 102)
     ball_handling_skill_key = jax.random.fold_in(key, 103)
     passing_skill_key = jax.random.fold_in(key, 104)
+    shot_contest_skill_key = jax.random.fold_in(key, 105)
 
     # Folded keys add Team B skill draws for multi-possession games without
     # perturbing legacy reset sampling or its reproducibility.
@@ -7225,6 +7258,14 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         jax.random.normal(passing_skill_key, shape=(n_players,), dtype=jnp.float32)
         * static.passing_skill_std
     )
+    shot_contest_skill = static.shot_contest_skill_mean + (
+        jax.random.normal(
+            shot_contest_skill_key,
+            shape=(n_players,),
+            dtype=jnp.float32,
+        )
+        * static.shot_contest_skill_std
+    )
 
     # Continuous games sample neutral positions first, then use the 50/50
     # draw to decide which stable team won the simulated jump ball. The legacy
@@ -7347,6 +7388,7 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         steal_skill=steal_skill,
         ball_handling_skill=ball_handling_skill,
         passing_skill=passing_skill,
+        shot_contest_skill=shot_contest_skill,
         rebound_reward_advance_paid=jnp.asarray(0.0, dtype=jnp.float32),
         offense_team=offense_team,
         starting_offense_team=offense_team,

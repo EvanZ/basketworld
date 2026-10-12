@@ -82,20 +82,24 @@ def test_jax_dev_runtime_adapts_attention_observation_with_extra_token_and_globa
     np.testing.assert_allclose(adapted[:, -1], np.asarray(flat[:, current_global_start + current_global_dim]))
 
 
-def test_jax_dev_runtime_adapts_v3_flat_observation_for_v2_checkpoint():
+@pytest.mark.parametrize("checkpoint_schema,checkpoint_skill_count", [(2, 0), (3, 4)])
+def test_jax_dev_runtime_adapts_current_flat_observation_for_older_checkpoint(
+    checkpoint_schema, checkpoint_skill_count
+):
     n_players = 4
     offense_count = 2
     prefix_dim = 9
     legacy_multi_dim = 7
     role_and_shooting_dim = 1 + (3 * offense_count)
-    skill_dim = 4 * n_players
-    current_dim = prefix_dim + legacy_multi_dim + skill_dim + role_and_shooting_dim
-    expected_dim = current_dim - skill_dim
+    current_skill_dim = 5 * n_players
+    remove_dim = (5 - checkpoint_skill_count) * n_players
+    current_dim = prefix_dim + legacy_multi_dim + current_skill_dim + role_and_shooting_dim
+    expected_dim = current_dim - remove_dim
     spec = SimpleNamespace(
         model_type="mlp",
         flat_obs_dim=expected_dim,
         multi_possession_features=True,
-        observation_schema_version=2,
+        observation_schema_version=checkpoint_schema,
     )
     static = SimpleNamespace(
         role_encoding=np.zeros((n_players,), dtype=np.float32),
@@ -105,9 +109,9 @@ def test_jax_dev_runtime_adapts_v3_flat_observation_for_v2_checkpoint():
 
     adapted = np.asarray(_adapt_policy_observation_to_spec(flat, static, spec, jnp))
 
-    remove_start = prefix_dim + legacy_multi_dim
+    remove_start = prefix_dim + legacy_multi_dim + (checkpoint_skill_count * n_players)
     expected = np.concatenate(
-        [np.asarray(flat)[:, :remove_start], np.asarray(flat)[:, remove_start + skill_dim :]],
+        [np.asarray(flat)[:, :remove_start], np.asarray(flat)[:, remove_start + remove_dim :]],
         axis=1,
     )
     np.testing.assert_allclose(adapted, expected)
@@ -547,6 +551,7 @@ def test_jax_dev_runtime_fast_self_play_returns_board_state_with_value_overlay_o
     assert len(start["state"]["player_episode_skills"]) == runtime.n_players
     assert set(start["state"]["player_episode_skills"]["0"]) == {
         "pressure",
+        "shot_contest",
         "steal",
         "ball_handling",
         "passing",
@@ -1655,13 +1660,14 @@ def test_jax_dev_runtime_exposes_dynamic_multi_possession_game_context():
     assert state["inbound_deadline_steps"] == 4
     assert state["start_templates_disabled"] is True
     assert state["obs_tokens"]["globals"]
-    assert state["obs_tokens"]["players_labels"][-6:] == [
+    assert state["obs_tokens"]["players_labels"][-7:] == [
         "is_inbounder",
         "on_court",
         "pressure_skill",
         "steal_skill",
         "ball_handling_skill",
         "passing_skill",
+        "shot_contest_skill",
     ]
     assert len(state["obs_tokens"]["players_labels"]) == len(state["obs_tokens"]["players"][0])
     assert len(state["player_episode_skills"]) == runtime.n_players

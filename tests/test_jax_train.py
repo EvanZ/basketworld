@@ -15,6 +15,7 @@ from basketworld_jax.env import (
 from basketworld_jax.env.minimal import (
     GAME_PHASE_AWAITING_CHECK,
     GAME_PHASE_LIVE,
+    MULTI_POSSESSION_SCHEMA_VERSION,
     ReboundDiagnosticTotals,
     build_rebound_diagnostics,
 )
@@ -168,6 +169,28 @@ def test_multi_possession_limit_remains_fixed_without_enabled_curriculum():
     assert _multi_possession_curriculum_enabled(args) is False
     assert _multi_possession_limit_for_update(args, 1) == 7
     assert _multi_possession_limit_for_update(args, 10_000) == 7
+
+
+def test_shot_contest_skill_cli_values_reach_jax_environment_config():
+    args = parse_args(
+        [
+            "--shot-contest-skill-mean",
+            "-0.2",
+            "--shot-contest-skill-std",
+            "0.7",
+            "--shot-contest-skill-effect-weight",
+            "1.3",
+        ]
+    )
+    validate_train_args(args)
+
+    env_config = _jax_env_config_from_args(args)
+    assert env_config["shot_contest_skill_mean"] == -0.2
+    assert env_config["shot_contest_skill_std"] == 0.7
+    assert env_config["shot_contest_skill_effect_weight"] == 1.3
+
+    with pytest.raises(SystemExit, match="shot-contest-skill-std"):
+        validate_train_args(parse_args(["--shot-contest-skill-std", "-0.1"]))
 
 
 def test_deploy_eval_args_reject_invalid_values():
@@ -553,25 +576,26 @@ def test_checkpoint_observation_metadata_labels_multi_possession_skill_schema():
         hidden_dims=(64, 64),
         model_type="attention",
         token_player_count=10,
-        token_dim=24,
+        token_dim=25,
         global_dim=12,
         multi_possession_features=True,
-        observation_schema_version=3,
+        observation_schema_version=MULTI_POSSESSION_SCHEMA_VERSION,
     )
 
     metadata = _checkpoint_observation_metadata(spec)
 
-    assert metadata["schema_version"] == 3
-    assert metadata["player_dim"] == 24
+    assert metadata["schema_version"] == MULTI_POSSESSION_SCHEMA_VERSION
+    assert metadata["player_dim"] == 25
     assert metadata["global_dim"] == 12
     assert metadata["flat_observation_dim"] == 132
-    assert metadata["player_labels"][-6:] == [
+    assert metadata["player_labels"][-7:] == [
         "is_inbounder",
         "on_court",
         "pressure_skill",
         "steal_skill",
         "ball_handling_skill",
         "passing_skill",
+        "shot_contest_skill",
     ]
     assert metadata["global_labels"][-5:] == [
         "relative_score",
@@ -583,28 +607,33 @@ def test_checkpoint_observation_metadata_labels_multi_possession_skill_schema():
 
 
 @pytest.mark.parametrize("model_type", ["mlp", "attention"])
-def test_v2_frozen_opponent_params_are_zero_padded_for_v3_skills(model_type):
+@pytest.mark.parametrize("source_schema,source_skill_count", [(2, 0), (3, 4)])
+def test_older_frozen_opponent_params_are_zero_padded_for_current_skills(
+    model_type, source_schema, source_skill_count
+):
     is_attention = model_type == "attention"
     source_spec = ActorCriticSpec(
-        flat_obs_dim=211 if is_attention else 92,
+        flat_obs_dim=(211 if is_attention else 92)
+        + (source_skill_count * (10 if is_attention else 4)),
         training_player_count=2,
         action_dim_per_player=16,
         total_action_dim=32,
         hidden_dims=(8,),
         model_type=model_type,
         token_player_count=10 if is_attention else 0,
-        token_dim=20 if is_attention else 0,
+        token_dim=(20 + source_skill_count) if is_attention else 0,
         global_dim=10 if is_attention else 0,
         multi_possession_features=True,
-        observation_schema_version=2,
+        observation_schema_version=source_schema,
     )
     target_spec = replace(
         source_spec,
         flat_obs_dim=source_spec.flat_obs_dim + (
-            4 * (source_spec.token_player_count if is_attention else 4)
+            (5 - source_skill_count)
+            * (source_spec.token_player_count if is_attention else 4)
         ),
-        token_dim=source_spec.token_dim + (4 if is_attention else 0),
-        observation_schema_version=3,
+        token_dim=source_spec.token_dim + ((5 - source_skill_count) if is_attention else 0),
+        observation_schema_version=MULTI_POSSESSION_SCHEMA_VERSION,
     )
     layer_name = "token_mlp_0" if is_attention else "Dense_0"
     source_rows = (
@@ -623,7 +652,7 @@ def test_v2_frozen_opponent_params_are_zero_padded_for_v3_skills(model_type):
     assert changed is True
     result = migrated[layer_name]["kernel"]
     insert_at = source_spec.token_dim if is_attention else source_spec.flat_obs_dim - 7
-    zero_count = 4 if is_attention else 16
+    zero_count = (5 - source_skill_count) * (1 if is_attention else 4)
     assert result.shape == (source_rows + zero_count, 3)
     np.testing.assert_array_equal(result[:insert_at], kernel[:insert_at])
     np.testing.assert_array_equal(result[insert_at : insert_at + zero_count], 0.0)

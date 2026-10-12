@@ -88,6 +88,10 @@ def compute_shot_pressure_multiplier(
 
     opp_ids = env.defense_ids if shooter_id in env.offense_ids else env.offense_ids
     best_pressure_reduction: Optional[float] = None
+    contest_weight = max(
+        0.0, float(getattr(env, "shot_contest_skill_effect_weight", 0.0))
+    )
+    contest_skills = getattr(env, "shot_contest_skill_by_player", None)
 
     for did in opp_ids:
         dq = env.positions[did][0] - shooter_pos[0]
@@ -110,6 +114,20 @@ def compute_shot_pressure_multiplier(
                 -env.shot_pressure_lambda * exponent_arg
             )
             pressure_reduction = distance_reduction * (angle_factor ** 2)
+            if (
+                contest_weight > 0.0
+                and contest_skills is not None
+                and pressure_reduction > 0.0
+            ):
+                skill = float(contest_skills[int(did)])
+                clipped = max(1.0e-6, min(1.0 - 1.0e-6, pressure_reduction))
+                logit = math.log(clipped) - math.log1p(-clipped)
+                adjusted_logit = logit + (contest_weight * skill)
+                if adjusted_logit >= 0.0:
+                    pressure_reduction = 1.0 / (1.0 + math.exp(-adjusted_logit))
+                else:
+                    exp_logit = math.exp(adjusted_logit)
+                    pressure_reduction = exp_logit / (1.0 + exp_logit)
 
             if best_pressure_reduction is None or pressure_reduction > best_pressure_reduction:
                 best_pressure_reduction = pressure_reduction

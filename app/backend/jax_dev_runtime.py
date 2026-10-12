@@ -100,6 +100,9 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "multi_possession_use_inbounds",
     "made_basket_restart_mode",
     "multi_possession_schema_version",
+    "shot_contest_skill_mean",
+    "shot_contest_skill_std",
+    "shot_contest_skill_effect_weight",
     "inbound_deadline_steps",
     "check_deadline_steps",
     "check_setup_steps",
@@ -140,6 +143,9 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "multi_possession_use_inbounds": True,
     "made_basket_restart_mode": "baseline_inbound",
     "multi_possession_schema_version": MULTI_POSSESSION_SCHEMA_VERSION,
+    "shot_contest_skill_mean": 0.0,
+    "shot_contest_skill_std": 0.0,
+    "shot_contest_skill_effect_weight": 0.0,
     "inbound_deadline_steps": 5,
     "check_deadline_steps": 5,
     "check_setup_steps": 0,
@@ -179,6 +185,9 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "multi_possession_use_inbounds": "bool",
     "made_basket_restart_mode": "str",
     "multi_possession_schema_version": "int",
+    "shot_contest_skill_mean": "float",
+    "shot_contest_skill_std": "float",
+    "shot_contest_skill_effect_weight": "float",
     "inbound_deadline_steps": "int",
     "check_deadline_steps": "int",
     "check_setup_steps": "int",
@@ -331,19 +340,19 @@ def _adapt_policy_observation_to_spec(flat_obs, static, spec, jnp):
     n_players = int(static.role_encoding.shape[0])
     offense_count = int(static.offense_ids.shape[0])
     schema_version = int(getattr(spec, "observation_schema_version", 1))
+    added_player_features = {2: 5, 3: 1}.get(schema_version)
     if (
         bool(getattr(spec, "multi_possession_features", False))
-        and schema_version == 2
-        and current_dim - expected_dim == (4 * n_players)
+        and added_player_features is not None
+        and current_dim - expected_dim == (added_player_features * n_players)
     ):
-        # Schema v3 appends four episode-stable skill features per player
+        # Additive episode-skill schemas place their new MLP feature block
         # immediately before the role flag and offense shooting-skill deltas.
-        # Remove that complete block for v2 MLP checkpoints instead of blindly
-        # truncating the tail, which would shift the role and shooting fields.
         tail_dim = 1 + (3 * offense_count)
-        remove_start = current_dim - tail_dim - (4 * n_players)
+        remove_width = added_player_features * n_players
+        remove_start = current_dim - tail_dim - remove_width
         return jnp.concatenate(
-            [flat_obs[:, :remove_start], flat_obs[:, remove_start + (4 * n_players) :]],
+            [flat_obs[:, :remove_start], flat_obs[:, remove_start + remove_width :]],
             axis=1,
         ).astype(jnp.float32)
     tail_dim = 4 + 1 + (3 * offense_count)
@@ -3268,6 +3277,9 @@ class JaxDevRuntime:
                 "steal_skill": _field0(self.state, "steal_skill"),
                 "ball_handling_skill": _field0(self.state, "ball_handling_skill"),
                 "passing_skill": _field0(self.state, "passing_skill"),
+                "shot_contest_skill": _field0(
+                    self.state, "shot_contest_skill"
+                ),
             }
         )
         layup_pct = np.asarray(skill_host["layup_pct"], dtype=np.float32).reshape(-1)
@@ -3288,6 +3300,9 @@ class JaxDevRuntime:
         steal_skill = np.asarray(skill_host["steal_skill"], dtype=np.float32).reshape(-1)
         ball_handling_skill = np.asarray(skill_host["ball_handling_skill"], dtype=np.float32).reshape(-1)
         passing_skill = np.asarray(skill_host["passing_skill"], dtype=np.float32).reshape(-1)
+        shot_contest_skill = np.asarray(
+            skill_host["shot_contest_skill"], dtype=np.float32
+        ).reshape(-1)
 
         def _team_skills(ids: list[int]) -> dict[str, list[float]]:
             return {
@@ -3433,6 +3448,7 @@ class JaxDevRuntime:
                     "steal": float(steal_skill[pid]),
                     "ball_handling": float(ball_handling_skill[pid]),
                     "passing": float(passing_skill[pid]),
+                    "shot_contest": float(shot_contest_skill[pid]),
                 }
                 for pid in range(self.n_players)
             },
@@ -3877,12 +3893,16 @@ class JaxDevRuntime:
                 "steal": _field0(self.state, "steal_skill"),
                 "ball_handling": _field0(self.state, "ball_handling_skill"),
                 "passing": _field0(self.state, "passing_skill"),
+                "shot_contest": _field0(self.state, "shot_contest_skill"),
             }
         )
         pressure_skill = np.asarray(episode_skills["pressure"], dtype=np.float32)
         steal_skill = np.asarray(episode_skills["steal"], dtype=np.float32)
         ball_handling_skill = np.asarray(episode_skills["ball_handling"], dtype=np.float32)
         passing_skill = np.asarray(episode_skills["passing"], dtype=np.float32)
+        shot_contest_skill = np.asarray(
+            episode_skills["shot_contest"], dtype=np.float32
+        )
         shooting_skills = self.jax.device_get(
             {
                 "layup": _field0(self.state, "layup_pct"),
@@ -3912,6 +3932,7 @@ class JaxDevRuntime:
                 "steal": float(steal_skill[pid]),
                 "ball_handling": float(ball_handling_skill[pid]),
                 "passing": float(passing_skill[pid]),
+                "shot_contest": float(shot_contest_skill[pid]),
             }
             for pid in range(self.n_players)
         }

@@ -958,6 +958,15 @@ def get_full_game_state(
         "defender_pressure_distance": int(env.defender_pressure_distance or 1),
         "defender_pressure_turnover_chance": float(env.defender_pressure_turnover_chance or 0.05),
         "defender_pressure_decay_lambda": float(env.defender_pressure_decay_lambda or 1.0),
+        "shot_contest_skill_mean": _float_or_default(
+            getattr(env, "shot_contest_skill_mean", None), 0.0
+        ),
+        "shot_contest_skill_std": _float_or_default(
+            getattr(env, "shot_contest_skill_std", None), 0.0
+        ),
+        "shot_contest_skill_effect_weight": _float_or_default(
+            getattr(env, "shot_contest_skill_effect_weight", None), 0.0
+        ),
         "base_steal_rate": float(env.base_steal_rate or 0.35),
         "steal_perp_decay": float(env.steal_perp_decay or 1.5),
         "steal_distance_factor": float(env.steal_distance_factor or 0.08),

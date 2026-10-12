@@ -2539,6 +2539,9 @@ def _set_pressure_params_impl(
         "shot_pressure_max",
         "shot_pressure_lambda",
         "shot_pressure_arc_degrees",
+        "shot_contest_skill_mean",
+        "shot_contest_skill_std",
+        "shot_contest_skill_effect_weight",
         "base_steal_rate",
         "steal_perp_decay",
         "steal_distance_factor",
@@ -2583,6 +2586,9 @@ def _set_pressure_params_impl(
             "shot_pressure_max",
             "shot_pressure_lambda",
             "shot_pressure_arc_degrees",
+            "shot_contest_skill_mean",
+            "shot_contest_skill_std",
+            "shot_contest_skill_effect_weight",
         },
         "pass_interception": {
             "base_steal_rate",
@@ -2655,6 +2661,18 @@ def _set_pressure_params_impl(
             ),
             "shot_pressure_arc_degrees": _default_value(
                 "shot_pressure_arc_degrees", getattr(env, "shot_pressure_arc_degrees", 60.0)
+            ),
+            "shot_contest_skill_mean": _default_value(
+                "shot_contest_skill_mean",
+                getattr(env, "shot_contest_skill_mean", 0.0),
+            ),
+            "shot_contest_skill_std": _default_value(
+                "shot_contest_skill_std",
+                getattr(env, "shot_contest_skill_std", 0.0),
+            ),
+            "shot_contest_skill_effect_weight": _default_value(
+                "shot_contest_skill_effect_weight",
+                getattr(env, "shot_contest_skill_effect_weight", 0.0),
             ),
             "base_steal_rate": _default_value(
                 "base_steal_rate", getattr(env, "base_steal_rate", 0.35)
@@ -2799,6 +2817,9 @@ def _set_pressure_params_impl(
             "shot_pressure_max": req.shot_pressure_max,
             "shot_pressure_lambda": req.shot_pressure_lambda,
             "shot_pressure_arc_degrees": req.shot_pressure_arc_degrees,
+            "shot_contest_skill_mean": req.shot_contest_skill_mean,
+            "shot_contest_skill_std": req.shot_contest_skill_std,
+            "shot_contest_skill_effect_weight": req.shot_contest_skill_effect_weight,
             "base_steal_rate": req.base_steal_rate,
             "steal_perp_decay": req.steal_perp_decay,
             "steal_distance_factor": req.steal_distance_factor,
@@ -2916,6 +2937,15 @@ def _set_pressure_params_impl(
             0.0,
             360.0,
         )
+    if "shot_contest_skill_mean" in payload:
+        normalized["shot_contest_skill_mean"] = _as_float(
+            payload["shot_contest_skill_mean"], "shot_contest_skill_mean"
+        )
+    for key in ("shot_contest_skill_std", "shot_contest_skill_effect_weight"):
+        if key in payload:
+            normalized[key] = _validate_min(
+                _as_float(payload[key], key), key, 0.0
+            )
 
     if "base_steal_rate" in payload:
         normalized["base_steal_rate"] = _validate_range(

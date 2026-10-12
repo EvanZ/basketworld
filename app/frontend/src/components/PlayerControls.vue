@@ -771,6 +771,9 @@ const pressureParamsInput = ref({
   shot_pressure_max: 0.5,
   shot_pressure_lambda: 1.0,
   shot_pressure_arc_degrees: 60.0,
+  shot_contest_skill_mean: 0.0,
+  shot_contest_skill_std: 0.0,
+  shot_contest_skill_effect_weight: 0.0,
   base_steal_rate: 0.35,
   steal_perp_decay: 1.5,
   steal_distance_factor: 0.08,
@@ -817,6 +820,9 @@ const SHOT_PRESSURE_PARAM_KEYS = [
   'shot_pressure_max',
   'shot_pressure_lambda',
   'shot_pressure_arc_degrees',
+  'shot_contest_skill_mean',
+  'shot_contest_skill_std',
+  'shot_contest_skill_effect_weight',
 ];
 const DEFENDER_PRESSURE_PARAM_KEYS = [
   'defender_pressure_distance',
@@ -1062,6 +1068,9 @@ function syncPressureParamsInputs(state) {
     shot_pressure_max: Number(src.shot_pressure_max ?? 0.5),
     shot_pressure_lambda: Number(src.shot_pressure_lambda ?? 1.0),
     shot_pressure_arc_degrees: Number(src.shot_pressure_arc_degrees ?? 60.0),
+    shot_contest_skill_mean: Number(src.shot_contest_skill_mean ?? 0.0),
+    shot_contest_skill_std: Number(src.shot_contest_skill_std ?? 0.0),
+    shot_contest_skill_effect_weight: Number(src.shot_contest_skill_effect_weight ?? 0.0),
     base_steal_rate: Number(src.base_steal_rate ?? 0.35),
     steal_perp_decay: Number(src.steal_perp_decay ?? 1.5),
     steal_distance_factor: Number(src.steal_distance_factor ?? 0.08),
@@ -1121,6 +1130,9 @@ watch(
     props.gameState?.shot_pressure_max,
     props.gameState?.shot_pressure_lambda,
     props.gameState?.shot_pressure_arc_degrees,
+    props.gameState?.shot_contest_skill_mean,
+    props.gameState?.shot_contest_skill_std,
+    props.gameState?.shot_contest_skill_effect_weight,
     props.gameState?.base_steal_rate,
     props.gameState?.steal_perp_decay,
     props.gameState?.steal_distance_factor,
@@ -1784,6 +1796,7 @@ const sampledEpisodeSkillRows = computed(() => {
       playerId,
       team: userSet.has(playerId) ? 'Player' : (aiSet.has(playerId) ? 'AI' : 'Unknown'),
       pressure: Number(raw.pressure),
+      shotContest: Number(raw.shot_contest),
       steal: Number(raw.steal),
       ballHandling: Number(raw.ball_handling),
       passing: Number(raw.passing),
@@ -3236,6 +3249,7 @@ function normalizeEvalRosterProfiles(rawProfiles, { probabilities = true } = {})
       dunk: shootingValue('dunk'),
       rebound: rawValue('rebound'),
       pressure: rawValue('pressure'),
+      shot_contest: rawValue('shot_contest'),
       steal: rawValue('steal'),
       ball_handling: rawValue('ball_handling'),
       passing: rawValue('passing'),
@@ -3687,6 +3701,7 @@ const evalPlayerSkillRows = computed(() => {
       dunk: numberOrZero('dunk'),
       rebound: numberOrZero('rebound'),
       pressure: numberOrZero('pressure'),
+      shotContest: numberOrZero('shot_contest'),
       steal: numberOrZero('steal'),
       ballHandling: numberOrZero('ball_handling'),
       passing: numberOrZero('passing'),
@@ -4281,6 +4296,9 @@ function _normalizePressurePayload(input) {
     shot_pressure_max: Number(input?.shot_pressure_max ?? 0.5),
     shot_pressure_lambda: Number(input?.shot_pressure_lambda ?? 1.0),
     shot_pressure_arc_degrees: Number(input?.shot_pressure_arc_degrees ?? 60.0),
+    shot_contest_skill_mean: Number(input?.shot_contest_skill_mean ?? 0.0),
+    shot_contest_skill_std: Number(input?.shot_contest_skill_std ?? 0.0),
+    shot_contest_skill_effect_weight: Number(input?.shot_contest_skill_effect_weight ?? 0.0),
     base_steal_rate: Number(input?.base_steal_rate ?? 0.35),
     steal_perp_decay: Number(input?.steal_perp_decay ?? 1.5),
     steal_distance_factor: Number(input?.steal_distance_factor ?? 0.08),
@@ -9162,7 +9180,7 @@ function offenseSkillDeltaLabel(idx) {
                 <th rowspan="2">Team</th>
                 <th colspan="11">Box score</th>
                 <th colspan="5">Offensive skills</th>
-                <th colspan="3">Defensive / shared skills</th>
+                <th colspan="4">Defensive / shared skills</th>
               </tr>
               <tr>
                 <th>PTS</th>
@@ -9182,6 +9200,7 @@ function offenseSkillDeltaLabel(idx) {
                 <th title="Mean sampled ball-handling skill; higher values resist pressure turnovers">Handle</th>
                 <th title="Mean sampled passing skill; higher values resist interceptions">Pass</th>
                 <th title="Mean sampled turnover-pressure skill">Pressure</th>
+                <th title="Mean sampled shot-contest skill">Contest</th>
                 <th title="Mean sampled steal skill">Steal</th>
                 <th title="Mean sampled rebounding skill">Rebound</th>
               </tr>
@@ -9207,6 +9226,7 @@ function offenseSkillDeltaLabel(idx) {
                 <td class="skill-cell offense-skill">{{ formatEvalLatentSkill(row.sampledSkills.ball_handling) }}</td>
                 <td class="skill-cell offense-skill">{{ formatEvalLatentSkill(row.sampledSkills.passing) }}</td>
                 <td class="skill-cell defense-skill">{{ formatEvalLatentSkill(row.sampledSkills.turnover_pressure) }}</td>
+                <td class="skill-cell defense-skill">{{ formatEvalLatentSkill(row.sampledSkills.shot_contest) }}</td>
                 <td class="skill-cell defense-skill">{{ formatEvalLatentSkill(row.sampledSkills.steal) }}</td>
                 <td class="skill-cell shared-skill">{{ formatEvalLatentSkill(row.sampledSkills.rebound) }}</td>
               </tr>
@@ -11534,6 +11554,7 @@ function offenseSkillDeltaLabel(idx) {
                   <th title="Dunk make probability">Dunk %</th>
                   <th title="Rebounding skill">Rebound</th>
                   <th title="Turnover-pressure skill">Pressure</th>
+                  <th title="Shot-contest skill">Contest</th>
                   <th title="Steal/interception skill">Steal</th>
                   <th title="Ball-handling skill">Handle</th>
                   <th title="Passing accuracy skill">Pass</th>
@@ -11548,6 +11569,7 @@ function offenseSkillDeltaLabel(idx) {
                   <td><input type="number" min="1" max="99" step="0.1" :value="row.dunk" @input="updateEvalPlayerSkill(row.playerId, 'dunk', $event.target.value)" /></td>
                   <td><input type="number" step="0.05" :value="row.rebound" @input="updateEvalPlayerSkill(row.playerId, 'rebound', $event.target.value)" /></td>
                   <td><input type="number" step="0.05" :value="row.pressure" @input="updateEvalPlayerSkill(row.playerId, 'pressure', $event.target.value)" /></td>
+                  <td><input type="number" step="0.05" :value="row.shotContest" @input="updateEvalPlayerSkill(row.playerId, 'shot_contest', $event.target.value)" /></td>
                   <td><input type="number" step="0.05" :value="row.steal" @input="updateEvalPlayerSkill(row.playerId, 'steal', $event.target.value)" /></td>
                   <td><input type="number" step="0.05" :value="row.ballHandling" @input="updateEvalPlayerSkill(row.playerId, 'ball_handling', $event.target.value)" /></td>
                   <td><input type="number" step="0.05" :value="row.passing" @input="updateEvalPlayerSkill(row.playerId, 'passing', $event.target.value)" /></td>
@@ -12172,21 +12194,23 @@ function offenseSkillDeltaLabel(idx) {
           <div class="param-category" v-if="sampledEpisodeSkillRows.length">
             <h5>Defensive Skills (Episode)</h5>
             <div class="offense-skills-editor">
-              <div class="offense-skills-row header sampled-episode-skills-row">
+              <div class="offense-skills-row header sampled-episode-skills-row sampled-defense-skills-row">
                 <span>Player</span>
                 <span>Team</span>
                 <span>Pressure</span>
+                <span>Contest</span>
                 <span>Steal</span>
               </div>
               <div
-                class="offense-skills-row sampled-episode-skills-row"
+                class="offense-skills-row sampled-episode-skills-row sampled-defense-skills-row"
                 v-for="row in sampledEpisodeSkillRows"
                 :key="`sampled-defense-skill-${row.playerId}`"
-                data-tooltip="Episode-stable defensive attributes. Pressure increases live-ball turnover contribution; steal increases pass-interception contribution."
+                data-tooltip="Episode-stable defensive attributes. Pressure increases live-ball turnover contribution; contest strengthens geometric shot pressure; steal increases pass-interception contribution."
               >
                 <span class="skills-player">{{ formatPlayerIdentity(row.playerId) }}</span>
                 <span class="param-value" :class="`skill-team-${row.team.toLowerCase()}`">{{ row.team }}</span>
                 <span class="param-value">{{ formatEpisodeSkill(row.pressure) }}</span>
+                <span class="param-value">{{ formatEpisodeSkill(row.shotContest) }}</span>
                 <span class="param-value">{{ formatEpisodeSkill(row.steal) }}</span>
               </div>
             </div>
@@ -12514,6 +12538,18 @@ function offenseSkillDeltaLabel(idx) {
                 v-model.number="pressureParamsInput.shot_pressure_arc_degrees"
                 :disabled="pressureParamsUpdating"
               />
+            </div>
+            <div class="param-item" data-tooltip="Mean of the episode-stable per-player shot-contest skill distribution.">
+              <span class="param-name">Contest skill mean:</span>
+              <input class="env-param-input" type="number" step="0.05" v-model.number="pressureParamsInput.shot_contest_skill_mean" :disabled="pressureParamsUpdating" />
+            </div>
+            <div class="param-item" data-tooltip="Standard deviation of independently sampled per-player shot-contest skill.">
+              <span class="param-name">Contest skill std:</span>
+              <input class="env-param-input" type="number" min="0" step="0.05" v-model.number="pressureParamsInput.shot_contest_skill_std" :disabled="pressureParamsUpdating" />
+            </div>
+            <div class="param-item" data-tooltip="Logit-space weight applied to each eligible defender's geometric shot-pressure reduction. Zero preserves legacy behavior exactly.">
+              <span class="param-name">Contest effect weight:</span>
+              <input class="env-param-input" type="number" min="0" step="0.05" v-model.number="pressureParamsInput.shot_contest_skill_effect_weight" :disabled="pressureParamsUpdating" />
             </div>
             <div class="offense-skill-actions">
                 <button
@@ -14812,6 +14848,10 @@ function offenseSkillDeltaLabel(idx) {
 
 .offense-skills-row.sampled-episode-skills-row {
   grid-template-columns: 0.9fr 0.75fr repeat(2, 1fr);
+}
+
+.offense-skills-row.sampled-defense-skills-row {
+  grid-template-columns: 0.9fr 0.75fr repeat(3, 1fr);
 }
 
 .skill-team-player {

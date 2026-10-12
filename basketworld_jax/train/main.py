@@ -155,9 +155,12 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "defender_pressure_decay_lambda",
         "pressure_skill_mean",
         "pressure_skill_std",
+        "shot_contest_skill_mean",
+        "shot_contest_skill_std",
         "ball_handling_skill_mean",
         "ball_handling_skill_std",
         "pressure_skill_effect_weight",
+        "shot_contest_skill_effect_weight",
         "base_steal_rate",
         "steal_perp_decay",
         "steal_distance_factor",
@@ -302,9 +305,12 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "defender_pressure_decay_lambda",
     "pressure_skill_mean",
     "pressure_skill_std",
+    "shot_contest_skill_mean",
+    "shot_contest_skill_std",
     "ball_handling_skill_mean",
     "ball_handling_skill_std",
     "pressure_skill_effect_weight",
+    "shot_contest_skill_effect_weight",
     "base_steal_rate",
     "steal_perp_decay",
     "steal_distance_factor",
@@ -1916,10 +1922,12 @@ def validate_train_args(args) -> None:
         raise SystemExit("--rebound-skill-std must be >= 0.")
     for key in (
         "pressure_skill_std",
+        "shot_contest_skill_std",
         "steal_skill_std",
         "ball_handling_skill_std",
         "passing_skill_std",
         "pressure_skill_effect_weight",
+        "shot_contest_skill_effect_weight",
         "steal_skill_effect_weight",
     ):
         if float(getattr(args, key, 0.0)) < 0.0:
@@ -2208,9 +2216,12 @@ _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
     "check_setup_steps": 0,
     "pressure_skill_mean": 0.0,
     "pressure_skill_std": 0.0,
+    "shot_contest_skill_mean": 0.0,
+    "shot_contest_skill_std": 0.0,
     "ball_handling_skill_mean": 0.0,
     "ball_handling_skill_std": 0.0,
     "pressure_skill_effect_weight": 0.0,
+    "shot_contest_skill_effect_weight": 0.0,
     "steal_skill_mean": 0.0,
     "steal_skill_std": 0.0,
     "passing_skill_mean": 0.0,
@@ -2501,12 +2512,21 @@ def _checkpoint_trainer_config_from_args(
         "rebound_skill_std": float(getattr(args, "rebound_skill_std", 0.0)),
         "pressure_skill_mean": float(getattr(args, "pressure_skill_mean", 0.0)),
         "pressure_skill_std": float(getattr(args, "pressure_skill_std", 0.0)),
+        "shot_contest_skill_mean": float(
+            getattr(args, "shot_contest_skill_mean", 0.0)
+        ),
+        "shot_contest_skill_std": float(
+            getattr(args, "shot_contest_skill_std", 0.0)
+        ),
         "ball_handling_skill_mean": float(
             getattr(args, "ball_handling_skill_mean", 0.0)
         ),
         "ball_handling_skill_std": float(getattr(args, "ball_handling_skill_std", 0.0)),
         "pressure_skill_effect_weight": float(
             getattr(args, "pressure_skill_effect_weight", 0.0)
+        ),
+        "shot_contest_skill_effect_weight": float(
+            getattr(args, "shot_contest_skill_effect_weight", 0.0)
         ),
         "steal_skill_mean": float(getattr(args, "steal_skill_mean", 0.0)),
         "steal_skill_std": float(getattr(args, "steal_skill_std", 0.0)),
@@ -2626,7 +2646,7 @@ def _migrate_v2_frozen_opponent_params(
     payload: dict[str, Any],
     target_spec: ActorCriticSpec,
 ) -> tuple[Any, bool]:
-    """Pad v2 policy inputs so a frozen opponent can run under schema v3."""
+    """Pad older multi-possession policy inputs for the current schema."""
     source_spec = ActorCriticSpec(**dict(payload.get("policy_spec", {})))
     if source_spec == target_spec:
         return payload["params"], False
@@ -2644,16 +2664,18 @@ def _migrate_v2_frozen_opponent_params(
         if is_attention
         else 2 * int(target_spec.training_player_count)
     )
+    added_player_features = {2: 5, 3: 1}.get(source_schema)
     compatible = (
         bool(source_spec.multi_possession_features)
         and bool(target_spec.multi_possession_features)
-        and source_schema == 2
+        and added_player_features is not None
         and target_schema == int(MULTI_POSSESSION_SCHEMA_VERSION)
         and source_fields == target_fields
         and int(target_spec.flat_obs_dim)
-        == int(source_spec.flat_obs_dim) + (4 * player_count)
+        == int(source_spec.flat_obs_dim) + (added_player_features * player_count)
         and (
-            int(target_spec.token_dim) == int(source_spec.token_dim) + 4
+            int(target_spec.token_dim)
+            == int(source_spec.token_dim) + added_player_features
             if is_attention
             else int(target_spec.token_dim) == int(source_spec.token_dim)
         )
@@ -2661,8 +2683,8 @@ def _migrate_v2_frozen_opponent_params(
     if not compatible:
         raise SystemExit(
             "Frozen opponent policy_spec does not match the current JAX trainer "
-            "policy_spec and is not the supported multi-possession schema-v2 to "
-            "schema-v3 input-width migration."
+            "policy_spec and is not a supported additive multi-possession "
+            "observation migration."
         )
 
     migrated = deepcopy(payload["params"])
@@ -2670,13 +2692,18 @@ def _migrate_v2_frozen_opponent_params(
         layer_name = "token_mlp_0"
         kernel = np.asarray(migrated[layer_name]["kernel"])
         insert_at = int(source_spec.token_dim)
-        zero_rows = np.zeros((4, kernel.shape[1]), dtype=kernel.dtype)
+        zero_rows = np.zeros(
+            (added_player_features, kernel.shape[1]), dtype=kernel.dtype
+        )
     else:
         layer_name = "Dense_0"
         kernel = np.asarray(migrated[layer_name]["kernel"])
         tail_dim = 1 + (3 * int(target_spec.training_player_count))
         insert_at = int(source_spec.flat_obs_dim) - tail_dim
-        zero_rows = np.zeros((4 * player_count, kernel.shape[1]), dtype=kernel.dtype)
+        zero_rows = np.zeros(
+            (added_player_features * player_count, kernel.shape[1]),
+            dtype=kernel.dtype,
+        )
     migrated[layer_name]["kernel"] = np.concatenate(
         [kernel[:insert_at], zero_rows, kernel[insert_at:]],
         axis=0,
@@ -3663,6 +3690,12 @@ def _log_mlflow_params(
         "jax/rebound_skill_std": float(getattr(args, "rebound_skill_std", 0.0)),
         "jax/pressure_skill_mean": float(getattr(args, "pressure_skill_mean", 0.0)),
         "jax/pressure_skill_std": float(getattr(args, "pressure_skill_std", 0.0)),
+        "jax/shot_contest_skill_mean": float(
+            getattr(args, "shot_contest_skill_mean", 0.0)
+        ),
+        "jax/shot_contest_skill_std": float(
+            getattr(args, "shot_contest_skill_std", 0.0)
+        ),
         "jax/ball_handling_skill_mean": float(
             getattr(args, "ball_handling_skill_mean", 0.0)
         ),
@@ -3671,6 +3704,9 @@ def _log_mlflow_params(
         ),
         "jax/pressure_skill_effect_weight": float(
             getattr(args, "pressure_skill_effect_weight", 0.0)
+        ),
+        "jax/shot_contest_skill_effect_weight": float(
+            getattr(args, "shot_contest_skill_effect_weight", 0.0)
         ),
         "jax/steal_skill_mean": float(getattr(args, "steal_skill_mean", 0.0)),
         "jax/steal_skill_std": float(getattr(args, "steal_skill_std", 0.0)),
