@@ -2560,6 +2560,22 @@ const checkBallMarker = computed(() => {
   return axialToCartesian(Number(pos[0]), Number(pos[1]));
 });
 
+const checkClearanceMarkers = computed(() => {
+  const state = currentGameState.value;
+  const checkPosition = state?.check_position;
+  const clearance = Math.max(0, Number(state?.check_clearance ?? 0));
+  if (
+    !checkBallMarker.value
+    || clearance < 1
+    || !Array.isArray(checkPosition)
+    || checkPosition.length < 2
+  ) return [];
+
+  return courtLayout.value.filter((hex) => (
+    hexDistance([hex.q, hex.r], checkPosition) <= clearance
+  ));
+});
+
 const legalInboundEntryMarkers = computed(() => {
   const entries = currentGameState.value?.legal_inbound_entry_positions;
   if (!Array.isArray(entries)) return [];
@@ -5171,8 +5187,24 @@ onBeforeUnmount(() => {
           />
         </g>
 
-        <!-- A check ball is loose at the protected top-of-key cell until the
-             first offensive player enters it. -->
+        <!-- The protected disk moves with the sampled check location. During
+             setup both teams must leave it; during pickup only defenders must
+             stay outside until the ball is collected. -->
+        <g
+          v-if="checkClearanceMarkers.length && showPlayers"
+          class="check-clearance-layer"
+          aria-label="Check-clearance area"
+        >
+          <polygon
+            v-for="hex in checkClearanceMarkers"
+            :key="`check-clearance-${hex.key}`"
+            :points="hexPointsFor(hex.x, hex.y, HEX_RADIUS * 0.92)"
+            class="check-clearance-cell"
+          />
+        </g>
+
+        <!-- A check ball is loose at the sampled location until the first
+             offensive player enters it. -->
         <g v-if="checkBallMarker && showPlayers" class="check-ball-marker" aria-label="Check ball">
           <use
             href="#basketball-glyph"
@@ -5191,6 +5223,13 @@ onBeforeUnmount(() => {
             text-anchor="middle"
             class="inbound-label"
           >{{ currentGameState?.game_phase === 'check_setup' ? 'SETUP' : 'CHECK' }}</text>
+          <text
+            v-if="checkClearanceMarkers.length"
+            :x="checkBallMarker.x"
+            :y="checkBallMarker.y + HEX_RADIUS * 0.72"
+            text-anchor="middle"
+            class="check-clearance-label"
+          >CLEAR {{ currentGameState?.check_clearance }}</text>
         </g>
 
         <!-- Draw the current players on top -->
@@ -7195,6 +7234,24 @@ onBeforeUnmount(() => {
 }
 .check-ball-marker {
   pointer-events: none;
+}
+.check-clearance-layer {
+  pointer-events: none;
+}
+.check-clearance-cell {
+  fill: rgba(251, 191, 36, 0.24);
+  stroke: rgba(253, 230, 138, 0.98);
+  stroke-width: 2.2;
+  stroke-dasharray: 5 3;
+}
+.check-clearance-label {
+  fill: #fde68a;
+  font-size: 0.42rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  paint-order: stroke;
+  stroke: #0f172a;
+  stroke-width: 2px;
 }
 .basketball-glyph-fill {
   fill: #f97316;
