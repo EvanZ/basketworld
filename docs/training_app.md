@@ -71,6 +71,13 @@ an explicitly pinned setting remains visible regardless of those filters.
 The application launches the Python trainer directly; it does not execute the
 command-line training shell script.
 
+The shot-contest controls are pinned in the launch form by default:
+`shot_contest_skill_mean`, `shot_contest_skill_std`, and
+`shot_contest_skill_effect_weight`. They map directly to the trainer's
+`--shot-contest-skill-mean`, `--shot-contest-skill-std`, and
+`--shot-contest-skill-effect-weight` arguments and are included explicitly in
+the resolved command for new runs.
+
 `entropy_decay_updates` optionally decouples the entropy schedule from the
 overall run length. When it is null, entropy reaches `ent_coef_end` on the last
 configured update, preserving the original behavior. When it is set, entropy

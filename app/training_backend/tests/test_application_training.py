@@ -23,7 +23,19 @@ def test_application_schema_excludes_sb3_only_fields(tmp_path):
         "kernel_batch_size",
         "policy_hidden_dims",
         "eval_deploy_every_updates",
+        "shot_contest_skill_mean",
+        "shot_contest_skill_std",
+        "shot_contest_skill_effect_weight",
     }.issubset(names)
+
+    fields = {field["name"]: field for field in schema}
+    for name in (
+        "shot_contest_skill_mean",
+        "shot_contest_skill_std",
+        "shot_contest_skill_effect_weight",
+    ):
+        assert fields[name]["editable"] is True
+        assert fields[name]["category"] == "Shooting"
 
 
 def test_application_preset_does_not_depend_on_inapplicable_fields(tmp_path):

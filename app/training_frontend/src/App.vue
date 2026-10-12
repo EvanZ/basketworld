@@ -34,7 +34,13 @@ const defaultConfig = () => ({
 
 const PIN_STORAGE_KEY = 'basketworld.training.pinned-configs.v1'
 const PIN_MIGRATION_KEY = 'basketworld.training.pinned-configs.migration.v1'
-const ENTROPY_DECAY_PIN_MIGRATION = 'entropy-decay-updates'
+const PIN_MIGRATION_VERSION = 'shot-contest-skill-v2'
+const MIGRATED_PINNED_FIELDS = [
+  'entropy_decay_updates',
+  'shot_contest_skill_mean',
+  'shot_contest_skill_std',
+  'shot_contest_skill_effect_weight',
+]
 const METRIC_STORAGE_KEY = 'basketworld.training.sparkline-metrics.v1'
 const MAX_SELECTED_METRICS = 16
 const DEFAULT_METRICS = [
@@ -52,6 +58,9 @@ const DEFAULT_PINNED_FIELDS = [
   'mlflow_experiment_name',
   'num_updates',
   'entropy_decay_updates',
+  'shot_contest_skill_mean',
+  'shot_contest_skill_std',
+  'shot_contest_skill_effect_weight',
   'policy_seed',
   'multi_possession_limit_start',
   'multi_possession_limit_end',
@@ -83,10 +92,12 @@ function loadPinnedConfigNames() {
     const pinned = Array.isArray(stored)
       ? [...new Set(stored.filter((name) => typeof name === 'string'))]
       : [...DEFAULT_PINNED_FIELDS]
-    if (window.localStorage.getItem(PIN_MIGRATION_KEY) !== ENTROPY_DECAY_PIN_MIGRATION) {
-      if (!pinned.includes('entropy_decay_updates')) pinned.push('entropy_decay_updates')
+    if (window.localStorage.getItem(PIN_MIGRATION_KEY) !== PIN_MIGRATION_VERSION) {
+      for (const name of MIGRATED_PINNED_FIELDS) {
+        if (!pinned.includes(name)) pinned.push(name)
+      }
       window.localStorage.setItem(PIN_STORAGE_KEY, JSON.stringify(pinned))
-      window.localStorage.setItem(PIN_MIGRATION_KEY, ENTROPY_DECAY_PIN_MIGRATION)
+      window.localStorage.setItem(PIN_MIGRATION_KEY, PIN_MIGRATION_VERSION)
     }
     return pinned
   } catch {
@@ -432,6 +443,9 @@ function fieldLabel(field) {
     multi_possession_limit_end: 'Final possessions',
     multi_possession_limit_ramp_updates: 'Curriculum updates',
     historical_eval_episodes: 'Historical eval episodes',
+    shot_contest_skill_mean: 'Shot contest mean',
+    shot_contest_skill_std: 'Shot contest std',
+    shot_contest_skill_effect_weight: 'Shot contest effect weight',
     made_basket_restart_mode: 'Made-basket restart',
     check_setup_steps: 'Pre-check setup steps',
     multi_possession_use_inbounds: 'Use inbounds for dead-ball restarts',

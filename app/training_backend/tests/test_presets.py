@@ -31,6 +31,13 @@ def test_short_run_filters_default_historical_milestones(tmp_path):
     assert preview.argv[experiment_index + 1] == "halfcourt_multi_possessions"
     assert "--control-file" in preview.argv
     assert "--training-status-file" in preview.argv
+    for option in (
+        "--shot-contest-skill-mean",
+        "--shot-contest-skill-std",
+        "--shot-contest-skill-effect-weight",
+    ):
+        index = preview.argv.index(option)
+        assert preview.argv[index + 1] == "0.0"
 
 
 def test_explicit_historical_milestone_after_target_is_rejected():
@@ -86,6 +93,30 @@ def test_preview_compiles_typed_overrides(tmp_path):
     assert "--gamma" in preview.argv
     assert preview.argv[preview.argv.index("--gamma") + 1] == "0.97"
     assert "--single-episode-rollouts" in preview.argv
+
+
+def test_preview_compiles_shot_contest_overrides(tmp_path):
+    preview = build_halfcourt_multi_possession_preview(
+        config=TrainingRunConfig(
+            overrides={
+                "shot_contest_skill_mean": -0.2,
+                "shot_contest_skill_std": 0.7,
+                "shot_contest_skill_effect_weight": 1.3,
+            }
+        ),
+        run_id="ffffffff-ffff-4fff-8fff-ffffffffffff",
+        repo_root=tmp_path,
+        data_dir=tmp_path / "data",
+    )
+
+    expected = {
+        "--shot-contest-skill-mean": "-0.2",
+        "--shot-contest-skill-std": "0.7",
+        "--shot-contest-skill-effect-weight": "1.3",
+    }
+    for option, value in expected.items():
+        index = preview.argv.index(option)
+        assert preview.argv[index + 1] == value
 
 
 def test_resume_uses_full_state_checkpoint_without_reset_flags(tmp_path):
