@@ -15,6 +15,18 @@ test('retargets a copied run historical evaluation schedule when updates decreas
   )
 })
 
+test('preserves copied milestones while a replacement target is typed', () => {
+  const source = [100, 500, 2500, 5000, 7500, 10000, 30000]
+
+  assert.deepEqual(historicalEvalUpdatesForTarget(source, 30000, 6), [6])
+  assert.deepEqual(historicalEvalUpdatesForTarget(source, 30000, 60), [60])
+  assert.deepEqual(historicalEvalUpdatesForTarget(source, 30000, 600), [100, 500, 600])
+  assert.deepEqual(
+    historicalEvalUpdatesForTarget(source, 30000, 6000),
+    [100, 500, 2500, 5000, 6000],
+  )
+})
+
 test('moves an existing final evaluation milestone when updates increase', () => {
   assert.deepEqual(
     historicalEvalUpdatesForTarget([100, 500, 5000], 5000, 8000),

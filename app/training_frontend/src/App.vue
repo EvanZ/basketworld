@@ -120,6 +120,10 @@ function loadSelectedMetricNames() {
 const runs = ref([])
 const selected = ref(null)
 const config = ref(defaultConfig())
+const historicalEvalScheduleSource = ref({
+  updates: config.value.historical_eval_updates,
+  target: config.value.num_updates,
+})
 const preview = ref(null)
 const configSchema = ref([])
 const configSearch = ref('')
@@ -488,6 +492,15 @@ function parseConfigFieldValue(field, rawValue) {
   return value
 }
 
+function rememberHistoricalEvalSchedule(source) {
+  historicalEvalScheduleSource.value = {
+    updates: Array.isArray(source.historical_eval_updates)
+      ? [...source.historical_eval_updates]
+      : source.historical_eval_updates,
+    target: source.num_updates,
+  }
+}
+
 function setConfigField(field, rawValue) {
   let value = parseConfigFieldValue(field, rawValue)
   const appConfigKey = APP_CONFIG_KEYS[field.name]
@@ -499,30 +512,25 @@ function setConfigField(field, rawValue) {
       value = items.length ? items.map((item) => Number.parseInt(item, 10)) : null
     }
     if (field.name === 'num_updates') {
-      const previousTarget = config.value.num_updates
+      const scheduleSource = historicalEvalScheduleSource.value
       config.value = {
         ...config.value,
         num_updates: value,
         historical_eval_updates: historicalEvalUpdatesForTarget(
-          config.value.historical_eval_updates,
-          previousTarget,
+          scheduleSource.updates,
+          scheduleSource.target,
           value,
         ),
       }
       return
     }
     config.value[appConfigKey] = value
+    if (field.name === 'historical_eval_updates') {
+      rememberHistoricalEvalSchedule(config.value)
+    }
     return
   }
   config.value.overrides = { ...config.value.overrides, [field.name]: value }
-}
-
-function handleConfigFieldInput(field, rawValue) {
-  if (field.name !== 'num_updates') setConfigField(field, rawValue)
-}
-
-function handleConfigFieldChange(field, rawValue) {
-  if (field.name === 'num_updates') setConfigField(field, rawValue)
 }
 
 function resetOverride(field) {
@@ -539,6 +547,7 @@ function cloneRun(run) {
     name: `${run.name} copy`,
     overrides: { ...(source.overrides || {}) },
   }
+  rememberHistoricalEvalSchedule(config.value)
   activeView.value = 'new'
 }
 
@@ -554,6 +563,7 @@ async function importFromMlflow() {
       ...result.config,
       overrides: { ...(result.config.overrides || {}) },
     }
+    rememberHistoricalEvalSchedule(config.value)
     importResult.value = result
   } catch (cause) {
     error.value = cause.message
@@ -821,7 +831,7 @@ onBeforeUnmount(() => {
                 <select v-else-if="field.choices" class="config-input" :value="inputValue(field)" :disabled="!fieldIsEditable(field)" @change="setConfigField(field, $event.target.value)">
                   <option v-for="choice in field.choices" :key="choice" :value="choice">{{ choice }}</option>
                 </select>
-                <input v-else class="config-input" :type="['int', 'float'].includes(field.type) ? 'number' : 'text'" :step="field.type === 'float' ? 'any' : undefined" :value="inputValue(field)" :disabled="!fieldIsEditable(field)" @input="handleConfigFieldInput(field, $event.target.value)" @change="handleConfigFieldChange(field, $event.target.value)" />
+                <input v-else class="config-input" :type="['int', 'float'].includes(field.type) ? 'number' : 'text'" :step="field.type === 'float' ? 'any' : undefined" :value="inputValue(field)" :disabled="!fieldIsEditable(field)" @input="setConfigField(field, $event.target.value)" />
                 <small class="field-meta">{{ field.name }} · {{ field.type }}<span v-if="!fieldIsEditable(field)"> · {{ field.frozen ? 'frozen' : 'internal' }}</span></small>
               </article>
             </div>
@@ -852,7 +862,7 @@ onBeforeUnmount(() => {
                 <select v-else-if="field.choices" class="config-input" :value="inputValue(field)" :disabled="!fieldIsEditable(field)" @change="setConfigField(field, $event.target.value)">
                   <option v-for="choice in field.choices" :key="choice" :value="choice">{{ choice }}</option>
                 </select>
-                <input v-else class="config-input" :type="['int', 'float'].includes(field.type) ? 'number' : 'text'" :step="field.type === 'float' ? 'any' : undefined" :value="inputValue(field)" :disabled="!fieldIsEditable(field)" @input="handleConfigFieldInput(field, $event.target.value)" @change="handleConfigFieldChange(field, $event.target.value)" />
+                <input v-else class="config-input" :type="['int', 'float'].includes(field.type) ? 'number' : 'text'" :step="field.type === 'float' ? 'any' : undefined" :value="inputValue(field)" :disabled="!fieldIsEditable(field)" @input="setConfigField(field, $event.target.value)" />
                 <div class="field-actions">
                   <button type="button" class="pin-button" :class="{ active: isPinned(field) }" :aria-label="`${isPinned(field) ? 'Unpin' : 'Pin'} ${field.name}`" :title="`${isPinned(field) ? 'Unpin' : 'Pin'} ${field.name}`" @click="togglePinned(field)">📌</button>
                   <button v-if="Object.prototype.hasOwnProperty.call(config.overrides, field.name)" type="button" class="reset-button" title="Restore preset default" @click="resetOverride(field)">Reset</button>
