@@ -14,6 +14,7 @@ import {
   remainingTrainingTimeCaption,
 } from './runTiming'
 import { historicalEvalUpdatesForTarget } from './configEditing'
+import { launchGitCommit, launchWorktreeState } from './runProvenance'
 
 const defaultConfig = () => ({
   name: `halfcourt-${new Date().toISOString().slice(0, 10)}`,
@@ -1052,6 +1053,8 @@ onBeforeUnmount(() => {
             <h3>Runtime</h3>
             <dl>
               <div><dt>PID</dt><dd>{{ selected.pid || '—' }}</dd></div>
+              <div><dt>Launch Git commit</dt><dd class="mono">{{ launchGitCommit(selected) }}</dd></div>
+              <div><dt>Launch worktree</dt><dd>{{ launchWorktreeState(selected) }}</dd></div>
               <div><dt>MLflow tracking URI</dt><dd>{{ selected.config.mlflow_tracking_uri }}</dd></div>
               <div><dt>MLflow experiment</dt><dd>{{ selected.config.mlflow_experiment_name }}</dd></div>
               <div><dt>Started</dt><dd>{{ formatDate(selected.started_at) }}</dd></div>

@@ -51,6 +51,11 @@ Closing the browser or stopping the frontend does not stop a training worker. Th
 
 Every durable checkpoint records its Git commit, tracked-worktree cleanliness, and (when dirty) a SHA-256 fingerprint of the tracked diff. The trainer app compares that record with the current checkout before Resume, Recover, or Continue. An exact match proceeds normally; a mismatch, unavailable Git metadata, or a legacy checkpoint requires explicit confirmation. This provenance is diagnostic only—it does not guarantee dependency or runtime compatibility.
 
+Run detail shows the full Git commit and worktree state captured for the most
+recent worker launch. For a resumed or continued run, these fields describe the
+latest launch. Runs created before launch provenance was recorded show the
+values as unavailable.
+
 DuckDB stores control-plane state only. MLflow remains the source of truth for training metrics, parameters, and uploaded artifacts.
 
 Every launch explicitly records an MLflow tracking URI and experiment name.
