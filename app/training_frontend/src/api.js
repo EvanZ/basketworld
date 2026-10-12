@@ -1,4 +1,18 @@
-const API_ROOT = import.meta.env.VITE_TRAINING_API_URL || '/api/v1'
+const API_ROOT = import.meta.env?.VITE_TRAINING_API_URL || '/api/v1'
+
+export function responseErrorMessage(payload, status) {
+  const detail = payload?.detail
+  if (typeof detail === 'string') return detail
+  if (typeof detail?.message === 'string') return detail.message
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => item?.msg)
+      .filter((message) => typeof message === 'string' && message.trim())
+      .map((message) => message.replace(/^Value error,\s*/i, ''))
+    if (messages.length) return [...new Set(messages)].join(' ')
+  }
+  return `Request failed (${status})`
+}
 
 async function request(path, options = {}) {
   const response = await fetch(`${API_ROOT}${path}`, {
@@ -8,9 +22,7 @@ async function request(path, options = {}) {
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}))
     const detail = payload.detail
-    const message = typeof detail === 'string'
-      ? detail
-      : detail?.message || `Request failed (${response.status})`
+    const message = responseErrorMessage(payload, response.status)
     const error = new Error(message)
     error.detail = detail
     throw error

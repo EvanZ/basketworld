@@ -98,6 +98,9 @@ rather than `num_envs`, and the JAX evaluation cadence fields rather than
 `eval_freq`. This prevents a launch from accepting a setting that has no effect.
 
 Use **Copy as new run** on an application run to duplicate its launch config.
+When the copied run's update target changes, the form drops historical
+evaluation milestones beyond the new target. If the source schedule evaluated
+at its final update, that final milestone moves to the new target.
 To copy an MLflow run, paste its run ID in **Copy an MLflow run**. Runs created
 after this feature include `metadata/resolved_training_config.json` and can be
 reconstructed exactly. Older runs are reconstructed from their logged MLflow
