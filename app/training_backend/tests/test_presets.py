@@ -119,6 +119,36 @@ def test_preview_compiles_shot_contest_overrides(tmp_path):
         assert preview.argv[index + 1] == value
 
 
+def test_preview_carries_check_clearance_controls_and_validates_check_mode(tmp_path):
+    config = TrainingRunConfig(
+        check_deadline_steps=7,
+        check_setup_steps=5,
+        check_clearance=2,
+    )
+    preview = build_halfcourt_multi_possession_preview(
+        config=config,
+        run_id="12121212-1212-4121-8121-121212121212",
+        repo_root=tmp_path,
+        data_dir=tmp_path / "data",
+    )
+    expected = {
+        "--check-deadline-steps": "7",
+        "--check-setup-steps": "5",
+        "--check-clearance": "2",
+    }
+    for option, value in expected.items():
+        index = preview.argv.index(option)
+        assert preview.argv[index + 1] == value
+
+    with pytest.raises(ValidationError, match="requires made_basket_restart_mode"):
+        TrainingRunConfig(
+            made_basket_restart_mode="baseline_inbound",
+            check_clearance=1,
+        )
+    with pytest.raises(ValidationError, match="requires at least one"):
+        TrainingRunConfig(check_clearance=1, check_setup_steps=0)
+
+
 def test_resume_uses_full_state_checkpoint_without_reset_flags(tmp_path):
     preview = build_halfcourt_multi_possession_preview(
         config=TrainingRunConfig(num_updates=5000),

@@ -106,6 +106,7 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "inbound_deadline_steps",
     "check_deadline_steps",
     "check_setup_steps",
+    "check_clearance",
 }
 
 
@@ -149,6 +150,7 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "inbound_deadline_steps": 5,
     "check_deadline_steps": 5,
     "check_setup_steps": 0,
+    "check_clearance": 0,
 }
 
 _JAX_STATIC_ONLY_ENV_CASTS = {
@@ -191,6 +193,7 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "inbound_deadline_steps": "int",
     "check_deadline_steps": "int",
     "check_setup_steps": "int",
+    "check_clearance": "int",
 }
 
 
@@ -1415,6 +1418,9 @@ class JaxDevRuntime:
             rebound_win_prob_features=bool(getattr(self.raw_model.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(self.raw_model.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(self.raw_model.spec, "multi_possession_features", False)),
+            check_clearance_features=(
+                int(getattr(self.raw_model.spec, "observation_schema_version", 1)) >= 5
+            ),
         )
         obs = _adapt_policy_observation_to_spec(obs, self.static, self.raw_model.spec, self.jnp)
         players, globals_vec, _ = build_token_observation_components_batch(
@@ -1427,6 +1433,9 @@ class JaxDevRuntime:
             ),
             rebound_target_observation_features=bool(getattr(self.raw_model.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(self.raw_model.spec, "multi_possession_features", False)),
+            check_clearance_features=(
+                int(getattr(self.raw_model.spec, "observation_schema_version", 1)) >= 5
+            ),
         )
         skills = self.jnp.stack(
             [
@@ -1479,6 +1488,9 @@ class JaxDevRuntime:
             rebound_win_prob_features=bool(getattr(raw.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(raw.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(raw.spec, "multi_possession_features", False)),
+            check_clearance_features=(
+                int(getattr(raw.spec, "observation_schema_version", 1)) >= 5
+            ),
         )
         flat_obs = _adapt_policy_observation_to_spec(flat_obs, self.static, raw.spec, self.jnp)
         full_action_mask = build_action_masks_batch(self.static, self.state, self.jnp)
@@ -2599,6 +2611,12 @@ class JaxDevRuntime:
                     "team": "team_a" if check_team == TEAM_A else "team_b",
                     "completed": _as_bool(out.check_pickup[0]),
                     "violation": _as_bool(out.check_violation[0]),
+                    "offense_space_violation": _as_bool(
+                        out.check_space_offense_violation[0]
+                    ),
+                    "defense_space_violation": _as_bool(
+                        out.check_space_defense_violation[0]
+                    ),
                     "pickup_player": pickup_player
                     if _as_bool(out.check_pickup[0]) and pickup_player >= 0
                     else None,
@@ -2616,6 +2634,21 @@ class JaxDevRuntime:
                 {
                     "team": "team_a" if check_team == TEAM_A else "team_b",
                     "setup": True,
+                    "offense_space_violation": _as_bool(
+                        out.check_space_offense_violation[0]
+                    ),
+                    "defense_space_violation": _as_bool(
+                        out.check_space_defense_violation[0]
+                    ),
+                    "double_violation": _as_bool(
+                        out.check_space_double_violation[0]
+                    ),
+                    "random_resolution": _as_bool(
+                        out.check_space_random_resolution[0]
+                    ),
+                    "double_violation_count": _as_int(
+                        _field0(next_state, "check_double_violation_count")
+                    ),
                     "setup_steps_remaining": _as_int(
                         _field0(next_state, "check_setup_steps_remaining")
                     ),
@@ -2963,6 +2996,9 @@ class JaxDevRuntime:
             ),
             multi_possession_features=bool(
                 getattr(selector_model.spec, "multi_possession_features", False)
+            ),
+            check_clearance_features=(
+                int(getattr(selector_model.spec, "observation_schema_version", 1)) >= 5
             ),
         )
         flat_obs = _adapt_policy_observation_to_spec(
@@ -3543,6 +3579,10 @@ class JaxDevRuntime:
             "inbound_reason": _field0(self.state, "inbound_reason"),
             "inbound_steps_remaining": _field0(self.state, "inbound_steps_remaining"),
             "check_team": _field0(self.state, "check_team"),
+            "check_ball_position": _field0(self.state, "check_ball_position"),
+            "check_double_violation_count": _field0(
+                self.state, "check_double_violation_count"
+            ),
             "check_setup_steps_remaining": _field0(
                 self.state, "check_setup_steps_remaining"
             ),
@@ -3757,8 +3797,20 @@ class JaxDevRuntime:
                 )
             ),
             "check_position": [
-                int(v) for v in np.asarray(self.static.check_position).tolist()
+                int(v)
+                for v in np.asarray(host["check_ball_position"], dtype=np.int32)
+                .reshape(-1, 2)[0]
+                .tolist()
             ],
+            "check_clearance": _int_from_static_field(
+                self.static,
+                "check_clearance",
+                0,
+            ),
+            "check_double_violation_count": int(
+                np.asarray(host["check_double_violation_count"]).reshape(-1)[0]
+            ),
+            "check_double_violation_limit": 3,
             "check_steps_remaining": int(
                 np.asarray(host["check_steps_remaining"]).reshape(-1)[0]
             ),
@@ -3947,6 +3999,9 @@ class JaxDevRuntime:
             ),
             rebound_target_observation_features=rebound_target_observation_features,
             multi_possession_features=self.multi_possession_enabled,
+            check_clearance_features=(
+                int(getattr(self.raw_model.spec, "observation_schema_version", 1)) >= 5
+            ),
         )
         attention_payloads = self._attention_payloads_for_state(observer_is_offense)
         attention_payload = attention_payloads["default"]
@@ -4122,8 +4177,21 @@ class JaxDevRuntime:
                 )
             ),
             "check_position": [
-                int(v) for v in np.asarray(self.static.check_position).tolist()
+                int(v)
+                for v in np.asarray(
+                    _field0(self.state, "check_ball_position"),
+                    dtype=np.int32,
+                ).reshape(-1, 2)[0].tolist()
             ],
+            "check_clearance": _int_from_static_field(
+                self.static,
+                "check_clearance",
+                0,
+            ),
+            "check_double_violation_count": _as_int(
+                _field0(self.state, "check_double_violation_count")
+            ),
+            "check_double_violation_limit": 3,
             "check_steps_remaining": _as_int(
                 _field0(self.state, "check_steps_remaining")
             ),

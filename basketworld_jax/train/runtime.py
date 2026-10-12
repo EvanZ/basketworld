@@ -87,6 +87,10 @@ HISTORICAL_MATCH_DIAGNOSTIC_KEYS = (
     "check_setup_steps",
     "check_pickups",
     "check_violations",
+    "check_space_offense_violations",
+    "check_space_defense_violations",
+    "check_space_double_violations",
+    "check_space_random_resolutions",
     "check_pickup_steps",
     "spatial_live_steps",
     "spatial_all_player_pair_distance",
@@ -1297,6 +1301,9 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
+                ),
             )
             policy_state, selector_metrics = _maybe_apply_selector_segment_start(
                 static,
@@ -1473,6 +1480,10 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 check_setup_steps=jnp.where(active_step, env_out.check_setup_step.astype(jnp.int8), 0),
                 check_pickups=jnp.where(active_step, env_out.check_pickup.astype(jnp.int8), 0),
                 check_violations=jnp.where(active_step, env_out.check_violation.astype(jnp.int8), 0),
+                check_space_offense_violations=jnp.where(active_step, env_out.check_space_offense_violation.astype(jnp.int8), 0),
+                check_space_defense_violations=jnp.where(active_step, env_out.check_space_defense_violation.astype(jnp.int8), 0),
+                check_space_double_violations=jnp.where(active_step, env_out.check_space_double_violation.astype(jnp.int8), 0),
+                check_space_random_resolutions=jnp.where(active_step, env_out.check_space_random_resolution.astype(jnp.int8), 0),
                 check_pickup_steps=jnp.where(active_step, env_out.check_pickup_steps.astype(jnp.int32), 0),
                 possession_ended=jnp.where(
                     active_step,
@@ -1571,10 +1582,13 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
             rebound_target_observation_features=bool(
                 getattr(spec, "rebound_target_observation_features", True)
             ),
-            multi_possession_features=bool(
-                getattr(spec, "multi_possession_features", False)
-            ),
-        )
+                multi_possession_features=bool(
+                    getattr(spec, "multi_possession_features", False)
+                ),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
+                ),
+            )
         final_intent_context = build_policy_intent_context_batch(static, final_state, jnp)
         final_action_mask = build_action_masks_batch(static, final_state, jnp)[:, training_ids, :]
         final_forward = actor_critic_forward(
@@ -1709,6 +1723,9 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
+                ),
             )
             policy_state, selector_metrics = _maybe_apply_selector_segment_start(
                 static,
@@ -1740,6 +1757,9 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 ),
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
+                ),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
             )
             policy_intent_context = build_policy_intent_context_batch(static, policy_state, jnp)
@@ -1952,6 +1972,10 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 check_setup_steps=jnp.where(active_step, env_out.check_setup_step.astype(jnp.int8), 0),
                 check_pickups=jnp.where(active_step, env_out.check_pickup.astype(jnp.int8), 0),
                 check_violations=jnp.where(active_step, env_out.check_violation.astype(jnp.int8), 0),
+                check_space_offense_violations=jnp.where(active_step, env_out.check_space_offense_violation.astype(jnp.int8), 0),
+                check_space_defense_violations=jnp.where(active_step, env_out.check_space_defense_violation.astype(jnp.int8), 0),
+                check_space_double_violations=jnp.where(active_step, env_out.check_space_double_violation.astype(jnp.int8), 0),
+                check_space_random_resolutions=jnp.where(active_step, env_out.check_space_random_resolution.astype(jnp.int8), 0),
                 check_pickup_steps=jnp.where(active_step, env_out.check_pickup_steps.astype(jnp.int32), 0),
                 possession_ended=jnp.where(
                     active_step,
@@ -2089,10 +2113,13 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
             rebound_target_observation_features=bool(
                 getattr(spec, "rebound_target_observation_features", True)
             ),
-            multi_possession_features=bool(
-                getattr(spec, "multi_possession_features", False)
-            ),
-        )
+                multi_possession_features=bool(
+                    getattr(spec, "multi_possession_features", False)
+                ),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
+                ),
+            )
         final_intent_context = build_policy_intent_context_batch(static, final_state, jnp)
         final_action_mask = build_action_masks_batch(static, final_state, jnp)[:, training_ids, :]
         final_forward = actor_critic_forward(
@@ -2232,6 +2259,9 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
+                ),
             )
             policy_state, selector_metrics = _maybe_apply_selector_segment_start(
                 static,
@@ -2260,6 +2290,9 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
+                ),
             )
             policy_intent_context = build_policy_intent_context_batch(static, policy_state, jnp)
             opponent_intent_context = build_policy_intent_context_batch_with_role_flag(
@@ -2442,6 +2475,10 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 check_setup_steps=jnp.where(active_step, env_out.check_setup_step.astype(jnp.int8), 0),
                 check_pickups=jnp.where(active_step, env_out.check_pickup.astype(jnp.int8), 0),
                 check_violations=jnp.where(active_step, env_out.check_violation.astype(jnp.int8), 0),
+                check_space_offense_violations=jnp.where(active_step, env_out.check_space_offense_violation.astype(jnp.int8), 0),
+                check_space_defense_violations=jnp.where(active_step, env_out.check_space_defense_violation.astype(jnp.int8), 0),
+                check_space_double_violations=jnp.where(active_step, env_out.check_space_double_violation.astype(jnp.int8), 0),
+                check_space_random_resolutions=jnp.where(active_step, env_out.check_space_random_resolution.astype(jnp.int8), 0),
                 check_pickup_steps=jnp.where(active_step, env_out.check_pickup_steps.astype(jnp.int32), 0),
                 possession_ended=jnp.where(
                     active_step,
@@ -2579,8 +2616,11 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
             model_type=spec.model_type,
             rebound_win_prob_features=bool(spec.rebound_win_prob_features),
             rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
-            multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
-        )
+                multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
+                ),
+            )
         final_intent_context = build_policy_intent_context_batch(static, final_state, jnp)
         final_action_mask = build_action_masks_batch(static, final_state, jnp)[:, training_ids, :]
         final_forward = actor_critic_forward(
@@ -2640,6 +2680,9 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                     ),
                     multi_possession_features=bool(
                         getattr(spec, "multi_possession_features", False)
+                    ),
+                    check_clearance_features=(
+                        int(getattr(spec, "observation_schema_version", 1)) >= 5
                     ),
                 ),
                 spec,
@@ -2708,6 +2751,10 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 check_setup_steps=env_out.check_setup_step.astype(jnp.int8),
                 check_pickups=env_out.check_pickup.astype(jnp.int8),
                 check_violations=env_out.check_violation.astype(jnp.int8),
+                check_space_offense_violations=env_out.check_space_offense_violation.astype(jnp.int8),
+                check_space_defense_violations=env_out.check_space_defense_violation.astype(jnp.int8),
+                check_space_double_violations=env_out.check_space_double_violation.astype(jnp.int8),
+                check_space_random_resolutions=env_out.check_space_random_resolution.astype(jnp.int8),
                 check_pickup_steps=env_out.check_pickup_steps.astype(jnp.int32),
                 possession_ended=env_out.possession_ended.astype(jnp.int8),
                 completed_possession_live_steps=(
@@ -2768,6 +2815,9 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                     multi_possession_features=bool(
                         getattr(spec, "multi_possession_features", False)
                     ),
+                    check_clearance_features=(
+                        int(getattr(spec, "observation_schema_version", 1)) >= 5
+                    ),
                 ),
                 spec,
                 jnp,
@@ -2794,6 +2844,9 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                     ),
                     multi_possession_features=bool(
                         getattr(spec, "multi_possession_features", False)
+                    ),
+                    check_clearance_features=(
+                        int(getattr(spec, "observation_schema_version", 1)) >= 5
                     ),
                 ),
                 opponent_action_mask,
@@ -2852,6 +2905,10 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 check_setup_steps=env_out.check_setup_step.astype(jnp.int8),
                 check_pickups=env_out.check_pickup.astype(jnp.int8),
                 check_violations=env_out.check_violation.astype(jnp.int8),
+                check_space_offense_violations=env_out.check_space_offense_violation.astype(jnp.int8),
+                check_space_defense_violations=env_out.check_space_defense_violation.astype(jnp.int8),
+                check_space_double_violations=env_out.check_space_double_violation.astype(jnp.int8),
+                check_space_random_resolutions=env_out.check_space_random_resolution.astype(jnp.int8),
                 check_pickup_steps=env_out.check_pickup_steps.astype(jnp.int32),
                 possession_ended=env_out.possession_ended.astype(jnp.int8),
                 completed_possession_live_steps=(
@@ -2945,6 +3002,18 @@ def _build_historical_match_step_diagnostics(
     counters["check_setup_steps"] = _count(env_out.check_setup_step)
     counters["check_pickups"] = _count(env_out.check_pickup)
     counters["check_violations"] = _count(env_out.check_violation)
+    counters["check_space_offense_violations"] = _count(
+        env_out.check_space_offense_violation
+    )
+    counters["check_space_defense_violations"] = _count(
+        env_out.check_space_defense_violation
+    )
+    counters["check_space_double_violations"] = _count(
+        env_out.check_space_double_violation
+    )
+    counters["check_space_random_resolutions"] = _count(
+        env_out.check_space_random_resolution
+    )
     counters["check_pickup_steps"] = jnp.where(
         active_step,
         env_out.check_pickup_steps.astype(jnp.float32),
@@ -3124,6 +3193,9 @@ def build_compiled_historical_match_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
+                ),
             )
             state, _ = _maybe_apply_deterministic_selector_segment_start_for_role(
                 static,
@@ -3153,6 +3225,9 @@ def build_compiled_historical_match_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 ),
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
+                ),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
             )
             state, _ = _maybe_apply_deterministic_selector_segment_start_for_role(
@@ -3188,6 +3263,9 @@ def build_compiled_historical_match_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
+                ),
             )
             opponent_obs = build_policy_observation_batch_with_role_flag(
                 static,
@@ -3201,6 +3279,9 @@ def build_compiled_historical_match_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 ),
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
+                ),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
             )
             candidate_forward = actor_critic_forward(
@@ -3404,6 +3485,9 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                     multi_possession_features=bool(
                         getattr(spec, "multi_possession_features", False)
                     ),
+                    check_clearance_features=(
+                        int(getattr(spec, "observation_schema_version", 1)) >= 5
+                    ),
                 ),
                 spec,
                 jnp,
@@ -3429,6 +3513,9 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                     ),
                     multi_possession_features=bool(
                         getattr(spec, "multi_possession_features", False)
+                    ),
+                    check_clearance_features=(
+                        int(getattr(spec, "observation_schema_version", 1)) >= 5
                     ),
                 ),
                 opponent_action_mask,
@@ -3484,6 +3571,10 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 check_setup_steps=env_out.check_setup_step.astype(jnp.int8),
                 check_pickups=env_out.check_pickup.astype(jnp.int8),
                 check_violations=env_out.check_violation.astype(jnp.int8),
+                check_space_offense_violations=env_out.check_space_offense_violation.astype(jnp.int8),
+                check_space_defense_violations=env_out.check_space_defense_violation.astype(jnp.int8),
+                check_space_double_violations=env_out.check_space_double_violation.astype(jnp.int8),
+                check_space_random_resolutions=env_out.check_space_random_resolution.astype(jnp.int8),
                 check_pickup_steps=env_out.check_pickup_steps.astype(jnp.int32),
                 possession_ended=env_out.possession_ended.astype(jnp.int8),
                 completed_possession_live_steps=(
@@ -3557,6 +3648,9 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
+                ),
             )
             state, selector_metrics = _maybe_apply_deterministic_selector_segment_start(
                 static,
@@ -3583,6 +3677,9 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
+                ),
             )
             defense_obs = build_policy_observation_batch_with_role_flag(
                 static,
@@ -3593,6 +3690,9 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
+                ),
             )
             offense_forward = actor_critic_forward(
                 params,
@@ -3697,6 +3797,10 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 check_setup_steps=_active_sum(env_out.check_setup_step),
                 check_pickups=_active_sum(env_out.check_pickup),
                 check_violations=_active_sum(env_out.check_violation),
+                check_space_offense_violations=_active_sum(env_out.check_space_offense_violation),
+                check_space_defense_violations=_active_sum(env_out.check_space_defense_violation),
+                check_space_double_violations=_active_sum(env_out.check_space_double_violation),
+                check_space_random_resolutions=_active_sum(env_out.check_space_random_resolution),
                 check_pickup_steps=_active_sum(env_out.check_pickup_steps),
                 completed_possessions=_active_sum(env_out.possession_ended),
                 completed_possession_live_steps=_active_sum(
@@ -3982,6 +4086,18 @@ def summarize_deploy_eval_outputs(
         ),
         "check_pickup_count": int(totals["check_pickups"]),
         "check_violation_count": int(totals["check_violations"]),
+        "check_space_offense_violation_count": int(
+            totals["check_space_offense_violations"]
+        ),
+        "check_space_defense_violation_count": int(
+            totals["check_space_defense_violations"]
+        ),
+        "check_space_double_violation_count": int(
+            totals["check_space_double_violations"]
+        ),
+        "check_space_random_resolution_count": int(
+            totals["check_space_random_resolutions"]
+        ),
         "check_pickup_rate": _rate(
             totals["check_pickups"], totals["check_opportunities"]
         ),
@@ -4892,6 +5008,10 @@ def summarize_ppo_eligible_episode_metrics(
         "check_setup_steps": trajectory.check_setup_steps,
         "check_pickups": trajectory.check_pickups,
         "check_violations": trajectory.check_violations,
+        "check_space_offense_violations": trajectory.check_space_offense_violations,
+        "check_space_defense_violations": trajectory.check_space_defense_violations,
+        "check_space_double_violations": trajectory.check_space_double_violations,
+        "check_space_random_resolutions": trajectory.check_space_random_resolutions,
         "learner_turnovers": trajectory.learner_turnovers,
         "opponent_turnovers": trajectory.opponent_turnovers,
         "offensive_three_seconds": trajectory.offensive_three_seconds,
@@ -5442,6 +5562,30 @@ def summarize_training_step(
     check_violations = float(
         np.asarray(rollout_out.trajectory.check_violations, dtype=np.float32).sum()
     )
+    check_space_offense_violations = float(
+        np.asarray(
+            rollout_out.trajectory.check_space_offense_violations,
+            dtype=np.float32,
+        ).sum()
+    )
+    check_space_defense_violations = float(
+        np.asarray(
+            rollout_out.trajectory.check_space_defense_violations,
+            dtype=np.float32,
+        ).sum()
+    )
+    check_space_double_violations = float(
+        np.asarray(
+            rollout_out.trajectory.check_space_double_violations,
+            dtype=np.float32,
+        ).sum()
+    )
+    check_space_random_resolutions = float(
+        np.asarray(
+            rollout_out.trajectory.check_space_random_resolutions,
+            dtype=np.float32,
+        ).sum()
+    )
     check_pickup_steps = float(
         np.asarray(rollout_out.trajectory.check_pickup_steps, dtype=np.float32).sum()
     )
@@ -5461,6 +5605,18 @@ def summarize_training_step(
             ),
             "check_pickup_count": int(check_pickups),
             "check_violation_count": int(check_violations),
+            "check_space_offense_violation_count": int(
+                check_space_offense_violations
+            ),
+            "check_space_defense_violation_count": int(
+                check_space_defense_violations
+            ),
+            "check_space_double_violation_count": int(
+                check_space_double_violations
+            ),
+            "check_space_random_resolution_count": int(
+                check_space_random_resolutions
+            ),
             "check_pickup_rate": float(
                 check_pickups / max(1.0, check_opportunities)
             ),

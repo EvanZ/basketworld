@@ -1251,6 +1251,10 @@ def _run_jax_playbook_batch(
                             model_type=spec.model_type,
                             rebound_win_prob_features=bool(getattr(spec, "rebound_win_prob_features", False)),
                             rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                            multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                            check_clearance_features=(
+                                int(getattr(spec, "observation_schema_version", 1)) >= 5
+                            ),
                         )
                         neutral_context = {
                             "intent_index": jnp.zeros((batch_size,), dtype=jnp.int32),
@@ -1316,7 +1320,11 @@ def _run_jax_playbook_batch(
                         jnp,
                         model_type=spec.model_type,
                         rebound_win_prob_features=bool(getattr(spec, "rebound_win_prob_features", False)),
-                            rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                        rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                        multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                        check_clearance_features=(
+                            int(getattr(spec, "observation_schema_version", 1)) >= 5
+                        ),
                     )
                     defense_obs = build_policy_observation_batch_with_role_flag(
                         static_arg,
@@ -1325,7 +1333,11 @@ def _run_jax_playbook_batch(
                         jnp,
                         model_type=spec.model_type,
                         rebound_win_prob_features=bool(getattr(spec, "rebound_win_prob_features", False)),
-                            rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                        rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
+                        multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                        check_clearance_features=(
+                            int(getattr(spec, "observation_schema_version", 1)) >= 5
+                        ),
                     )
                     offense_context = build_policy_intent_context_batch_with_role_flag(
                         static_arg,

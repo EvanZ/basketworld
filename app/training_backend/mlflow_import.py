@@ -84,7 +84,9 @@ def config_from_mlflow_values(
         "multi_possession_limit_end": "possession_limit_end",
         "multi_possession_limit_ramp_updates": "possession_limit_ramp_updates",
         "made_basket_restart_mode": "made_basket_restart_mode",
+        "check_deadline_steps": "check_deadline_steps",
         "check_setup_steps": "check_setup_steps",
+        "check_clearance": "check_clearance",
         "multi_possession_use_inbounds": "multi_possession_use_inbounds",
     }
     for source, target in application_field_mapping.items():

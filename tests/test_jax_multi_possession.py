@@ -69,6 +69,8 @@ def _multi_possession_static(
     three_point_distance: float = 4.0,
     three_point_short_distance: float | None = None,
     overtime_round_cap: int = 0,
+    check_clearance: int = 0,
+    check_setup_steps: int = 0,
 ):
     env = HexagonBasketballEnv(
         players=players,
@@ -93,6 +95,8 @@ def _multi_possession_static(
     env.enable_multi_possession = True
     env.multi_possession_limit = possession_limit
     env.multi_possession_overtime_round_cap = overtime_round_cap
+    env.check_clearance = check_clearance
+    env.check_setup_steps = check_setup_steps
     return build_kernel_static_from_env(env, xp=jnp)
 
 
@@ -307,7 +311,8 @@ def test_multi_possession_cli_validates_limit_and_disables_start_templates():
     assert defaults.multi_possession_overtime_round_cap == 0
     assert parse_args(["--enable-multi-possession"]).inbound_deadline_steps == 5
     assert parse_args(["--enable-multi-possession"]).check_deadline_steps == 5
-    assert parse_args(["--enable-multi-possession"]).check_setup_steps == 0
+    assert parse_args(["--enable-multi-possession"]).check_setup_steps == 5
+    assert parse_args(["--enable-multi-possession"]).check_clearance == 0
     assert (
         parse_args(["--enable-multi-possession"]).made_basket_restart_mode
         == "baseline_inbound"
@@ -359,6 +364,22 @@ def test_multi_possession_cli_validates_limit_and_disables_start_templates():
     with pytest.raises(SystemExit, match="check-setup-steps"):
         validate_train_args(
             parse_args(["--enable-multi-possession", "--check-setup-steps", "-1"])
+        )
+    with pytest.raises(SystemExit, match="check-clearance"):
+        validate_train_args(
+            parse_args(["--enable-multi-possession", "--check-clearance", "-1"])
+        )
+    with pytest.raises(SystemExit, match="requires --check-setup-steps"):
+        validate_train_args(
+            parse_args(
+                [
+                    "--enable-multi-possession",
+                    "--check-clearance",
+                    "1",
+                    "--check-setup-steps",
+                    "0",
+                ]
+            )
         )
     with pytest.raises(SystemExit, match="game-winner-reward"):
         validate_train_args(
@@ -462,6 +483,217 @@ def _check_state(static, *, countdown: int = 5, seed: int = 310):
         ),
         offense_player,
         MOVE_ACTION_START + entry_direction,
+    )
+
+
+def _clearance_setup_state(static, positions, *, double_violations: int = 0, seed: int = 610):
+    state = reset_batch_minimal(
+        static,
+        jax.random.split(jax.random.PRNGKey(seed), 1),
+        jax,
+        jnp,
+    )
+    check_index = int(np.flatnonzero(np.asarray(static.check_candidate_mask))[0])
+    check_position = np.asarray(static.cell_coords[check_index], dtype=np.int32)
+    return state._replace(
+        positions=jnp.asarray(positions[None, :, :], dtype=jnp.int32),
+        ball_holder=jnp.asarray([-1], dtype=jnp.int32),
+        offense_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
+        game_phase=jnp.asarray([GAME_PHASE_CHECK_SETUP], dtype=jnp.int8),
+        check_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
+        check_ball_position=jnp.asarray([check_position], dtype=jnp.int32),
+        check_setup_steps_remaining=jnp.asarray([1], dtype=jnp.int32),
+        check_steps_remaining=jnp.asarray([0], dtype=jnp.int32),
+        check_double_violation_count=jnp.asarray([double_violations], dtype=jnp.int32),
+        clearance_achieved=jnp.asarray([0], dtype=jnp.int8),
+    )
+
+
+def _hex_distance_np(positions, target):
+    delta = np.asarray(positions, dtype=np.int32) - np.asarray(target, dtype=np.int32)
+    return (
+        np.abs(delta[..., 0])
+        + np.abs(delta[..., 1])
+        + np.abs(delta[..., 0] + delta[..., 1])
+    ) // 2
+
+
+def test_check_clearance_samples_safe_locations_and_exposes_schema_five_features():
+    static = _multi_possession_static(
+        players=2,
+        court_rows=9,
+        court_cols=8,
+        check_clearance=1,
+        check_setup_steps=1,
+    )
+    candidates = np.asarray(static.cell_coords)[
+        np.asarray(static.check_candidate_mask, dtype=bool)
+    ]
+    assert candidates.size > 0
+    for candidate in candidates:
+        assert int(np.sum(_hex_distance_np(np.asarray(static.cell_coords), candidate) <= 2)) == 19
+
+    positions = np.asarray(static.cell_coords, dtype=np.int32)[:4]
+    state = _clearance_setup_state(static, positions)
+    players, globals_vec, _ = build_token_observation_components_batch(
+        static,
+        state,
+        jnp.asarray([1.0], dtype=jnp.float32),
+        jnp,
+        multi_possession_features=True,
+        check_clearance_features=True,
+    )
+    assert players.shape[-1] == token_observation_dims(
+        False, True, True, True
+    )[0]
+    assert globals_vec.shape[-1] == token_observation_dims(
+        False, True, True, True
+    )[1]
+    check_position = np.asarray(state.check_ball_position)[0]
+    np.testing.assert_allclose(
+        np.asarray(globals_vec)[0, -5:-3],
+        check_position / float(np.asarray(static.court_norm_den)),
+    )
+    assert float(np.asarray(globals_vec)[0, -3]) > 0.0
+    assert float(np.asarray(globals_vec)[0, -1]) == pytest.approx(1.0 / 120.0)
+
+
+def test_check_clearance_applies_single_team_penalties_and_breaks_double_violation_symmetry():
+    static = _multi_possession_static(
+        players=2,
+        court_rows=9,
+        court_cols=8,
+        check_clearance=1,
+        check_setup_steps=1,
+    )
+    cells = np.asarray(static.cell_coords, dtype=np.int32)
+    check_position = cells[int(np.flatnonzero(np.asarray(static.check_candidate_mask))[0])]
+    outside = cells[_hex_distance_np(cells, check_position) > 1]
+    actions = jnp.full((1, 4), ActionType.NOOP.value, dtype=jnp.int32)
+
+    defense_only = _clearance_setup_state(
+        static,
+        np.vstack([outside[:2], check_position[None, :], outside[2:3]]),
+    )
+    defense_out = step_batch_minimal(
+        static,
+        defense_only,
+        actions,
+        jax.random.split(jax.random.PRNGKey(611), 1),
+        jax,
+        jnp,
+    )
+    assert int(np.asarray(defense_out.check_space_defense_violation)[0]) == 1
+    assert int(np.asarray(defense_out.check_pickup)[0]) == 0
+    assert int(np.asarray(defense_out.possession_ended)[0]) == 0
+    assert float(np.asarray(defense_out.team_a_score_delta)[0]) == pytest.approx(1.0)
+
+    offense_only = _clearance_setup_state(
+        static,
+        np.vstack([check_position[None, :], outside[:1], outside[1:3]]),
+        seed=612,
+    )
+    offense_out = step_batch_minimal(
+        static,
+        offense_only,
+        actions,
+        jax.random.split(jax.random.PRNGKey(613), 1),
+        jax,
+        jnp,
+    )
+    assert int(np.asarray(offense_out.check_space_offense_violation)[0]) == 1
+    assert int(np.asarray(offense_out.possession_ended)[0]) == 1
+    assert float(np.asarray(offense_out.team_b_score_delta)[0]) == pytest.approx(1.0)
+
+    double_positions = np.broadcast_to(check_position, (4, 2)).copy()
+    retry_state = _clearance_setup_state(static, double_positions, seed=614)
+    first_retry = step_batch_minimal(
+        static,
+        retry_state,
+        actions,
+        jax.random.split(jax.random.PRNGKey(615), 1),
+        jax,
+        jnp,
+    )
+    second_retry = step_batch_minimal(
+        static,
+        first_retry.state,
+        actions,
+        jax.random.split(jax.random.PRNGKey(616), 1),
+        jax,
+        jnp,
+    )
+    resolved = step_batch_minimal(
+        static,
+        second_retry.state,
+        actions,
+        jax.random.split(jax.random.PRNGKey(617), 1),
+        jax,
+        jnp,
+    )
+    assert int(np.asarray(first_retry.check_space_double_violation)[0]) == 1
+    assert int(np.asarray(first_retry.state.check_double_violation_count)[0]) == 1
+    assert int(np.asarray(second_retry.state.check_double_violation_count)[0]) == 2
+    assert int(np.asarray(resolved.check_space_double_violation)[0]) == 1
+    assert int(np.asarray(resolved.check_space_random_resolution)[0]) == 1
+    assert int(np.asarray(resolved.state.check_double_violation_count)[0]) == 0
+    assert float(
+        np.asarray(resolved.team_a_score_delta)[0]
+        + np.asarray(resolved.team_b_score_delta)[0]
+    ) == pytest.approx(1.0)
+
+
+def test_check_clearance_defender_reentry_wins_over_same_step_pickup():
+    static = _multi_possession_static(
+        players=2,
+        court_rows=9,
+        court_cols=8,
+        check_clearance=1,
+        check_setup_steps=1,
+    )
+    cells = np.asarray(static.cell_coords, dtype=np.int32)
+    check_position = cells[int(np.flatnonzero(np.asarray(static.check_candidate_mask))[0])]
+    direction = np.asarray(static.hex_directions, dtype=np.int32)[0]
+    defender_start = check_position + (2 * direction)
+    defender_destination = check_position + direction
+    outside = cells[_hex_distance_np(cells, check_position) > 1]
+    positions = np.vstack(
+        [
+            check_position[None, :],
+            outside[:1],
+            defender_start[None, :],
+            outside[1:2],
+        ]
+    )
+    state = _clearance_setup_state(static, positions, seed=618)._replace(
+        game_phase=jnp.asarray([GAME_PHASE_AWAITING_CHECK], dtype=jnp.int8),
+        check_setup_steps_remaining=jnp.asarray([0], dtype=jnp.int32),
+        check_steps_remaining=jnp.asarray([5], dtype=jnp.int32),
+    )
+    defender_move = next(
+        action
+        for action, candidate_direction in enumerate(
+            np.asarray(static.hex_directions, dtype=np.int32),
+            start=MOVE_ACTION_START,
+        )
+        if np.array_equal(candidate_direction, -direction)
+    )
+    actions = jnp.full((1, 4), ActionType.NOOP.value, dtype=jnp.int32)
+    actions = actions.at[0, 2].set(defender_move)
+    out = step_batch_minimal(
+        static,
+        state,
+        actions,
+        jax.random.split(jax.random.PRNGKey(619), 1),
+        jax,
+        jnp,
+    )
+    assert int(np.asarray(out.check_pickup)[0]) == 0
+    assert int(np.asarray(out.check_space_defense_violation)[0]) == 1
+    assert int(np.asarray(out.possession_ended)[0]) == 0
+    assert np.array_equal(
+        np.asarray(out.state.positions)[0, 2],
+        defender_destination,
     )
 
 

@@ -51,6 +51,8 @@ Closing the browser or stopping the frontend does not stop a training worker. Th
 
 Every durable checkpoint records its Git commit, tracked-worktree cleanliness, and (when dirty) a SHA-256 fingerprint of the tracked diff. The trainer app compares that record with the current checkout before Resume, Recover, or Continue. An exact match proceeds normally; a mismatch, unavailable Git metadata, or a legacy checkpoint requires explicit confirmation. This provenance is diagnostic only—it does not guarantee dependency or runtime compatibility.
 
+For check-based made-basket restarts, the trainer configuration exposes **Pre-check setup steps**, **Check pickup seconds**, and **Check-clearance rings**. New configurations use five seconds for setup and five seconds for pickup. A nonzero clearance samples one eligible pickup tile outside the clearance arc; the protected disk, plus one inbounds ring, must fit on the court. During setup both teams must clear it. An offense-only violation awards the defense one point and ends possession; a defense-only violation awards the offense one point and restarts the same possession with a defensive technical. The first two double violations repeat setup at the same tile, and the third assigns one of those single-team penalties with a seeded 50/50 draw. Nonzero-clearance policies use a new observation schema and should train from scratch.
+
 Run detail shows the full Git commit and worktree state captured for the most
 recent worker launch. For a resumed or continued run, these fields describe the
 latest launch. Runs created before launch provenance was recorded show the

@@ -92,6 +92,10 @@ class TrajectoryBatch(NamedTuple):
     check_setup_steps: Any
     check_pickups: Any
     check_violations: Any
+    check_space_offense_violations: Any
+    check_space_defense_violations: Any
+    check_space_double_violations: Any
+    check_space_random_resolutions: Any
     check_pickup_steps: Any
     possession_ended: Any
     completed_possession_live_steps: Any
@@ -222,6 +226,10 @@ class EvalTrace(NamedTuple):
     check_setup_steps: Any
     check_pickups: Any
     check_violations: Any
+    check_space_offense_violations: Any
+    check_space_defense_violations: Any
+    check_space_double_violations: Any
+    check_space_random_resolutions: Any
     check_pickup_steps: Any
     possession_ended: Any
     completed_possession_live_steps: Any
@@ -294,6 +302,10 @@ class DeployEvalTotals(NamedTuple):
     check_setup_steps: Any
     check_pickups: Any
     check_violations: Any
+    check_space_offense_violations: Any
+    check_space_defense_violations: Any
+    check_space_double_violations: Any
+    check_space_random_resolutions: Any
     check_pickup_steps: Any
     completed_possessions: Any
     completed_possession_live_steps: Any

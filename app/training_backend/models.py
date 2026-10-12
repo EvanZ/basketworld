@@ -40,7 +40,9 @@ class TrainingRunConfig(BaseModel):
     made_basket_restart_mode: Literal["baseline_inbound", "check", "direct_handoff"] = (
         "check"
     )
-    check_setup_steps: int = Field(default=0, ge=0, le=120)
+    check_deadline_steps: int = Field(default=5, ge=1, le=120)
+    check_setup_steps: int = Field(default=5, ge=0, le=120)
+    check_clearance: int = Field(default=0, ge=0, le=12)
     multi_possession_use_inbounds: bool = True
     overrides: dict[str, Any] = Field(default_factory=dict)
 
@@ -65,6 +67,15 @@ class TrainingRunConfig(BaseModel):
             raise ValueError(
                 "possession_limit_start cannot exceed possession_limit_end."
             )
+        if self.check_clearance > 0:
+            if self.made_basket_restart_mode != "check":
+                raise ValueError(
+                    "check_clearance requires made_basket_restart_mode='check'."
+                )
+            if self.check_setup_steps < 1:
+                raise ValueError(
+                    "check_clearance requires at least one check_setup_steps tick."
+                )
         if self.historical_eval_updates is not None:
             cleaned = sorted(set(self.historical_eval_updates))
             if any(update <= 0 for update in cleaned):

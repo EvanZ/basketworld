@@ -13,6 +13,7 @@ from basketworld_jax.checkpoints import load_checkpoint
 from basketworld_jax.env.minimal import (
     MOVE_ACTION_END,
     MOVE_ACTION_START,
+    CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION,
     MULTI_POSSESSION_SCHEMA_VERSION,
     GAME_PHASE_AWAITING_INBOUND,
     GAME_PHASE_AWAITING_CHECK,
@@ -113,6 +114,8 @@ def _compatible_native_cross_play_specs(
     if (
         not bool(getattr(first, "multi_possession_features", False))
         or not bool(getattr(second, "multi_possession_features", False))
+        or first_schema == int(CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION)
+        or second_schema == int(CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION)
         or first_schema not in {2, 3, int(MULTI_POSSESSION_SCHEMA_VERSION)}
         or second_schema not in {2, 3, int(MULTI_POSSESSION_SCHEMA_VERSION)}
     ):
@@ -237,6 +240,7 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "inbound_deadline_steps",
     "check_deadline_steps",
     "check_setup_steps",
+    "check_clearance",
 }
 
 _JAX_STATIC_ONLY_ENV_DEFAULTS = {
@@ -276,6 +280,7 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "inbound_deadline_steps": 5,
     "check_deadline_steps": 5,
     "check_setup_steps": 0,
+    "check_clearance": 0,
 }
 
 _JAX_STATIC_ONLY_ENV_CASTS = {
@@ -315,6 +320,7 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "inbound_deadline_steps": "int",
     "check_deadline_steps": "int",
     "check_setup_steps": "int",
+    "check_clearance": "int",
 }
 
 
@@ -1381,6 +1387,9 @@ def _build_native_eval_runner(
                 multi_possession_features=bool(
                     getattr(team_a_spec, "multi_possession_features", False)
                 ),
+                check_clearance_features=(
+                    int(getattr(team_a_spec, "observation_schema_version", 1)) >= 5
+                ),
             )
             selector_obs = _adapt_policy_observation_to_spec(
                 selector_obs, static, team_a_spec, jnp
@@ -1412,6 +1421,9 @@ def _build_native_eval_runner(
                 multi_possession_features=bool(
                     getattr(team_a_spec, "multi_possession_features", False)
                 ),
+                check_clearance_features=(
+                    int(getattr(team_a_spec, "observation_schema_version", 1)) >= 5
+                ),
             )
             team_a_obs = _adapt_policy_observation_to_spec(
                 team_a_obs, static, team_a_spec, jnp
@@ -1432,6 +1444,9 @@ def _build_native_eval_runner(
                 ),
                 multi_possession_features=bool(
                     getattr(team_b_spec, "multi_possession_features", False)
+                ),
+                check_clearance_features=(
+                    int(getattr(team_b_spec, "observation_schema_version", 1)) >= 5
                 ),
             )
             team_b_obs = _adapt_policy_observation_to_spec(
@@ -1690,6 +1705,10 @@ def _build_native_eval_runner(
                 "check_setup_steps": env_out.check_setup_step.astype(jnp.int8),
                 "check_pickups": env_out.check_pickup.astype(jnp.int8),
                 "check_violations": env_out.check_violation.astype(jnp.int8),
+                "check_space_offense_violations": env_out.check_space_offense_violation.astype(jnp.int8),
+                "check_space_defense_violations": env_out.check_space_defense_violation.astype(jnp.int8),
+                "check_space_double_violations": env_out.check_space_double_violation.astype(jnp.int8),
+                "check_space_random_resolutions": env_out.check_space_random_resolution.astype(jnp.int8),
                 "check_pickup_steps": env_out.check_pickup_steps.astype(jnp.int32),
                 "offensive_three_seconds": env_out.offensive_three_seconds.astype(
                     jnp.int8
@@ -2327,6 +2346,10 @@ def _init_eval_diagnostics() -> dict[str, Any]:
             "setup_steps": 0,
             "pickups": 0,
             "violations": 0,
+            "space_offense_violations": 0,
+            "space_defense_violations": 0,
+            "space_double_violations": 0,
+            "space_random_resolutions": 0,
             "pickup_steps_total": 0,
         },
         "assist_links": {},
@@ -3057,10 +3080,24 @@ def run_native_jax_evaluation(
             dtype=np.int32,
         ).reshape(-1)[0]
     )
-    compatible_checkpoint_schemas = {2, 3, int(MULTI_POSSESSION_SCHEMA_VERSION)}
+    clearance_schema = int(CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION)
+    legacy_checkpoint_schemas = {2, 3, int(MULTI_POSSESSION_SCHEMA_VERSION)}
+    static_check_clearance = int(
+        np.asarray(jax.device_get(static.check_clearance), dtype=np.int32).reshape(-1)[0]
+    )
+    expected_environment_schema = (
+        clearance_schema
+        if static_check_clearance > 0
+        else int(MULTI_POSSESSION_SCHEMA_VERSION)
+    )
+    compatible_checkpoint_schemas = (
+        {clearance_schema}
+        if static_check_clearance > 0
+        else legacy_checkpoint_schemas
+    )
     if static_multi and (
         not checkpoint_schema_versions.issubset(compatible_checkpoint_schemas)
-        or environment_schema_version != int(MULTI_POSSESSION_SCHEMA_VERSION)
+        or environment_schema_version != expected_environment_schema
     ):
         raise ValueError(
             "JAX checkpoint or environment uses an incompatible multi-possession "
@@ -3068,11 +3105,11 @@ def run_native_jax_evaluation(
             f"(checkpoints={sorted(checkpoint_schema_versions)}, "
             f"environment={environment_schema_version}, "
             f"supported_checkpoints={sorted(compatible_checkpoint_schemas)}, "
-            f"runtime={MULTI_POSSESSION_SCHEMA_VERSION})."
+            f"runtime={expected_environment_schema})."
         )
     if fixed_pool_mode and (
         not static_multi
-        or checkpoint_schema_versions != {int(MULTI_POSSESSION_SCHEMA_VERSION)}
+        or checkpoint_schema_versions != {expected_environment_schema}
     ):
         raise ValueError(
             "Fixed-pool evaluation requires checkpoints using the current "
@@ -3852,6 +3889,18 @@ def run_native_jax_evaluation(
                 check_diag["setup_steps"] += int(trace["check_setup_steps"][t, idx])
                 check_diag["pickups"] += int(trace["check_pickups"][t, idx])
                 check_diag["violations"] += int(trace["check_violations"][t, idx])
+                check_diag["space_offense_violations"] += int(
+                    trace["check_space_offense_violations"][t, idx]
+                )
+                check_diag["space_defense_violations"] += int(
+                    trace["check_space_defense_violations"][t, idx]
+                )
+                check_diag["space_double_violations"] += int(
+                    trace["check_space_double_violations"][t, idx]
+                )
+                check_diag["space_random_resolutions"] += int(
+                    trace["check_space_random_resolutions"][t, idx]
+                )
                 check_diag["pickup_steps_total"] += int(
                     trace["check_pickup_steps"][t, idx]
                 )
@@ -4965,6 +5014,18 @@ def run_native_jax_evaluation(
     check_setup_steps_total = int(check_diag_final.get("setup_steps", 0) or 0)
     check_pickup_count = int(check_diag_final.get("pickups", 0) or 0)
     check_violation_count = int(check_diag_final.get("violations", 0) or 0)
+    check_space_offense_violation_count = int(
+        check_diag_final.get("space_offense_violations", 0) or 0
+    )
+    check_space_defense_violation_count = int(
+        check_diag_final.get("space_defense_violations", 0) or 0
+    )
+    check_space_double_violation_count = int(
+        check_diag_final.get("space_double_violations", 0) or 0
+    )
+    check_space_random_resolution_count = int(
+        check_diag_final.get("space_random_resolutions", 0) or 0
+    )
     check_pickup_steps_total = int(check_diag_final.get("pickup_steps_total", 0) or 0)
     check_diag_final["pickup_rate"] = (
         float(check_pickup_count / check_opportunity_count)
@@ -5431,6 +5492,10 @@ def run_native_jax_evaluation(
         "check_setup_mean_executed_steps": float(check_diag_final["mean_setup_steps"]),
         "check_pickup_count": check_pickup_count,
         "check_violation_count": check_violation_count,
+        "check_space_offense_violation_count": check_space_offense_violation_count,
+        "check_space_defense_violation_count": check_space_defense_violation_count,
+        "check_space_double_violation_count": check_space_double_violation_count,
+        "check_space_random_resolution_count": check_space_random_resolution_count,
         "check_pickup_rate": float(check_diag_final["pickup_rate"]),
         "check_mean_pickup_steps": float(check_diag_final["mean_pickup_steps"]),
         "inbound_started_count": int(

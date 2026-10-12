@@ -154,6 +154,7 @@ _EVAL_ENV_OVERRIDE_KEYS = {
     "inbound_deadline_steps",
     "check_deadline_steps",
     "check_setup_steps",
+    "check_clearance",
 }
 
 
@@ -184,6 +185,14 @@ def _coerce_eval_env_override(key: str, value):
         except Exception:
             raise HTTPException(status_code=400, detail=f"{key} must be a positive integer.")
     if key == "check_setup_steps":
+        try:
+            numeric = int(value)
+            if numeric < 0:
+                raise ValueError
+            return numeric
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"{key} must be a non-negative integer.")
+    if key == "check_clearance":
         try:
             numeric = int(value)
             if numeric < 0:

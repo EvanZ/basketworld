@@ -31,12 +31,15 @@ TOKEN_OBS_REBOUND_TARGET_PLAYER_DIM = 2
 TOKEN_OBS_REBOUND_TARGET_GLOBAL_DIM = 3
 TOKEN_OBS_MULTI_POSSESSION_PLAYER_DIM = 7
 TOKEN_OBS_MULTI_POSSESSION_GLOBAL_DIM = 5
+TOKEN_OBS_CHECK_CLEARANCE_PLAYER_DIM = 1
+TOKEN_OBS_CHECK_CLEARANCE_GLOBAL_DIM = 5
 
 
 def token_observation_dims(
     rebound_win_prob_features: bool = False,
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
+    check_clearance_features: bool = False,
 ) -> tuple[int, int]:
     """Return player/global token dimensions for the selected observation schema."""
     player_dim = TOKEN_OBS_PLAYER_DIM
@@ -50,6 +53,9 @@ def token_observation_dims(
     if bool(multi_possession_features):
         player_dim += TOKEN_OBS_MULTI_POSSESSION_PLAYER_DIM
         global_dim += TOKEN_OBS_MULTI_POSSESSION_GLOBAL_DIM
+    if bool(check_clearance_features):
+        player_dim += TOKEN_OBS_CHECK_CLEARANCE_PLAYER_DIM
+        global_dim += TOKEN_OBS_CHECK_CLEARANCE_GLOBAL_DIM
     return player_dim, global_dim
 
 
@@ -57,6 +63,7 @@ def token_observation_labels(
     rebound_win_prob_features: bool = False,
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
+    check_clearance_features: bool = False,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Return the ordered labels for the selected token-observation schema."""
     player_labels = [
@@ -122,6 +129,17 @@ def token_observation_labels(
                 "restart_countdown_norm",
             )
         )
+    if bool(check_clearance_features):
+        player_labels.append("inside_check_clearance")
+        global_labels.extend(
+            (
+                "check_ball_q_norm",
+                "check_ball_r_norm",
+                "check_clearance_norm",
+                "check_double_violation_count_norm",
+                "check_timer_remaining_fixed_norm",
+            )
+        )
     return tuple(player_labels), tuple(global_labels)
 TURNOVER_REASON_NONE = 0
 TURNOVER_REASON_PASS_OUT_OF_BOUNDS = 1
@@ -134,6 +152,7 @@ TURNOVER_REASON_INBOUND_TIMEOUT = 7
 TURNOVER_REASON_INBOUND_INVALID_PASS = 8
 TURNOVER_REASON_CLEARANCE_VIOLATION = 9
 TURNOVER_REASON_CHECK_TIMEOUT = 10
+TURNOVER_REASON_CHECK_CLEARANCE_VIOLATION = 11
 TEAM_A = 0
 TEAM_B = 1
 GAME_PHASE_LIVE = 0
@@ -172,6 +191,7 @@ MULTI_POSSESSION_REWARD_MODE_IDS = {
     "scoring_events": MULTI_POSSESSION_REWARD_SCORING_EVENTS,
 }
 MULTI_POSSESSION_SCHEMA_VERSION = 4
+CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION = 5
 MADE_BASKET_RESTART_BASELINE_INBOUND = 0
 MADE_BASKET_RESTART_CHECK = 1
 MADE_BASKET_RESTART_DIRECT_HANDOFF = 2
@@ -393,6 +413,8 @@ class KernelStatic(NamedTuple):
     technical_inbound_positions: Any
     inbound_deadline_steps: Any
     check_position: Any
+    check_candidate_mask: Any
+    check_clearance: Any
     check_deadline_steps: Any
     check_setup_steps: Any
 
@@ -465,6 +487,8 @@ class KernelState(NamedTuple):
     inbound_reason: Any
     inbound_steps_remaining: Any
     check_team: Any
+    check_ball_position: Any
+    check_double_violation_count: Any
     check_setup_steps_remaining: Any
     check_steps_remaining: Any
     check_steps_elapsed: Any
@@ -533,6 +557,10 @@ class StepBatchOutput(NamedTuple):
     check_setup_step: Any
     check_pickup: Any
     check_violation: Any
+    check_space_offense_violation: Any
+    check_space_defense_violation: Any
+    check_space_double_violation: Any
+    check_space_random_resolution: Any
     check_pickup_steps: Any
 
 
@@ -819,6 +847,10 @@ def snapshot_state_from_env(env) -> dict[str, np.ndarray | int]:
         "inbound_reason": POSSESSION_END_NONE,
         "inbound_steps_remaining": 0,
         "check_team": -1,
+        "check_ball_position": np.asarray(
+            getattr(env, "check_ball_position", (0, 0)), dtype=np.int32
+        ),
+        "check_double_violation_count": 0,
         "check_setup_steps_remaining": 0,
         "check_steps_remaining": 0,
         "check_steps_elapsed": 0,
@@ -1108,6 +1140,23 @@ def stack_state_snapshots(
         check_team=xp.asarray(
             np.asarray([int(item.get("check_team", -1)) for item in snapshots], dtype=np.int8),
             dtype=xp.int8,
+        ),
+        check_ball_position=xp.asarray(
+            np.stack(
+                [
+                    np.asarray(item.get("check_ball_position", (0, 0)), dtype=np.int32)
+                    for item in snapshots
+                ],
+                axis=0,
+            ),
+            dtype=xp.int32,
+        ),
+        check_double_violation_count=xp.asarray(
+            np.asarray(
+                [int(item.get("check_double_violation_count", 0)) for item in snapshots],
+                dtype=np.int32,
+            ),
+            dtype=xp.int32,
         ),
         check_setup_steps_remaining=xp.asarray(
             np.asarray(
@@ -1434,6 +1483,36 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
         ),
     )
     check_position = np.asarray(cells[check_idx], dtype=np.int32)
+    check_clearance = int(getattr(env, "check_clearance", 0))
+    if check_clearance < 0:
+        raise ValueError("check_clearance must be >= 0.")
+    if check_clearance > 0 and int(getattr(env, "check_setup_steps", 0)) < 1:
+        raise ValueError(
+            "check_clearance requires at least one check_setup_steps tick."
+        )
+    check_candidate_mask = np.zeros(len(cells), dtype=np.int8)
+    if check_clearance > 0:
+        # A candidate needs the protected disk plus one full inbounds ring.
+        # The dense cell-distance matrix lets us reject boundary locations
+        # without relying on an implicit rectangular court margin.
+        candidate_margin = check_clearance + 1
+        expected_disk_cells = 1 + (3 * candidate_margin * (candidate_margin + 1))
+        inbounds_disk_sizes = np.sum(
+            cell_distance_matrix <= candidate_margin,
+            axis=1,
+        )
+        check_candidate_mask = (
+            (clearance_mask == 1)
+            & (inbounds_disk_sizes == expected_disk_cells)
+        ).astype(np.int8)
+        if not np.any(check_candidate_mask):
+            raise ValueError(
+                "check_clearance leaves no eligible outside-arc pickup tile with "
+                "the required inbounds boundary margin."
+            )
+    else:
+        # Radius zero retains the legacy fixed check location.
+        check_candidate_mask[check_idx] = 1
     offensive_lane_mask = np.asarray(
         [1 if cell in getattr(env, "offensive_lane_hexes", set()) else 0 for cell in cells],
         dtype=np.int8,
@@ -1781,9 +1860,12 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
                 getattr(
                     env,
                     "multi_possession_schema_version",
-                    MULTI_POSSESSION_SCHEMA_VERSION
-                    if bool(getattr(env, "enable_multi_possession", False))
-                    else 1,
+                    (
+                        CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION
+                        if check_clearance > 0
+                        else MULTI_POSSESSION_SCHEMA_VERSION
+                    )
+                    if bool(getattr(env, "enable_multi_possession", False)) else 1,
                 )
             ),
             dtype=xp.int32,
@@ -1820,6 +1902,8 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
             dtype=xp.int32,
         ),
         check_position=xp.asarray(check_position, dtype=xp.int32),
+        check_candidate_mask=xp.asarray(check_candidate_mask, dtype=xp.int8),
+        check_clearance=xp.asarray(check_clearance, dtype=xp.int32),
         check_deadline_steps=xp.asarray(
             max(1, int(getattr(env, "check_deadline_steps", 5))),
             dtype=xp.int32,
@@ -2235,7 +2319,7 @@ def build_action_masks_batch(static: KernelStatic, state: KernelState, jnp):
         stable_team_a[None, :],
     )
     targets_check = jnp.all(
-        neighbor_positions == static.check_position[None, None, None, :],
+        neighbor_positions == state.check_ball_position[:, None, None, :],
         axis=-1,
     )
     setup_forbidden = (
@@ -3518,6 +3602,62 @@ def build_multi_possession_observation_features_batch(
     return players, globals_vec
 
 
+def build_check_clearance_observation_features_batch(
+    static: KernelStatic,
+    state: KernelState,
+    jnp,
+) -> tuple[Any, Any]:
+    """Expose the dynamic check geometry only to the new schema.
+
+    The values are zero outside the check setup/pickup phases so a policy does
+    not learn an artificial pickup-location signal during live play.
+    """
+    check_active = (
+        (state.game_phase == GAME_PHASE_CHECK_SETUP)
+        | (state.game_phase == GAME_PHASE_AWAITING_CHECK)
+    )
+    check_position = state.check_ball_position.astype(jnp.int32)
+    distance = _hex_distance(
+        state.positions,
+        check_position[:, None, :],
+        jnp,
+    )
+    inside = (
+        check_active[:, None]
+        & (distance <= static.check_clearance.astype(jnp.int32))
+    ).astype(jnp.float32)
+    norm_den = jnp.maximum(static.court_norm_den.astype(jnp.float32), 1.0)
+    check_position_norm = check_position.astype(jnp.float32) / norm_den
+    active_timer = jnp.where(
+        state.game_phase == GAME_PHASE_CHECK_SETUP,
+        state.check_setup_steps_remaining,
+        jnp.where(
+            state.game_phase == GAME_PHASE_AWAITING_CHECK,
+            state.check_steps_remaining,
+            jnp.zeros_like(state.check_steps_remaining),
+        ),
+    ).astype(jnp.float32)
+    globals_vec = jnp.stack(
+        [
+            jnp.where(check_active, check_position_norm[:, 0], 0.0),
+            jnp.where(check_active, check_position_norm[:, 1], 0.0),
+            jnp.where(
+                check_active,
+                static.check_clearance.astype(jnp.float32) / norm_den,
+                0.0,
+            ),
+            jnp.where(
+                check_active,
+                state.check_double_violation_count.astype(jnp.float32) / 3.0,
+                0.0,
+            ),
+            jnp.where(check_active, active_timer / 120.0, 0.0),
+        ],
+        axis=-1,
+    ).astype(jnp.float32)
+    return inside[..., None], globals_vec
+
+
 def build_flat_observation_batch_with_role_flag(
     static: KernelStatic,
     state: KernelState,
@@ -3527,6 +3667,7 @@ def build_flat_observation_batch_with_role_flag(
     rebound_win_prob_features: bool = False,
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
+    check_clearance_features: bool = False,
 ):
     batch_size = state.positions.shape[0]
     role_flag = _broadcast_role_flag_batch(role_flag_value, batch_size, jnp)[:, None]
@@ -3563,6 +3704,16 @@ def build_flat_observation_batch_with_role_flag(
                 state.shot_contest_skill.astype(jnp.float32),
             ]
         )
+        if check_clearance_features:
+            clearance_players, clearance_globals = (
+                build_check_clearance_observation_features_batch(static, state, jnp)
+            )
+            parts.extend(
+                [
+                    clearance_players.reshape(batch_size, -1),
+                    clearance_globals,
+                ]
+            )
     parts.extend(
         [
             role_flag,
@@ -3580,6 +3731,7 @@ def build_flat_observation_batch(
     rebound_win_prob_features: bool = False,
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
+    check_clearance_features: bool = False,
 ):
     return build_flat_observation_batch_with_role_flag(
         static,
@@ -3589,6 +3741,7 @@ def build_flat_observation_batch(
         rebound_win_prob_features=rebound_win_prob_features,
         rebound_target_observation_features=rebound_target_observation_features,
         multi_possession_features=multi_possession_features,
+        check_clearance_features=check_clearance_features,
     )
 
 
@@ -3620,6 +3773,7 @@ def build_token_observation_components_batch(
     rebound_win_prob_features: bool = False,
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
+    check_clearance_features: bool = False,
 ):
     """Build set-observation components matching the production token layout."""
     batch_size, n_players, _ = state.positions.shape
@@ -3691,7 +3845,7 @@ def build_token_observation_components_batch(
             (state.game_phase == GAME_PHASE_AWAITING_CHECK)
             | (state.game_phase == GAME_PHASE_CHECK_SETUP)
         )[:, None],
-        static.check_position[None, :],
+        state.check_ball_position,
         ball_pos,
     )
     dist_to_ball = _hex_distance(state.positions, ball_pos[:, None, :], jnp).astype(jnp.float32) / norm_den
@@ -3782,6 +3936,12 @@ def build_token_observation_components_batch(
             axis=-1,
         ).astype(jnp.float32)
         players = jnp.concatenate([players, episode_skills], axis=-1)
+        if check_clearance_features:
+            clearance_players, clearance_globals = (
+                build_check_clearance_observation_features_batch(static, state, jnp)
+            )
+            players = jnp.concatenate([players, clearance_players], axis=-1)
+            globals_vec = jnp.concatenate([globals_vec, clearance_globals], axis=-1)
     role_flag = _broadcast_role_flag_batch(role_flag_value, batch_size, jnp)[:, None]
     return players, globals_vec, role_flag
 
@@ -3823,6 +3983,7 @@ def build_token_observation_batch_with_role_flag(
     rebound_win_prob_features: bool = False,
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
+    check_clearance_features: bool = False,
 ):
     players, globals_vec, role_flag = build_token_observation_components_batch(
         static,
@@ -3832,6 +3993,7 @@ def build_token_observation_batch_with_role_flag(
         rebound_win_prob_features=rebound_win_prob_features,
         rebound_target_observation_features=rebound_target_observation_features,
         multi_possession_features=multi_possession_features,
+        check_clearance_features=check_clearance_features,
     )
     players = canonicalize_player_tokens_by_active_role(
         static,
@@ -3857,6 +4019,7 @@ def build_token_observation_batch(
     rebound_win_prob_features: bool = False,
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
+    check_clearance_features: bool = False,
 ):
     return build_token_observation_batch_with_role_flag(
         static,
@@ -3866,6 +4029,7 @@ def build_token_observation_batch(
         rebound_win_prob_features=rebound_win_prob_features,
         rebound_target_observation_features=rebound_target_observation_features,
         multi_possession_features=multi_possession_features,
+        check_clearance_features=check_clearance_features,
     )
 
 
@@ -3879,6 +4043,7 @@ def build_policy_observation_batch_with_role_flag(
     rebound_win_prob_features: bool = False,
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
+    check_clearance_features: bool = False,
 ):
     if str(model_type) == "attention":
         return build_token_observation_batch_with_role_flag(
@@ -3889,6 +4054,7 @@ def build_policy_observation_batch_with_role_flag(
             rebound_win_prob_features=rebound_win_prob_features,
             rebound_target_observation_features=rebound_target_observation_features,
             multi_possession_features=multi_possession_features,
+            check_clearance_features=check_clearance_features,
         )
     return build_flat_observation_batch_with_role_flag(
         static,
@@ -3898,6 +4064,7 @@ def build_policy_observation_batch_with_role_flag(
         rebound_win_prob_features=rebound_win_prob_features,
         rebound_target_observation_features=rebound_target_observation_features,
         multi_possession_features=multi_possession_features,
+        check_clearance_features=check_clearance_features,
     )
 
 
@@ -3910,6 +4077,7 @@ def build_policy_observation_batch(
     rebound_win_prob_features: bool = False,
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
+    check_clearance_features: bool = False,
 ):
     return build_policy_observation_batch_with_role_flag(
         static,
@@ -3920,6 +4088,7 @@ def build_policy_observation_batch(
         rebound_win_prob_features=rebound_win_prob_features,
         rebound_target_observation_features=rebound_target_observation_features,
         multi_possession_features=multi_possession_features,
+        check_clearance_features=check_clearance_features,
     )
 
 
@@ -4188,7 +4357,11 @@ def _resolve_movement_single(static: KernelStatic, state: KernelState, actions, 
                 & active_defender
             )
         )
-        & jnp.all(proposed == static.check_position[None, :], axis=-1)
+        & jnp.all(
+            proposed
+            == _active_check_ball_position_single(static, state, jnp)[None, :],
+            axis=-1,
+        )
     )
     valid_move = (
         requested_move
@@ -4380,6 +4553,30 @@ def _prepare_inbound_positions_single(
     return restored_positions, inbound_positions, inbounder
 
 
+def _active_check_ball_position_single(static: KernelStatic, state: KernelState, jnp):
+    """Return the per-check pickup tile, preserving radius-zero behavior."""
+    return jnp.where(
+        static.check_clearance > 0,
+        state.check_ball_position,
+        static.check_position,
+    ).astype(jnp.int32)
+
+
+def _sample_check_ball_position_single(static: KernelStatic, selection_key, jax, jnp):
+    """Sample one eligible location for a nonzero-clearance check."""
+    candidate = static.check_candidate_mask.astype(jnp.bool_)
+    scores = jax.random.uniform(selection_key, shape=candidate.shape)
+    sampled_index = jnp.argmax(
+        jnp.where(candidate, scores, -jnp.ones_like(scores))
+    )
+    sampled = static.cell_coords[sampled_index].astype(jnp.int32)
+    return jnp.where(
+        static.check_clearance > 0,
+        sampled,
+        static.check_position,
+    ).astype(jnp.int32)
+
+
 def _prepare_check_positions_single(
     static: KernelStatic,
     state: KernelState,
@@ -4387,7 +4584,7 @@ def _prepare_check_positions_single(
     jax,
     jnp,
 ):
-    """Vacate the fixed check cell before placing the loose ball there."""
+    """Apply legacy ball-cell relocation only when clearance is disabled."""
     restored_positions = _return_pending_inbounder_to_court_single(
         static,
         state,
@@ -4396,7 +4593,7 @@ def _prepare_check_positions_single(
     n_players = restored_positions.shape[0]
     player_ids = jnp.arange(n_players, dtype=jnp.int32)
     on_check = jnp.all(
-        restored_positions == static.check_position[None, :],
+        restored_positions == _active_check_ball_position_single(static, state, jnp)[None, :],
         axis=-1,
     )
     has_occupant = jnp.any(on_check)
@@ -4412,7 +4609,8 @@ def _prepare_check_positions_single(
         axis=1,
     )
     is_check_cell = jnp.all(
-        static.cell_coords == static.check_position[None, :],
+        static.cell_coords
+        == _active_check_ball_position_single(static, state, jnp)[None, :],
         axis=-1,
     )
     legal = (~other_occupied) & (~is_check_cell)
@@ -4422,7 +4620,7 @@ def _prepare_check_positions_single(
     )
     distances = _hex_distance(
         static.cell_coords,
-        static.check_position[None, :],
+        _active_check_ball_position_single(static, state, jnp)[None, :],
         jnp,
     ).astype(jnp.int32)
     nearest_distance = jnp.min(
@@ -4435,7 +4633,12 @@ def _prepare_check_positions_single(
     )
     destination = static.cell_coords[destination_idx]
     relocated = restored_positions.at[safe_occupant].set(destination)
-    return jnp.where(has_occupant, relocated, restored_positions)
+    legacy_positions = jnp.where(has_occupant, relocated, restored_positions)
+    return jnp.where(
+        static.check_clearance > 0,
+        restored_positions,
+        legacy_positions,
+    )
 
 
 def _clear_reentered_inbound_metadata_single(
@@ -4622,11 +4825,12 @@ def _finalize_possession_single(
     (
         inbound_key,
         check_relocation_key,
+        check_location_key,
         direct_handoff_key,
         offense_intent_key,
         defense_intent_key,
         intent_visible_key,
-    ) = jax.random.split(inbound_selection_key, 6)
+    ) = jax.random.split(inbound_selection_key, 7)
     next_offense_intent = _sample_role_intent_single(
         static,
         static.enable_intent_learning,
@@ -4700,9 +4904,10 @@ def _finalize_possession_single(
         & (~requires_inbound.astype(jnp.bool_))
         & (~check_restart)
     )
+    active_check_position = _active_check_ball_position_single(static, state, jnp)
     check_violation_inbound_position = _select_technical_inbound_position_single(
         static,
-        static.check_position,
+        active_check_position,
         check_relocation_key,
         jax,
         jnp,
@@ -4725,9 +4930,19 @@ def _finalize_possession_single(
         jax,
         jnp,
     )
+    sampled_check_position = _sample_check_ball_position_single(
+        static,
+        check_location_key,
+        jax,
+        jnp,
+    )
     check_positions = _prepare_check_positions_single(
         static,
-        _replace_state(state, positions=restored_positions),
+        _replace_state(
+            state,
+            positions=restored_positions,
+            check_ball_position=sampled_check_position,
+        ),
         check_relocation_key,
         jax,
         jnp,
@@ -4915,6 +5130,20 @@ def _finalize_possession_single(
                 state.check_team,
             ),
         ),
+        check_ball_position=jnp.where(
+            check_restart,
+            sampled_check_position,
+            jnp.where(
+                advance,
+                static.check_position,
+                state.check_ball_position,
+            ),
+        ),
+        check_double_violation_count=jnp.where(
+            check_restart | advance,
+            jnp.asarray(0, dtype=jnp.int32),
+            state.check_double_violation_count,
+        ),
         check_setup_steps_remaining=jnp.where(
             check_setup,
             static.check_setup_steps.astype(jnp.int32),
@@ -5007,6 +5236,7 @@ def _restart_after_defensive_technical_single(
     state: KernelState,
     *,
     shot_clock_before_interruption,
+    interruption_position=None,
     inbound_selection_key,
     jax,
     jnp,
@@ -5016,13 +5246,25 @@ def _restart_after_defensive_technical_single(
         inbound_selection_key,
         3,
     )
-    technical_inbound_position = _technical_inbound_position_single(
-        static,
-        state,
-        technical_position_key,
-        jax,
-        jnp,
-    )
+    # ``interruption_position`` is a Python-level optional argument.  Choose
+    # the implementation while tracing, rather than passing a Python boolean
+    # through ``lax.cond``.
+    if interruption_position is None:
+        technical_inbound_position = _technical_inbound_position_single(
+            static,
+            state,
+            technical_position_key,
+            jax,
+            jnp,
+        )
+    else:
+        technical_inbound_position = _select_technical_inbound_position_single(
+            static,
+            interruption_position,
+            technical_position_key,
+            jax,
+            jnp,
+        )
     (
         _,
         inbound_positions,
@@ -5180,6 +5422,10 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             check_setup_step=zero_flag,
             check_pickup=zero_flag,
             check_violation=zero_flag,
+            check_space_offense_violation=zero_flag,
+            check_space_defense_violation=zero_flag,
+            check_space_double_violation=zero_flag,
+            check_space_random_resolution=zero_flag,
             check_pickup_steps=zero_steps,
         )
 
@@ -5229,6 +5475,114 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             ball_holder=jnp.asarray(-1, dtype=jnp.int32),
         )
 
+        base_output = _already_done(None)._replace(
+            state=moved_state,
+            done=jnp.asarray(False),
+        )
+
+        check_position = _active_check_ball_position_single(static, moved_state, jnp)
+        active_roles = _active_role_encoding_single(static, moved_state, jnp)
+        inside_clearance = _hex_distance(
+            positions_after,
+            check_position[None, :],
+            jnp,
+        ) <= static.check_clearance.astype(jnp.int32)
+        offense_inside = jnp.any(inside_clearance & (active_roles > 0.0))
+        defense_inside = jnp.any(inside_clearance & (active_roles < 0.0))
+
+        def _offense_space_violation(_):
+            """Award the defense a point and finish the violating possession."""
+            opponent_team = (1 - moved_state.offense_team).astype(jnp.int8)
+            point = jnp.asarray(1.0, dtype=jnp.float32)
+            penalized_state = _replace_state(
+                moved_state,
+                offense_score=moved_state.offense_score
+                + jnp.where(opponent_team == TEAM_A, point, 0.0),
+                defense_score=moved_state.defense_score
+                + jnp.where(opponent_team == TEAM_B, point, 0.0),
+                team_a_score=moved_state.team_a_score
+                + jnp.where(opponent_team == TEAM_A, point, 0.0),
+                team_b_score=moved_state.team_b_score
+                + jnp.where(opponent_team == TEAM_B, point, 0.0),
+                check_double_violation_count=jnp.asarray(0, dtype=jnp.int32),
+            )
+            (
+                final_state,
+                game_done,
+                possession_ended,
+                completed_possession_live_steps,
+            ) = _finalize_possession_single(
+                static,
+                penalized_state,
+                possession_ended=jnp.asarray(True),
+                possession_end_reason=jnp.asarray(
+                    POSSESSION_END_CHECK_VIOLATION,
+                    dtype=jnp.int32,
+                ),
+                next_offense_team=opponent_team,
+                requires_inbound=jnp.asarray(True),
+                inbound_selection_key=next_check_key,
+                jax=jax,
+                jnp=jnp,
+            )
+            return base_output._replace(
+                state=final_state,
+                done=game_done,
+                terminal_episode_steps=jnp.where(
+                    game_done,
+                    final_state.step_count.astype(jnp.int32),
+                    zero_steps,
+                ),
+                turnover_reason=jnp.asarray(
+                    TURNOVER_REASON_CHECK_CLEARANCE_VIOLATION,
+                    dtype=jnp.int32,
+                ),
+                possession_ended=possession_ended.astype(jnp.int8),
+                possession_end_reason=jnp.asarray(
+                    POSSESSION_END_CHECK_VIOLATION,
+                    dtype=jnp.int32,
+                ),
+                completed_possession_live_steps=completed_possession_live_steps,
+                check_violation=jnp.asarray(1, dtype=jnp.int8),
+                check_space_offense_violation=jnp.asarray(1, dtype=jnp.int8),
+            )
+
+        def _defense_space_violation(_):
+            """Award the offense a technical point without ending possession."""
+            point = jnp.asarray(1.0, dtype=jnp.float32)
+            penalized_state = _replace_state(
+                moved_state,
+                offense_score=moved_state.offense_score
+                + jnp.where(moved_state.offense_team == TEAM_A, point, 0.0),
+                defense_score=moved_state.defense_score
+                + jnp.where(moved_state.offense_team == TEAM_B, point, 0.0),
+                team_a_score=moved_state.team_a_score
+                + jnp.where(moved_state.offense_team == TEAM_A, point, 0.0),
+                team_b_score=moved_state.team_b_score
+                + jnp.where(moved_state.offense_team == TEAM_B, point, 0.0),
+                ball_holder=jnp.asarray(-1, dtype=jnp.int32),
+                check_team=jnp.asarray(-1, dtype=jnp.int8),
+                check_setup_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
+                check_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
+                check_steps_elapsed=jnp.asarray(0, dtype=jnp.int32),
+                check_double_violation_count=jnp.asarray(0, dtype=jnp.int32),
+                clearance_achieved=jnp.asarray(1, dtype=jnp.int8),
+            )
+            restarted_state = _restart_after_defensive_technical_single(
+                static,
+                penalized_state,
+                shot_clock_before_interruption=moved_state.shot_clock,
+                interruption_position=check_position,
+                inbound_selection_key=next_check_key,
+                jax=jax,
+                jnp=jnp,
+            )
+            return base_output._replace(
+                state=restarted_state,
+                check_violation=jnp.asarray(1, dtype=jnp.int8),
+                check_space_defense_violation=jnp.asarray(1, dtype=jnp.int8),
+            )
+
         setup_complete = countdown_state.check_setup_steps_remaining <= 0
         setup_state = _replace_state(
             moved_state,
@@ -5247,6 +5601,12 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 jnp.asarray(0, dtype=jnp.int32),
                 state.check_steps_elapsed,
             ),
+            # Completing a valid setup breaks the double-violation sequence.
+            check_double_violation_count=jnp.where(
+                setup_complete,
+                jnp.asarray(0, dtype=jnp.int32),
+                moved_state.check_double_violation_count,
+            ),
         )
         setup_output = _already_done(None)._replace(
             state=setup_state,
@@ -5254,20 +5614,80 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             check_setup_step=jnp.asarray(1, dtype=jnp.int8),
         )
 
+        def _clearance_setup_output(_):
+            next_double_count = (
+                moved_state.check_double_violation_count
+                + jnp.asarray(1, dtype=jnp.int32)
+            )
+
+            def _repeat_setup(_):
+                repeat_state = _replace_state(
+                    moved_state,
+                    game_phase=jnp.asarray(GAME_PHASE_CHECK_SETUP, dtype=jnp.int8),
+                    check_setup_steps_remaining=static.check_setup_steps.astype(jnp.int32),
+                    check_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
+                    check_steps_elapsed=jnp.asarray(0, dtype=jnp.int32),
+                    check_double_violation_count=next_double_count,
+                )
+                return base_output._replace(
+                    state=repeat_state,
+                    check_setup_step=jnp.asarray(1, dtype=jnp.int8),
+                    check_space_double_violation=jnp.asarray(1, dtype=jnp.int8),
+                )
+
+            def _randomly_resolve_double(_):
+                penalize_offense = jax.random.bernoulli(next_check_key)
+                resolved = jax.lax.cond(
+                    penalize_offense,
+                    _offense_space_violation,
+                    _defense_space_violation,
+                    operand=None,
+                )
+                return resolved._replace(
+                    check_space_double_violation=jnp.asarray(1, dtype=jnp.int8),
+                    check_space_random_resolution=jnp.asarray(1, dtype=jnp.int8),
+                )
+
+            def _resolve_completed_setup(_):
+                return jax.lax.cond(
+                    offense_inside & defense_inside,
+                    lambda __: jax.lax.cond(
+                        next_double_count < 3,
+                        _repeat_setup,
+                        _randomly_resolve_double,
+                        operand=None,
+                    ),
+                    lambda __: jax.lax.cond(
+                        offense_inside,
+                        _offense_space_violation,
+                        lambda ___: jax.lax.cond(
+                            defense_inside,
+                            _defense_space_violation,
+                            lambda ____: setup_output,
+                            operand=None,
+                        ),
+                        operand=None,
+                    ),
+                    operand=None,
+                )
+
+            return jax.lax.cond(
+                setup_complete,
+                _resolve_completed_setup,
+                lambda __: setup_output,
+                operand=None,
+            )
+
         active_offense_ids = _active_offense_ids_single(static, moved_state, jax)
         offense_positions = positions_after[active_offense_ids]
         on_check = jnp.all(
-            offense_positions == static.check_position[None, :],
+            offense_positions == check_position[None, :],
             axis=-1,
         )
         picked_up = jnp.any(on_check)
         pickup_slot = jnp.argmax(on_check.astype(jnp.int32))
         pickup_player = active_offense_ids[pickup_slot].astype(jnp.int32)
         expired = (~picked_up) & (moved_state.check_steps_remaining <= 0)
-        base_output = _already_done(None)._replace(
-            state=moved_state,
-            done=jnp.asarray(False),
-        )
 
         def _pickup(_):
             next_state = _replace_state(
@@ -5277,6 +5697,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 check_team=jnp.asarray(-1, dtype=jnp.int8),
                 check_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
                 clearance_achieved=jnp.asarray(1, dtype=jnp.int8),
+                check_double_violation_count=jnp.asarray(0, dtype=jnp.int32),
             )
             return base_output._replace(
                 state=next_state,
@@ -5339,19 +5760,29 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             )
 
         check_output = jax.lax.cond(
-            picked_up,
-            _pickup,
+            (static.check_clearance > 0) & defense_inside,
+            _defense_space_violation,
             lambda __: jax.lax.cond(
-                expired,
-                _violation,
-                lambda ___: base_output,
+                picked_up,
+                _pickup,
+                lambda ___: jax.lax.cond(
+                    expired,
+                    _violation,
+                    lambda ____: base_output,
+                    operand=None,
+                ),
                 operand=None,
             ),
             operand=None,
         )
         return jax.lax.cond(
             is_setup,
-            lambda _: setup_output,
+            lambda _: jax.lax.cond(
+                static.check_clearance > 0,
+                _clearance_setup_output,
+                lambda __: setup_output,
+                operand=None,
+            ),
             lambda _: check_output,
             operand=None,
         )
@@ -5845,6 +6276,10 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 check_setup_step=zero_flag,
                 check_pickup=zero_flag,
                 check_violation=zero_flag,
+                check_space_offense_violation=zero_flag,
+                check_space_defense_violation=zero_flag,
+                check_space_double_violation=zero_flag,
+                check_space_random_resolution=zero_flag,
                 check_pickup_steps=zero_steps,
             )
 
@@ -6711,6 +7146,10 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 check_setup_step=zero_flag,
                 check_pickup=zero_flag,
                 check_violation=zero_flag,
+                check_space_offense_violation=zero_flag,
+                check_space_defense_violation=zero_flag,
+                check_space_double_violation=zero_flag,
+                check_space_random_resolution=zero_flag,
                 check_pickup_steps=zero_steps,
             )
 
@@ -7413,6 +7852,8 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         inbound_reason=jnp.asarray(POSSESSION_END_NONE, dtype=jnp.int32),
         inbound_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
         check_team=jnp.asarray(-1, dtype=jnp.int8),
+        check_ball_position=static.check_position.astype(jnp.int32),
+        check_double_violation_count=jnp.asarray(0, dtype=jnp.int32),
         check_setup_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
         check_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
         check_steps_elapsed=jnp.asarray(0, dtype=jnp.int32),
@@ -7482,6 +7923,7 @@ def sample_state_batch(args, xp) -> tuple[KernelStatic, KernelState]:
         "inbound_deadline_steps",
         "check_deadline_steps",
         "check_setup_steps",
+        "check_clearance",
     ):
         if hasattr(args, key):
             setattr(base_env, key, getattr(args, key))

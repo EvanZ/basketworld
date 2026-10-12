@@ -249,6 +249,9 @@ class JAXInferenceModel:
             rebound_win_prob_features=bool(getattr(self.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(self.spec, "multi_possession_features", False)),
+            check_clearance_features=(
+                int(getattr(self.spec, "observation_schema_version", 1)) >= 5
+            ),
         )
         flat_obs = _adapt_observation_to_checkpoint(
             flat_obs,
@@ -284,6 +287,9 @@ class JAXInferenceModel:
             rebound_win_prob_features=bool(getattr(self.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(self.spec, "multi_possession_features", False)),
+            check_clearance_features=(
+                int(getattr(self.spec, "observation_schema_version", 1)) >= 5
+            ),
         )
         flat_obs = _adapt_observation_to_checkpoint(
             flat_obs,
@@ -309,6 +315,9 @@ class JAXInferenceModel:
             ),
             rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(self.spec, "multi_possession_features", False)),
+            check_clearance_features=(
+                int(getattr(self.spec, "observation_schema_version", 1)) >= 5
+            ),
         )
         rebound_target_observation_features = bool(
             getattr(self.spec, "rebound_target_observation_features", True)
@@ -415,6 +424,10 @@ class JAXInferenceModel:
             model_type=self.spec.model_type,
             rebound_win_prob_features=bool(getattr(self.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
+            multi_possession_features=bool(getattr(self.spec, "multi_possession_features", False)),
+            check_clearance_features=(
+                int(getattr(self.spec, "observation_schema_version", 1)) >= 5
+            ),
         )
         selector_out = self._selector_runner(self.params, flat_obs)
         logits = np.asarray(

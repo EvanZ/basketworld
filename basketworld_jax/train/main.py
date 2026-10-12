@@ -38,6 +38,7 @@ from basketworld_jax.provenance import (
     resume_config_snapshot,
 )
 from basketworld_jax.env import (
+    CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION,
     MULTI_POSSESSION_SCHEMA_VERSION,
     PASS_ACTION_END,
     PASS_ACTION_START,
@@ -277,6 +278,7 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "inbound_deadline_steps",
         "check_deadline_steps",
         "check_setup_steps",
+        "check_clearance",
     }
 )
 JAX_ENV_MLFLOW_PARAM_KEYS = (
@@ -414,6 +416,7 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "inbound_deadline_steps",
     "check_deadline_steps",
     "check_setup_steps",
+    "check_clearance",
 )
 
 
@@ -1247,10 +1250,21 @@ def build_train_parser():
     parser.add_argument(
         "--check-setup-steps",
         type=int,
-        default=0,
+        default=5,
         help=(
             "Movement-only setup steps before the receiving team's check pickup "
-            "clock begins; zero preserves the immediate-check behavior."
+            "clock begins. New configurations default to five seconds; zero "
+            "preserves the immediate-check behavior."
+        ),
+    )
+    parser.add_argument(
+        "--check-clearance",
+        type=int,
+        default=0,
+        help=(
+            "Hex-ring radius that both teams must clear during check setup. "
+            "Zero preserves the legacy fixed check; positive values randomize "
+            "an eligible pickup location outside the clearance arc."
         ),
     )
     parser.add_argument(
@@ -1854,6 +1868,15 @@ def validate_train_args(args) -> None:
             raise SystemExit("--check-deadline-steps must be >= 1.")
         if int(getattr(args, "check_setup_steps", 0)) < 0:
             raise SystemExit("--check-setup-steps must be >= 0.")
+        if int(getattr(args, "check_clearance", 0)) < 0:
+            raise SystemExit("--check-clearance must be >= 0.")
+        if (
+            int(getattr(args, "check_clearance", 0)) > 0
+            and int(getattr(args, "check_setup_steps", 0)) < 1
+        ):
+            raise SystemExit(
+                "--check-clearance requires --check-setup-steps to be at least 1."
+            )
         if bool(getattr(args, "start_template_enabled", False)):
             raise SystemExit(
                 "--start-template-enabled is incompatible with --enable-multi-possession."
@@ -2183,9 +2206,12 @@ def _jax_env_config_from_args(args) -> dict[str, Any]:
     # evaluation and by tooling that does not run the training schedule.
     config["multi_possession_limit"] = _multi_possession_final_limit(args)
     config["multi_possession_schema_version"] = (
-        MULTI_POSSESSION_SCHEMA_VERSION
-        if bool(getattr(args, "enable_multi_possession", False))
-        else 1
+        (
+            CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION
+            if int(getattr(args, "check_clearance", 0)) > 0
+            else MULTI_POSSESSION_SCHEMA_VERSION
+        )
+        if bool(getattr(args, "enable_multi_possession", False)) else 1
     )
     return config
 
@@ -2214,6 +2240,7 @@ _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
     "inbound_deadline_steps": 5,
     "check_deadline_steps": 5,
     "check_setup_steps": 0,
+    "check_clearance": 0,
     "pressure_skill_mean": 0.0,
     "pressure_skill_std": 0.0,
     "shot_contest_skill_mean": 0.0,
@@ -2589,10 +2616,15 @@ def _build_policy_spec(
         getattr(args, "rebound_target_observation_features", True)
     )
     multi_possession_features = bool(getattr(args, "enable_multi_possession", False))
+    check_clearance_features = (
+        multi_possession_features
+        and int(getattr(args, "check_clearance", 0)) > 0
+    )
     token_dim, global_dim = token_observation_dims(
         rebound_win_prob_features,
         rebound_target_observation_features,
         multi_possession_features,
+        check_clearance_features,
     )
     return build_actor_critic_spec(
         flat_obs_np,
@@ -2633,7 +2665,12 @@ def _build_policy_spec(
         rebound_critic_enabled=bool(getattr(args, "rebound_critic_enabled", False)),
         multi_possession_features=multi_possession_features,
         observation_schema_version=(
-            MULTI_POSSESSION_SCHEMA_VERSION if multi_possession_features else 1
+            (
+                CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION
+                if check_clearance_features
+                else MULTI_POSSESSION_SCHEMA_VERSION
+            )
+            if multi_possession_features else 1
         ),
     )
 
@@ -2718,6 +2755,10 @@ def _checkpoint_observation_metadata(spec: ActorCriticSpec) -> dict[str, Any]:
             spec.rebound_target_observation_features
         ),
         multi_possession_features=bool(spec.multi_possession_features),
+        check_clearance_features=(
+            int(spec.observation_schema_version)
+            >= CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION
+        ),
     )
     return {
         "schema_version": int(spec.observation_schema_version),
@@ -6476,6 +6517,10 @@ def run_training_loop(args) -> dict[str, Any]:
             getattr(args, "rebound_target_observation_features", True)
         ),
         multi_possession_features=bool(getattr(args, "enable_multi_possession", False)),
+        check_clearance_features=(
+            bool(getattr(args, "enable_multi_possession", False))
+            and int(getattr(args, "check_clearance", 0)) > 0
+        ),
     )
     action_masks = build_action_masks_batch(static, current_states["offense"], jnp)[
         :, training_player_ids_jnp, :
@@ -8512,6 +8557,10 @@ def run_train_scaffold(args) -> dict[str, Any]:
             getattr(args, "rebound_target_observation_features", True)
         ),
         multi_possession_features=bool(getattr(args, "enable_multi_possession", False)),
+        check_clearance_features=(
+            bool(getattr(args, "enable_multi_possession", False))
+            and int(getattr(args, "check_clearance", 0)) > 0
+        ),
     )
     policy_intent_context = build_policy_intent_context_batch(static, state, jnp)
     action_masks = build_action_masks_batch(static, state, jnp)[

@@ -29,7 +29,9 @@ const defaultConfig = () => ({
   possession_limit_end: 25,
   possession_limit_ramp_updates: 5000,
   made_basket_restart_mode: 'check',
-  check_setup_steps: 0,
+  check_deadline_steps: 5,
+  check_setup_steps: 5,
+  check_clearance: 0,
   multi_possession_use_inbounds: true,
   overrides: {},
 })
@@ -69,7 +71,9 @@ const DEFAULT_PINNED_FIELDS = [
   'multi_possession_limit_ramp_updates',
   'historical_eval_episodes',
   'made_basket_restart_mode',
+  'check_deadline_steps',
   'check_setup_steps',
+  'check_clearance',
   'multi_possession_use_inbounds',
 ]
 const APP_CONFIG_KEYS = {
@@ -85,7 +89,9 @@ const APP_CONFIG_KEYS = {
   multi_possession_limit_ramp_updates: 'possession_limit_ramp_updates',
   multi_possession_use_inbounds: 'multi_possession_use_inbounds',
   made_basket_restart_mode: 'made_basket_restart_mode',
+  check_deadline_steps: 'check_deadline_steps',
   check_setup_steps: 'check_setup_steps',
+  check_clearance: 'check_clearance',
 }
 
 function loadPinnedConfigNames() {
@@ -243,7 +249,9 @@ const applicationConfigValues = computed(() => ({
   multi_possession_limit_ramp_updates: config.value.possession_limit_ramp_updates,
   multi_possession_use_inbounds: config.value.multi_possession_use_inbounds,
   made_basket_restart_mode: config.value.made_basket_restart_mode,
+  check_deadline_steps: config.value.check_deadline_steps,
   check_setup_steps: config.value.check_setup_steps,
+  check_clearance: config.value.check_clearance,
 }))
 
 function formatDate(value) {
@@ -426,7 +434,21 @@ function progress(run) {
 function configHelp(name, fallback = '') {
   const field = configSchema.value.find((candidate) => candidate.name === name)
   if (!field) return fallback
-  return `${field.help}\n\nType: ${field.type}${field.item_type ? ` of ${field.item_type}` : ''}\nParser default: ${JSON.stringify(field.default)}\nPreset default: ${JSON.stringify(field.effective_value)}`
+  const rule = checkRuleNote(name)
+  return `${field.help}${rule ? `\n\nRule: ${rule}` : ''}\n\nType: ${field.type}${field.item_type ? ` of ${field.item_type}` : ''}\nParser default: ${JSON.stringify(field.default)}\nPreset default: ${JSON.stringify(field.effective_value)}`
+}
+
+function checkRuleNote(name) {
+  if (name === 'check_clearance') {
+    return 'A positive radius randomizes an eligible outside-arc pickup tile. Its protected disk and one extra inbounds ring must fit on the court.'
+  }
+  if (name === 'check_setup_steps') {
+    return 'Both teams must clear the protected disk before pickup starts. The first two double violations repeat setup at the same tile.'
+  }
+  if (name === 'check_deadline_steps') {
+    return 'After valid setup, the offense has this many seconds to collect the ball while defenders remain outside the clearance radius.'
+  }
+  return ''
 }
 
 function configFieldValue(field) {
@@ -453,7 +475,9 @@ function fieldLabel(field) {
     shot_contest_skill_std: 'Shot contest std',
     shot_contest_skill_effect_weight: 'Shot contest effect weight',
     made_basket_restart_mode: 'Made-basket restart',
+    check_deadline_steps: 'Check pickup seconds',
     check_setup_steps: 'Pre-check setup steps',
+    check_clearance: 'Check-clearance rings',
     multi_possession_use_inbounds: 'Use inbounds for dead-ball restarts',
   }
   return labels[field.name] || field.name.replaceAll('_', ' ')
@@ -833,6 +857,7 @@ onBeforeUnmount(() => {
                   <option v-for="choice in field.choices" :key="choice" :value="choice">{{ choice }}</option>
                 </select>
                 <input v-else class="config-input" :type="['int', 'float'].includes(field.type) ? 'number' : 'text'" :step="field.type === 'float' ? 'any' : undefined" :value="inputValue(field)" :disabled="!fieldIsEditable(field)" @input="setConfigField(field, $event.target.value)" />
+                <small v-if="checkRuleNote(field.name)" class="field-meta">{{ checkRuleNote(field.name) }}</small>
                 <small class="field-meta">{{ field.name }} · {{ field.type }}<span v-if="!fieldIsEditable(field)"> · {{ field.frozen ? 'frozen' : 'internal' }}</span></small>
               </article>
             </div>
@@ -852,9 +877,10 @@ onBeforeUnmount(() => {
               <article v-for="field in filteredConfigSchema" :key="field.name" class="config-field" :class="{ overridden: Object.prototype.hasOwnProperty.call(config.overrides, field.name) }">
                 <div class="config-field-label">
                   <strong>{{ field.name }}</strong>
-                  <button type="button" class="info-button" :title="`${field.help}\n\nType: ${field.type}${field.item_type ? ` of ${field.item_type}` : ''}\nParser default: ${JSON.stringify(field.default)}\nPreset default: ${JSON.stringify(field.effective_value)}`">i</button>
+                  <button type="button" class="info-button" :title="configHelp(field.name)">i</button>
                   <span>{{ field.type }}</span>
                   <small>{{ field.category }}</small>
+                  <small v-if="checkRuleNote(field.name)">{{ checkRuleNote(field.name) }}</small>
                 </div>
                 <label v-if="field.type === 'bool'" class="toggle config-input">
                   <input type="checkbox" :checked="Boolean(configFieldValue(field))" :disabled="!fieldIsEditable(field)" @change="setConfigField(field, $event.target.checked)" />
