@@ -3899,6 +3899,15 @@ def _log_mlflow_params(
         "jax/multi_possession_overtime_round_cap": int(
             getattr(args, "multi_possession_overtime_round_cap", 0)
         ),
+        "jax/check_clearance": int(getattr(args, "check_clearance", 0)),
+        "jax/check_clearance_warmup_updates": int(
+            getattr(args, "check_clearance_warmup_updates", 0)
+        ),
+        "jax/check_setup_steps": int(getattr(args, "check_setup_steps", 0)),
+        "jax/check_pickup_steps": int(getattr(args, "check_pickup_steps", 5)),
+        "jax/random_check_location": bool(
+            getattr(args, "random_check_location", False)
+        ),
         "jax/pass_mode": str(getattr(args, "pass_mode")),
         "jax/use_set_obs": bool(getattr(args, "use_set_obs")),
         "jax/training_team": str(getattr(args, "training_team")),
@@ -4137,6 +4146,8 @@ _CORE_TRAIN_METRICS = frozenset(
         # Curricula and frozen-opponent schedule.
         "task_reward_scale",
         "multi_possession_limit_active",
+        "check_clearance_active",
+        "check_clearance_warmup_active",
         "episode_possession_limit_mean",
         "episode_overtime_round_cap_mean",
         "opponent_update_index",
@@ -4162,6 +4173,7 @@ _CORE_TRAIN_METRICS = frozenset(
         "intent_policy_sensitivity_argmax_disagreement",
         "selector_alpha",
         "selector_eps",
+        "selector_active",
         "selector_usage_rate",
         "selector_applied_rate",
         "selector_entropy",
@@ -4736,6 +4748,8 @@ def _run_historical_match_evaluation(
     opponent_params,
     candidate_update: int,
     opponent_update: int,
+    candidate_selector_active: bool = False,
+    opponent_selector_active: bool = False,
     args,
     jax,
     jnp,
@@ -4760,6 +4774,8 @@ def _run_historical_match_evaluation(
         opponent_params,
         jax.random.fold_in(rollout_key, 0),
         int(getattr(args, "historical_eval_horizon", 1024)),
+        bool(candidate_selector_active),
+        bool(opponent_selector_active),
         bool(getattr(args, "intent_selector_multiselect_enabled", False)),
         int(getattr(args, "intent_selector_min_play_steps", 3)),
     )
@@ -4770,6 +4786,8 @@ def _run_historical_match_evaluation(
         opponent_params,
         jax.random.fold_in(rollout_key, 1),
         int(getattr(args, "historical_eval_horizon", 1024)),
+        bool(candidate_selector_active),
+        bool(opponent_selector_active),
         bool(getattr(args, "intent_selector_multiselect_enabled", False)),
         int(getattr(args, "intent_selector_min_play_steps", 3)),
     )
@@ -4801,7 +4819,7 @@ def _historical_eval_artifact_payload(
     update_artifact_paths: dict[int, str] | None = None,
 ) -> dict[str, Any]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "milestone_updates": [int(update) for update in milestone_updates],
         "milestone_checkpoints": {
             str(int(update)): dict(record)
@@ -5746,6 +5764,67 @@ def _selector_schedules_for_update(args, update_index: int) -> tuple[float, floa
     return alpha, eps
 
 
+def _known_opponent_updates(opponent_info: dict[str, Any] | None) -> tuple[int, ...]:
+    """Extract persisted update indices for the policy sides of an evaluation."""
+    if not opponent_info:
+        return ()
+    grouped = opponent_info.get("groups")
+    if isinstance(grouped, list):
+        updates = []
+        for group in grouped:
+            if not isinstance(group, dict):
+                continue
+            try:
+                update = int(group.get("update_index", 0))
+            except (TypeError, ValueError):
+                continue
+            if update > 0:
+                updates.append(update)
+        if updates:
+            return tuple(updates)
+    for key in ("update_index", "latest_update_index"):
+        try:
+            update = int(opponent_info.get(key, 0))
+        except (TypeError, ValueError):
+            continue
+        if update > 0:
+            return (update,)
+    return ()
+
+
+def _evaluation_game_rule_context(
+    args,
+    *,
+    candidate_update: int,
+    opponent_updates: tuple[int, ...] = (),
+) -> dict[str, int]:
+    """Choose one shared game-rule context for a policy matchup.
+
+    Possession length and check clearance alter the shared environment, so a
+    matchup uses the earliest participating checkpoint's scheduled values.
+    Policy-internal schedules, such as selector activation, deliberately do
+    not use this context and are resolved per checkpoint instead.
+    """
+    positive_updates = [int(candidate_update)]
+    positive_updates.extend(
+        int(update) for update in opponent_updates if int(update) > 0
+    )
+    rule_update = min(positive_updates)
+    return {
+        "rule_update": int(rule_update),
+        "multi_possession_limit": _multi_possession_limit_for_update(
+            args,
+            rule_update,
+        ),
+        "check_clearance": _check_clearance_for_update(args, rule_update),
+    }
+
+
+def _selector_active_for_update(args, update_index: int) -> bool:
+    selector_alpha, _ = _selector_schedules_for_update(args, int(update_index))
+    return bool(selector_alpha > 0.0)
+
+
 def summarize_selector_metrics(
     rollout, *, num_intents: int, alpha: float, eps: float
 ) -> dict[str, Any]:
@@ -6546,24 +6625,16 @@ def run_training_loop(args) -> dict[str, Any]:
     }
     static = statics["offense"]
     base_key = jax.random.PRNGKey(int(args.policy_seed))
-    reset_seed_key, eval_reset_seed_key, base_key = jax.random.split(base_key, 3)
+    reset_seed_key, base_key = jax.random.split(base_key, 2)
     role_reset_keys = jax.random.split(reset_seed_key, len(TRAINING_ROLES))
-    role_eval_reset_keys = jax.random.split(eval_reset_seed_key, len(TRAINING_ROLES))
     current_states = {}
-    eval_initial_states = {}
-    for role, reset_key, eval_key in zip(
-        TRAINING_ROLES, role_reset_keys, role_eval_reset_keys, strict=True
-    ):
+    for role, reset_key in zip(TRAINING_ROLES, role_reset_keys, strict=True):
         initial_reset_keys = jax.random.split(reset_key, int(args.kernel_batch_size))
         current_states[role] = reset_batch_minimal(
             initial_training_statics[role],
             initial_reset_keys,
             jax,
             jnp,
-        )
-        eval_reset_keys = jax.random.split(eval_key, int(args.kernel_batch_size))
-        eval_initial_states[role] = reset_batch_minimal(
-            statics[role], eval_reset_keys, jax, jnp
         )
 
     training_player_ids_by_role = {
@@ -7163,12 +7234,10 @@ def run_training_loop(args) -> dict[str, Any]:
                 )
                 for role in TRAINING_ROLES
             }
-            # Evaluation remains comparable across training updates by using
-            # the final configured game length, never the partial curriculum.
-            eval_statics = {
-                role: _static_with_phi_beta(statics[role], phi_beta, jnp)
-                for role in TRAINING_ROLES
-            }
+            # Same-policy deployment evaluation has no older checkpoint, so it
+            # uses this update's active game rules. Policy matchups select a
+            # shared older-checkpoint context at evaluation time below.
+            deployment_eval_statics = active_statics
             if _check_clearance_activates_on_update(args, update_idx):
                 # A state can span PPO updates. Restart the batch at the
                 # curriculum handoff so a check placed at the warmup's legacy
@@ -7195,6 +7264,7 @@ def run_training_loop(args) -> dict[str, Any]:
             selector_alpha, selector_eps = _selector_schedules_for_update(
                 args, update_idx
             )
+            selector_active = bool(selector_alpha > 0.0)
             opponent_deterministic_episode_prob = (
                 _opponent_deterministic_episode_prob_for_update(
                     args,
@@ -7845,6 +7915,7 @@ def run_training_loop(args) -> dict[str, Any]:
                 _check_clearance_warmup_enabled(args)
                 and active_check_clearance == 0
             )
+            last_metrics["selector_active"] = float(selector_active)
             last_metrics["episode_possession_limit_mean"] = float(
                 np.mean(episode_possession_limits)
             )
@@ -7984,10 +8055,80 @@ def run_training_loop(args) -> dict[str, Any]:
                 or update_idx % int(args.eval_every_updates) == 0
             )
             if should_eval:
+                if grouped_opponent_params is not None:
+                    evaluation_opponent_updates = _known_opponent_updates(
+                        active_opponent_info
+                    )
+                elif opponent_params is not None:
+                    evaluation_opponent_updates = _known_opponent_updates(
+                        active_opponent_info
+                    )
+                else:
+                    evaluation_opponent_updates = ()
+                evaluation_rule_context = _evaluation_game_rule_context(
+                    args,
+                    candidate_update=update_idx,
+                    opponent_updates=evaluation_opponent_updates,
+                )
+                eval_statics = {
+                    role: _static_with_training_schedules(
+                        statics[role],
+                        phi_beta=phi_beta,
+                        possession_limit=evaluation_rule_context[
+                            "multi_possession_limit"
+                        ],
+                        check_clearance=evaluation_rule_context[
+                            "check_clearance"
+                        ],
+                        jnp=jnp,
+                    )
+                    for role in TRAINING_ROLES
+                }
+                opponent_selector_active = (
+                    _selector_active_for_update(
+                        args,
+                        evaluation_opponent_updates[0],
+                    )
+                    if evaluation_opponent_updates
+                    else selector_active
+                )
+                opponent_selector_active_by_group = None
+                if grouped_opponent_params is not None:
+                    group_count = int(active_opponent_info["group_count"])
+                    group_updates = list(evaluation_opponent_updates)
+                    if len(group_updates) != group_count:
+                        group_updates = [update_idx] * group_count
+                    opponent_selector_active_by_group = jnp.asarray(
+                        [
+                            _selector_active_for_update(args, opponent_update)
+                            for opponent_update in group_updates
+                        ],
+                        dtype=jnp.bool_,
+                    )
                 eval_key = jax.random.PRNGKey(
                     int(args.policy_seed) + 1_000_000 + update_idx
                 )
                 role_eval_keys = jax.random.split(eval_key, len(TRAINING_ROLES))
+                eval_reset_key = jax.random.PRNGKey(
+                    int(args.policy_seed) + 1_500_000 + update_idx
+                )
+                role_eval_reset_keys = jax.random.split(
+                    eval_reset_key,
+                    len(TRAINING_ROLES),
+                )
+                eval_initial_states = {
+                    role: reset_batch_minimal(
+                        eval_statics[role],
+                        jax.random.split(reset_key, int(args.kernel_batch_size)),
+                        jax,
+                        jnp,
+                    )
+                    for role, reset_key in zip(
+                        TRAINING_ROLES,
+                        role_eval_reset_keys,
+                        strict=True,
+                    )
+                }
                 eval_outputs = {}
                 for role, role_eval_key in zip(
                     TRAINING_ROLES, role_eval_keys, strict=True
@@ -8001,6 +8142,10 @@ def run_training_loop(args) -> dict[str, Any]:
                             role_eval_key,
                             int(args.eval_horizon),
                             int(active_opponent_info["group_count"]),
+                            selector_active,
+                            opponent_selector_active_by_group,
+                            selector_multiselect_enabled,
+                            selector_min_play_steps,
                         )
                     elif opponent_params is None:
                         eval_outputs[role] = eval_runner(
@@ -8009,6 +8154,9 @@ def run_training_loop(args) -> dict[str, Any]:
                             params,
                             role_eval_key,
                             int(args.eval_horizon),
+                            selector_active,
+                            selector_multiselect_enabled,
+                            selector_min_play_steps,
                         )
                     else:
                         eval_outputs[role] = frozen_eval_runner(
@@ -8018,6 +8166,10 @@ def run_training_loop(args) -> dict[str, Any]:
                             opponent_params,
                             role_eval_key,
                             int(args.eval_horizon),
+                            selector_active,
+                            opponent_selector_active,
+                            selector_multiselect_enabled,
+                            selector_min_play_steps,
                         )
                 block_until_ready_tree(eval_outputs)
                 if len(eval_trajectories) < int(args.max_eval_dumps):
@@ -8050,6 +8202,20 @@ def run_training_loop(args) -> dict[str, Any]:
                         )
                         eval_metrics = {
                             "update_index": update_idx,
+                            "evaluation_rule_update": int(
+                                evaluation_rule_context["rule_update"]
+                            ),
+                            "multi_possession_limit_active": int(
+                                evaluation_rule_context["multi_possession_limit"]
+                            ),
+                            "check_clearance_active": int(
+                                evaluation_rule_context["check_clearance"]
+                            ),
+                            "selector_active": float(selector_active),
+                            "opponent_selector_active": float(
+                                opponent_selector_active
+                            ),
+                            "selector_alpha": float(selector_alpha),
                             "mean_final_offense_score": float(
                                 np.asarray(final_eval_state.offense_score).mean()
                             ),
@@ -8200,17 +8366,18 @@ def run_training_loop(args) -> dict[str, Any]:
                         int(args.kernel_batch_size),
                     )
                     deploy_initial_state = reset_batch_minimal(
-                        eval_statics["offense"],
+                        deployment_eval_statics["offense"],
                         deploy_reset_keys,
                         jax,
                         jnp,
                     )
                     deploy_output = deploy_eval_runner(
-                        eval_statics["offense"],
+                        deployment_eval_statics["offense"],
                         deploy_initial_state,
                         params,
                         deploy_rollout_key,
                         int(args.eval_deploy_horizon),
+                        selector_active,
                         selector_multiselect_enabled,
                         selector_min_play_steps,
                     )
@@ -8228,6 +8395,12 @@ def run_training_loop(args) -> dict[str, Any]:
                         "action_argmax_offense": 1,
                         "action_argmax_defense": 1,
                         "same_policy_both_sides": 1,
+                        "multi_possession_limit_active": int(
+                            active_possession_limit
+                        ),
+                        "check_clearance_active": int(active_check_clearance),
+                        "selector_active": float(selector_active),
+                        "selector_alpha": float(selector_alpha),
                     }
                 )
                 deploy_eval_history.append(deploy_metrics)
@@ -8465,18 +8638,62 @@ def run_training_loop(args) -> dict[str, Any]:
                         ),
                     }
                     for opponent_update in sorted(historical_milestone_params):
+                        match_rule_context = _evaluation_game_rule_context(
+                            args,
+                            candidate_update=update_idx,
+                            opponent_updates=(int(opponent_update),),
+                        )
+                        match_statics = {
+                            role: _static_with_training_schedules(
+                                statics[role],
+                                phi_beta=phi_beta,
+                                possession_limit=match_rule_context[
+                                    "multi_possession_limit"
+                                ],
+                                check_clearance=match_rule_context[
+                                    "check_clearance"
+                                ],
+                                jnp=jnp,
+                            )
+                            for role in TRAINING_ROLES
+                        }
+                        candidate_match_selector_active = _selector_active_for_update(
+                            args,
+                            update_idx,
+                        )
+                        opponent_match_selector_active = _selector_active_for_update(
+                            args,
+                            opponent_update,
+                        )
                         match = _run_historical_match_evaluation(
                             runner=historical_match_eval_runner,
-                            statics=eval_statics,
+                            statics=match_statics,
                             candidate_params=params,
                             opponent_params=historical_milestone_params[
                                 opponent_update
                             ],
                             candidate_update=int(update_idx),
                             opponent_update=int(opponent_update),
+                            candidate_selector_active=candidate_match_selector_active,
+                            opponent_selector_active=opponent_match_selector_active,
                             args=args,
                             jax=jax,
                             jnp=jnp,
+                        )
+                        match["evaluation_rule_update"] = int(
+                            match_rule_context["rule_update"]
+                        )
+                        match["evaluation_multi_possession_limit"] = int(
+                            match_rule_context["multi_possession_limit"]
+                        )
+                        match["evaluation_check_clearance"] = int(
+                            match_rule_context["check_clearance"]
+                        )
+                        match["candidate_selector_active"] = bool(
+                            candidate_match_selector_active
+                        )
+                        match["opponent_selector_active"] = bool(
+                            opponent_match_selector_active
                         )
                         historical_eval_history.append(match)
                         progress.update(1)

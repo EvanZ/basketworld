@@ -247,7 +247,9 @@ the historical implementation decisions above.
 - `check_clearance_warmup_updates` defaults to 500 for new runs. It keeps the
   clearance observation schema from update one while using a zero-radius check
   through the warmup. On the first protected-disk update, training batches
-  reset once so no legacy-location check carries into the new rule.
+  reset once so no legacy-location check carries into the new rule. Same-policy
+  deployment evaluation at each update uses that update's active clearance
+  radius and possession limit, and its reset states use the same configuration.
 - The intended default for new configurations is **five setup seconds,
   followed by a separate five-second pickup deadline**. One simulation step
   represents one countdown second. Currently setup defaults to zero and
@@ -259,6 +261,21 @@ the historical implementation decisions above.
 - Nonzero clearance requires positive setup time. Validate radius, court
   geometry, and pickup deadline together so clearing the protected area
   does not make timely pickup geometrically impossible.
+
+#### Scheduled evaluation context
+
+- A checkpoint matchup uses one shared game-rule configuration: the earlier
+  checkpoint's active possession limit and check-clearance radius. The
+  evaluator applies those values to both teams, never a newer rule to only one
+  policy side.
+- Selector activation is policy-internal rather than a game rule. Deterministic
+  evaluation uses each checkpoint's own selector schedule: it remains off for
+  a checkpoint whose alpha is zero and turns on for that policy after alpha is
+  nonzero. Selector epsilon does not change an argmax choice.
+- Historical-match records persist the shared game-rule configuration and both
+  selector activation values. A historical Elo ladder that spans game-rule
+  configurations must warn that cross-configuration ratings are not directly
+  comparable.
 
 #### Random pickup location
 

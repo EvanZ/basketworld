@@ -110,6 +110,30 @@ def test_summary_cache_reuses_fit_until_artifact_changes(tmp_path, monkeypatch):
     assert updated["latest"]["update"] == 500
 
 
+def test_summary_warns_when_historical_matches_span_rule_configurations(tmp_path):
+    artifact = tmp_path / historical_elo.HISTORICAL_EVAL_FILENAME
+    first = _match(250, 100, wins=12, losses=8)
+    first.update(
+        {
+            "evaluation_multi_possession_limit": 1,
+            "evaluation_check_clearance": 0,
+        }
+    )
+    second = _match(500, 250, wins=12, losses=8)
+    second.update(
+        {
+            "evaluation_multi_possession_limit": 25,
+            "evaluation_check_clearance": 1,
+        }
+    )
+    _write_payload(artifact, [first, second])
+    historical_elo.clear_historical_elo_cache()
+
+    result = historical_elo.historical_elo_summary(artifact)
+
+    assert any("multiple scheduled evaluation rule configurations" in warning for warning in result["warnings"])
+
+
 def test_missing_artifact_returns_waiting_state(tmp_path):
     result = historical_elo.historical_elo_summary(
         tmp_path / historical_elo.HISTORICAL_EVAL_FILENAME

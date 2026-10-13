@@ -1088,6 +1088,7 @@ def _maybe_apply_deterministic_selector_segment_start_for_role(
     params,
     flat_obs,
     role_flags,
+    selector_active,
     selector_multiselect_enabled,
     completed_pass_boundary,
     offensive_rebound_boundary,
@@ -1100,7 +1101,12 @@ def _maybe_apply_deterministic_selector_segment_start_for_role(
     if not bool(spec.intent_selector_enabled):
         return state, metrics
 
-    should_run = static.enable_intent_learning.astype(jnp.bool_)
+    # Selector activation is policy-internal.  Each policy side receives its
+    # own schedule value and must remain inactive before its alpha is nonzero.
+    should_run = (
+        static.enable_intent_learning.astype(jnp.bool_)
+        & jnp.asarray(selector_active).astype(jnp.bool_)
+    )
 
     def _disabled(_):
         return state, metrics
@@ -1205,6 +1211,7 @@ def _maybe_apply_deterministic_selector_segment_start(
     state,
     params,
     flat_obs,
+    selector_active,
     selector_multiselect_enabled,
     completed_pass_boundary,
     offensive_rebound_boundary,
@@ -1220,6 +1227,7 @@ def _maybe_apply_deterministic_selector_segment_start(
         params,
         flat_obs,
         build_training_role_flags_batch(static, state, jnp),
+        selector_active,
         selector_multiselect_enabled,
         completed_pass_boundary,
         offensive_rebound_boundary,
@@ -2655,13 +2663,67 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
 
 
 def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
-    def _runner(static, initial_state, params, rollout_key, horizon: int):
+    def _runner(
+        static,
+        initial_state,
+        params,
+        rollout_key,
+        horizon: int,
+        selector_active: bool,
+        selector_multiselect_enabled: bool,
+        selector_min_play_steps: int,
+    ):
         training_ids, opponent_ids = resolve_team_player_ids(static, jax, jnp)
         n_players = int(static.role_encoding.shape[0])
+        initial_completed_pass_boundary = jnp.zeros(
+            initial_state.episode_ended.shape,
+            dtype=jnp.bool_,
+        )
+        initial_offensive_rebound_boundary = jnp.zeros_like(
+            initial_completed_pass_boundary
+        )
 
         def _scan_step(carry, _):
-            state, key = carry
+            (
+                state,
+                key,
+                completed_pass_boundary,
+                offensive_rebound_boundary,
+            ) = carry
             key, opponent_key, env_key = jax.random.split(key, 3)
+            training_role_flags = build_training_role_flags_batch(static, state, jnp)
+            selector_obs = build_policy_observation_batch_with_role_flag(
+                static,
+                state,
+                training_role_flags,
+                jnp,
+                model_type=spec.model_type,
+                rebound_win_prob_features=bool(spec.rebound_win_prob_features),
+                rebound_target_observation_features=bool(
+                    getattr(spec, "rebound_target_observation_features", True)
+                ),
+                multi_possession_features=bool(
+                    getattr(spec, "multi_possession_features", False)
+                ),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
+                ),
+            )
+            state, _ = _maybe_apply_deterministic_selector_segment_start_for_role(
+                static,
+                state,
+                params,
+                selector_obs,
+                training_role_flags,
+                selector_active,
+                selector_multiselect_enabled,
+                completed_pass_boundary,
+                offensive_rebound_boundary,
+                selector_min_play_steps,
+                jax,
+                jnp,
+                spec,
+            )
             full_action_mask = build_action_masks_batch(static, state, jnp)
             training_action_mask = full_action_mask[:, training_ids, :]
             opponent_action_mask = full_action_mask[:, opponent_ids, :]
@@ -2769,27 +2831,137 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 offense_score=env_out.state.offense_score,
                 defense_score=env_out.state.defense_score,
             )
-            return (env_out.state, key), trace
+            active_step = ~state.episode_ended.astype(jnp.bool_)
+            next_completed_pass_boundary = (
+                active_step
+                & (~env_out.done.astype(jnp.bool_))
+                & env_out.completed_pass.astype(jnp.bool_)
+            )
+            next_offensive_rebound_boundary = (
+                active_step
+                & (~env_out.done.astype(jnp.bool_))
+                & env_out.offensive_rebound.astype(jnp.bool_)
+            )
+            return (
+                env_out.state,
+                key,
+                next_completed_pass_boundary,
+                next_offensive_rebound_boundary,
+            ), trace
 
-        (final_state, _), trace = jax.lax.scan(
+        (final_state, _, _, _), trace = jax.lax.scan(
             _scan_step,
-            (initial_state, rollout_key),
+            (
+                initial_state,
+                rollout_key,
+                initial_completed_pass_boundary,
+                initial_offensive_rebound_boundary,
+            ),
             xs=None,
             length=int(horizon),
         )
         return final_state, trace
 
-    return jax.jit(_runner, static_argnums=(4,))
+    return jax.jit(_runner, static_argnums=(4, 6, 7))
 
 
 def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
-    def _runner(static, initial_state, params, opponent_params, rollout_key, horizon: int):
+    def _runner(
+        static,
+        initial_state,
+        params,
+        opponent_params,
+        rollout_key,
+        horizon: int,
+        candidate_selector_active: bool,
+        opponent_selector_active: bool,
+        selector_multiselect_enabled: bool,
+        selector_min_play_steps: int,
+    ):
         training_ids, opponent_ids = resolve_team_player_ids(static, jax, jnp)
         n_players = int(static.role_encoding.shape[0])
+        initial_completed_pass_boundary = jnp.zeros(
+            initial_state.episode_ended.shape,
+            dtype=jnp.bool_,
+        )
+        initial_offensive_rebound_boundary = jnp.zeros_like(
+            initial_completed_pass_boundary
+        )
 
         def _scan_step(carry, _):
-            state, key = carry
+            (
+                state,
+                key,
+                completed_pass_boundary,
+                offensive_rebound_boundary,
+            ) = carry
             key, opponent_key, env_key = jax.random.split(key, 3)
+            training_role_flags = build_training_role_flags_batch(static, state, jnp)
+            training_selector_obs = build_policy_observation_batch_with_role_flag(
+                static,
+                state,
+                training_role_flags,
+                jnp,
+                model_type=spec.model_type,
+                rebound_win_prob_features=bool(spec.rebound_win_prob_features),
+                rebound_target_observation_features=bool(
+                    getattr(spec, "rebound_target_observation_features", True)
+                ),
+                multi_possession_features=bool(
+                    getattr(spec, "multi_possession_features", False)
+                ),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
+                ),
+            )
+            state, _ = _maybe_apply_deterministic_selector_segment_start_for_role(
+                static,
+                state,
+                params,
+                training_selector_obs,
+                training_role_flags,
+                candidate_selector_active,
+                selector_multiselect_enabled,
+                completed_pass_boundary,
+                offensive_rebound_boundary,
+                selector_min_play_steps,
+                jax,
+                jnp,
+                spec,
+            )
+            opponent_role_flags = build_opponent_role_flags_batch(static, state, jnp)
+            opponent_selector_obs = build_policy_observation_batch_with_role_flag(
+                static,
+                state,
+                opponent_role_flags,
+                jnp,
+                model_type=spec.model_type,
+                rebound_win_prob_features=bool(spec.rebound_win_prob_features),
+                rebound_target_observation_features=bool(
+                    getattr(spec, "rebound_target_observation_features", True)
+                ),
+                multi_possession_features=bool(
+                    getattr(spec, "multi_possession_features", False)
+                ),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
+                ),
+            )
+            state, _ = _maybe_apply_deterministic_selector_segment_start_for_role(
+                static,
+                state,
+                opponent_params,
+                opponent_selector_obs,
+                opponent_role_flags,
+                opponent_selector_active,
+                selector_multiselect_enabled,
+                completed_pass_boundary,
+                offensive_rebound_boundary,
+                selector_min_play_steps,
+                jax,
+                jnp,
+                spec,
+            )
             full_action_mask = build_action_masks_batch(static, state, jnp)
             training_action_mask = full_action_mask[:, training_ids, :]
             opponent_action_mask = full_action_mask[:, opponent_ids, :]
@@ -2923,17 +3095,38 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 offense_score=env_out.state.offense_score,
                 defense_score=env_out.state.defense_score,
             )
-            return (env_out.state, key), trace
+            active_step = ~state.episode_ended.astype(jnp.bool_)
+            next_completed_pass_boundary = (
+                active_step
+                & (~env_out.done.astype(jnp.bool_))
+                & env_out.completed_pass.astype(jnp.bool_)
+            )
+            next_offensive_rebound_boundary = (
+                active_step
+                & (~env_out.done.astype(jnp.bool_))
+                & env_out.offensive_rebound.astype(jnp.bool_)
+            )
+            return (
+                env_out.state,
+                key,
+                next_completed_pass_boundary,
+                next_offensive_rebound_boundary,
+            ), trace
 
-        (final_state, _), trace = jax.lax.scan(
+        (final_state, _, _, _), trace = jax.lax.scan(
             _scan_step,
-            (initial_state, rollout_key),
+            (
+                initial_state,
+                rollout_key,
+                initial_completed_pass_boundary,
+                initial_offensive_rebound_boundary,
+            ),
             xs=None,
             length=int(horizon),
         )
         return final_state, trace
 
-    return jax.jit(_runner, static_argnums=(5,))
+    return jax.jit(_runner, static_argnums=(5, 8, 9))
 
 
 def _zero_historical_match_diagnostics(state, jnp) -> dict[str, Any]:
@@ -3152,6 +3345,8 @@ def build_compiled_historical_match_eval_runner(jax, jnp, spec: ActorCriticSpec)
         opponent_params,
         rollout_key,
         horizon: int,
+        candidate_selector_active: bool,
+        opponent_selector_active: bool,
         selector_multiselect_enabled: bool,
         selector_min_play_steps: int,
     ):
@@ -3203,6 +3398,7 @@ def build_compiled_historical_match_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 candidate_params,
                 candidate_selector_obs,
                 candidate_role_flags,
+                candidate_selector_active,
                 selector_multiselect_enabled,
                 completed_pass_boundary,
                 offensive_rebound_boundary,
@@ -3236,6 +3432,7 @@ def build_compiled_historical_match_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 opponent_params,
                 opponent_selector_obs,
                 opponent_role_flags,
+                opponent_selector_active,
                 selector_multiselect_enabled,
                 completed_pass_boundary,
                 offensive_rebound_boundary,
@@ -3390,7 +3587,7 @@ def build_compiled_historical_match_eval_runner(jax, jnp, spec: ActorCriticSpec)
         )
         return final_state, diagnostics
 
-    return jax.jit(_runner, static_argnums=(5, 6, 7))
+    return jax.jit(_runner, static_argnums=(5, 8, 9))
 
 
 def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
@@ -3402,12 +3599,23 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
         rollout_key,
         horizon: int,
         opponent_group_count: int,
+        candidate_selector_active: bool,
+        opponent_selector_active_by_group,
+        selector_multiselect_enabled: bool,
+        selector_min_play_steps: int,
     ):
         training_ids, opponent_ids = resolve_team_player_ids(static, jax, jnp)
         n_players = int(static.role_encoding.shape[0])
         group_count = int(opponent_group_count)
         batch_size = int(initial_state.positions.shape[0])
         group_size = batch_size // group_count
+        initial_completed_pass_boundary = jnp.zeros(
+            initial_state.episode_ended.shape,
+            dtype=jnp.bool_,
+        )
+        initial_offensive_rebound_boundary = jnp.zeros_like(
+            initial_completed_pass_boundary
+        )
 
         def _sample_grouped_opponent_actions(
             opponent_flat_obs,
@@ -3457,9 +3665,129 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 int(spec.training_player_count),
             )
 
+        def _apply_grouped_opponent_selector(
+            state,
+            completed_pass_boundary,
+            offensive_rebound_boundary,
+        ):
+            opponent_role_flags = build_opponent_role_flags_batch(static, state, jnp)
+            grouped_state = jax.tree_util.tree_map(
+                lambda value: value.reshape(
+                    (group_count, group_size) + value.shape[1:]
+                ),
+                state,
+            )
+            grouped_role_flags = opponent_role_flags.reshape(group_count, group_size)
+            grouped_completed_pass = completed_pass_boundary.reshape(
+                group_count,
+                group_size,
+            )
+            grouped_offensive_rebound = offensive_rebound_boundary.reshape(
+                group_count,
+                group_size,
+            )
+
+            def _apply_one_group(
+                group_params,
+                group_state,
+                group_role_flags,
+                group_completed_pass,
+                group_offensive_rebound,
+                group_selector_active,
+            ):
+                group_obs = build_policy_observation_batch_with_role_flag(
+                    static,
+                    group_state,
+                    group_role_flags,
+                    jnp,
+                    model_type=spec.model_type,
+                    rebound_win_prob_features=bool(spec.rebound_win_prob_features),
+                    rebound_target_observation_features=bool(
+                        getattr(spec, "rebound_target_observation_features", True)
+                    ),
+                    multi_possession_features=bool(
+                        getattr(spec, "multi_possession_features", False)
+                    ),
+                    check_clearance_features=(
+                        int(getattr(spec, "observation_schema_version", 1)) >= 5
+                    ),
+                )
+                selected_state, _ = _maybe_apply_deterministic_selector_segment_start_for_role(
+                    static,
+                    group_state,
+                    group_params,
+                    group_obs,
+                    group_role_flags,
+                    group_selector_active,
+                    selector_multiselect_enabled,
+                    group_completed_pass,
+                    group_offensive_rebound,
+                    selector_min_play_steps,
+                    jax,
+                    jnp,
+                    spec,
+                )
+                return selected_state
+
+            selected_grouped_state = jax.vmap(_apply_one_group)(
+                opponent_params_by_group,
+                grouped_state,
+                grouped_role_flags,
+                grouped_completed_pass,
+                grouped_offensive_rebound,
+                opponent_selector_active_by_group,
+            )
+            return jax.tree_util.tree_map(
+                lambda value: value.reshape((batch_size,) + value.shape[2:]),
+                selected_grouped_state,
+            )
+
         def _scan_step(carry, _):
-            state, key = carry
+            (
+                state,
+                key,
+                completed_pass_boundary,
+                offensive_rebound_boundary,
+            ) = carry
             key, opponent_key, env_key = jax.random.split(key, 3)
+            training_role_flags = build_training_role_flags_batch(static, state, jnp)
+            training_selector_obs = build_policy_observation_batch_with_role_flag(
+                static,
+                state,
+                training_role_flags,
+                jnp,
+                model_type=spec.model_type,
+                rebound_win_prob_features=bool(spec.rebound_win_prob_features),
+                rebound_target_observation_features=bool(
+                    getattr(spec, "rebound_target_observation_features", True)
+                ),
+                multi_possession_features=bool(
+                    getattr(spec, "multi_possession_features", False)
+                ),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
+                ),
+            )
+            state, _ = _maybe_apply_deterministic_selector_segment_start_for_role(
+                static,
+                state,
+                params,
+                training_selector_obs,
+                training_role_flags,
+                candidate_selector_active,
+                selector_multiselect_enabled,
+                completed_pass_boundary,
+                offensive_rebound_boundary,
+                selector_min_play_steps,
+                jax,
+                jnp,
+                spec,
+            )
+            state = _apply_grouped_opponent_selector(
+                state,
+                completed_pass_boundary,
+                offensive_rebound_boundary,
+            )
             full_action_mask = build_action_masks_batch(static, state, jnp)
             training_action_mask = full_action_mask[:, training_ids, :]
             opponent_action_mask = full_action_mask[:, opponent_ids, :]
@@ -3589,17 +3917,38 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 offense_score=env_out.state.offense_score,
                 defense_score=env_out.state.defense_score,
             )
-            return (env_out.state, key), trace
+            active_step = ~state.episode_ended.astype(jnp.bool_)
+            next_completed_pass_boundary = (
+                active_step
+                & (~env_out.done.astype(jnp.bool_))
+                & env_out.completed_pass.astype(jnp.bool_)
+            )
+            next_offensive_rebound_boundary = (
+                active_step
+                & (~env_out.done.astype(jnp.bool_))
+                & env_out.offensive_rebound.astype(jnp.bool_)
+            )
+            return (
+                env_out.state,
+                key,
+                next_completed_pass_boundary,
+                next_offensive_rebound_boundary,
+            ), trace
 
-        (final_state, _), trace = jax.lax.scan(
+        (final_state, _, _, _), trace = jax.lax.scan(
             _scan_step,
-            (initial_state, rollout_key),
+            (
+                initial_state,
+                rollout_key,
+                initial_completed_pass_boundary,
+                initial_offensive_rebound_boundary,
+            ),
             xs=None,
             length=int(horizon),
         )
         return final_state, trace
 
-    return jax.jit(_runner, static_argnums=(5, 6))
+    return jax.jit(_runner, static_argnums=(5, 6, 9, 10))
 
 
 def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
@@ -3611,6 +3960,7 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
         params,
         rollout_key,
         horizon: int,
+        selector_active: bool,
         selector_multiselect_enabled: bool,
         selector_min_play_steps: int,
     ):
@@ -3640,9 +3990,11 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
             ) = carry
             key, env_key = jax.random.split(key, 2)
             active_step = ~state.episode_ended.astype(jnp.bool_)
-            selector_obs = build_policy_observation_batch(
+            training_role_flags = build_training_role_flags_batch(static, state, jnp)
+            selector_obs = build_policy_observation_batch_with_role_flag(
                 static,
                 state,
+                training_role_flags,
                 jnp,
                 model_type=spec.model_type,
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
@@ -3652,11 +4004,13 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
             )
-            state, selector_metrics = _maybe_apply_deterministic_selector_segment_start(
+            state, training_selector_metrics = _maybe_apply_deterministic_selector_segment_start_for_role(
                 static,
                 state,
                 params,
                 selector_obs,
+                training_role_flags,
+                selector_active,
                 selector_multiselect_enabled,
                 completed_pass_boundary,
                 offensive_rebound_boundary,
@@ -3665,6 +4019,43 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 jnp,
                 spec,
             )
+            opponent_role_flags = build_opponent_role_flags_batch(static, state, jnp)
+            opponent_selector_obs = build_policy_observation_batch_with_role_flag(
+                static,
+                state,
+                opponent_role_flags,
+                jnp,
+                model_type=spec.model_type,
+                rebound_win_prob_features=bool(spec.rebound_win_prob_features),
+                rebound_target_observation_features=bool(
+                    getattr(spec, "rebound_target_observation_features", True)
+                ),
+                multi_possession_features=bool(
+                    getattr(spec, "multi_possession_features", False)
+                ),
+                check_clearance_features=(
+                    int(getattr(spec, "observation_schema_version", 1)) >= 5
+                ),
+            )
+            state, opponent_selector_metrics = _maybe_apply_deterministic_selector_segment_start_for_role(
+                static,
+                state,
+                params,
+                opponent_selector_obs,
+                opponent_role_flags,
+                selector_active,
+                selector_multiselect_enabled,
+                completed_pass_boundary,
+                offensive_rebound_boundary,
+                selector_min_play_steps,
+                jax,
+                jnp,
+                spec,
+            )
+            selector_metrics = {
+                name: training_selector_metrics[name] + opponent_selector_metrics[name]
+                for name in training_selector_metrics
+            }
 
             full_action_mask = build_action_masks_batch(static, state, jnp)
             offense_action_mask = full_action_mask[:, offense_ids, :]
@@ -3926,7 +4317,7 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
             rebound_diagnostic_totals=rebound_totals,
         )
 
-    return jax.jit(_runner, static_argnums=(4, 5, 6))
+    return jax.jit(_runner, static_argnums=(4, 6, 7))
 
 
 def summarize_deploy_eval_outputs(

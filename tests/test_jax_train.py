@@ -49,6 +49,7 @@ from basketworld_jax.train.main import (
     _check_clearance_for_update,
     _check_clearance_warmup_enabled,
     _entropy_coef_for_update,
+    _evaluation_game_rule_context,
     _filter_mlflow_deploy_metrics,
     _historical_eval_updates,
     _historical_eval_artifact_payload,
@@ -66,6 +67,7 @@ from basketworld_jax.train.main import (
     _multi_possession_curriculum_enabled,
     _multi_possession_limit_for_update,
     _selector_learning_rate_for_args,
+    _selector_active_for_update,
     _summarize_intent_intrinsic_advantages,
     _task_reward_scale_for_update,
     build_trainer_config,
@@ -210,6 +212,55 @@ def test_check_clearance_warmup_validation_and_zero_radius_noop():
     args = parse_args(["--enable-multi-possession", "--check-clearance", "0"])
     assert _check_clearance_warmup_enabled(args) is False
     assert _check_clearance_for_update(args, 999) == 0
+
+
+def test_policy_match_uses_older_shared_game_rules_but_own_selector_schedule():
+    args = parse_args(
+        [
+            "--enable-multi-possession",
+            "--policy-model",
+            "attention",
+            "--enable-intent-learning",
+            "true",
+            "--multi-possession-limit",
+            "25",
+            "--multi-possession-limit-start",
+            "1",
+            "--multi-possession-limit-end",
+            "25",
+            "--multi-possession-limit-ramp-updates",
+            "24",
+            "--check-clearance",
+            "1",
+            "--check-setup-steps",
+            "5",
+            "--check-clearance-warmup-updates",
+            "3",
+            "--intent-selector-enabled",
+            "true",
+            "--intent-selector-alpha-start",
+            "0.0",
+            "--intent-selector-alpha-end",
+            "1.0",
+            "--intent-selector-alpha-warmup-updates",
+            "4",
+            "--intent-selector-alpha-ramp-updates",
+            "1",
+        ]
+    )
+    context = _evaluation_game_rule_context(
+        args,
+        candidate_update=8,
+        opponent_updates=(3,),
+    )
+
+    assert context == {
+        "rule_update": 3,
+        "multi_possession_limit": 3,
+        "check_clearance": 0,
+    }
+    assert _selector_active_for_update(args, 8) is True
+    assert _selector_active_for_update(args, 3) is False
 
 
 def test_shot_contest_skill_cli_values_reach_jax_environment_config():
@@ -456,8 +507,11 @@ def test_historical_match_evaluation_passes_runner_diagnostics_to_summary(monkey
         del keys, jax, jnp
         return static
 
+    selector_active_args = []
+
     def _fake_runner(static, initial_state, *args):
-        del initial_state, args
+        del initial_state
+        selector_active_args.append((bool(args[4]), bool(args[5])))
         candidate_is_team_a = static == "candidate_team_a"
         return (
             SimpleNamespace(
@@ -482,6 +536,8 @@ def test_historical_match_evaluation_passes_runner_diagnostics_to_summary(monkey
         opponent_params=object(),
         candidate_update=10,
         opponent_update=5,
+        candidate_selector_active=True,
+        opponent_selector_active=False,
         args=SimpleNamespace(
             historical_eval_episodes=2,
             historical_eval_seed=3_000_000,
@@ -495,6 +551,7 @@ def test_historical_match_evaluation_passes_runner_diagnostics_to_summary(monkey
 
     assert summary["candidate_wins"] == 2
     assert summary["candidate_pass_attempts_total"] == 14
+    assert selector_active_args == [(True, False), (True, False)]
 
 
 def test_historical_eval_artifact_persists_milestones_and_match_mapping(tmp_path):
@@ -3275,6 +3332,12 @@ def test_train_loop_skips_empty_selector_update_during_warmup():
             "1",
             "--eval-every-updates",
             "0",
+            "--eval-deploy-every-updates",
+            "1",
+            "--eval-deploy-batches",
+            "1",
+            "--eval-deploy-horizon",
+            "4",
             "--no-progress",
         ]
     )
@@ -3286,6 +3349,10 @@ def test_train_loop_skips_empty_selector_update_during_warmup():
     assert metrics["selector_train_sample_count"] == pytest.approx(0.0)
     assert metrics["selector_train_skipped_empty"] == pytest.approx(1.0)
     assert "selector_train_loss" not in metrics
+    assert metrics["selector_active"] == pytest.approx(0.0)
+    deploy_metrics = result["deploy_eval_history"][0]
+    assert deploy_metrics["selector_active"] == pytest.approx(0.0)
+    assert deploy_metrics["selector_applied_count"] == 0
 
 
 def test_train_loop_checkpoint_resume_round_trip(tmp_path):

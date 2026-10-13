@@ -59,6 +59,25 @@ def _strict_milestone_updates(payload: dict[str, Any]) -> list[int]:
     return sorted(updates)
 
 
+def _scheduled_rule_configurations(payload: dict[str, Any]) -> set[tuple[int, int]]:
+    """Return explicit shared rule configurations recorded for matchups."""
+    configurations: set[tuple[int, int]] = set()
+    for record in payload.get("matches", []) or []:
+        if not isinstance(record, dict):
+            continue
+        try:
+            configurations.add(
+                (
+                    int(record["evaluation_multi_possession_limit"]),
+                    int(record["evaluation_check_clearance"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            # Older artifacts did not persist a scheduled rule context.
+            continue
+    return configurations
+
+
 def _compact_summary(
     payload: dict[str, Any],
     *,
@@ -145,6 +164,10 @@ def _compact_summary(
     if len(evaluated_components) > 1:
         warnings.append(
             "Evaluated checkpoints span disconnected matchup components; compare ratings only within a component."
+        )
+    if len(_scheduled_rule_configurations(payload)) > 1:
+        warnings.append(
+            "Historical Elo spans multiple scheduled evaluation rule configurations; compare checkpoints within the same configuration."
         )
     if result.get("fit", {}).get("success") is False:
         warnings.append("The Elo optimizer did not report a successful fit.")
