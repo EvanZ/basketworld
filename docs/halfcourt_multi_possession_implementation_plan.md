@@ -204,8 +204,8 @@ The individual issues contain detailed scope, primary code areas, and acceptance
 
 Status: the initial implementation landed on 2026-10-12 in
 `f10805b` (`Implement configurable check clearance`). All identified rule
-decisions are agreed, including the double-violation limit, random penalty,
-and pickup-zone entry rules. The unchecked acceptance items below remain
+decisions are agreed, including defense-only setup clearance and pickup-zone
+entry rules. The unchecked acceptance items below remain
 the release-validation and learning-study work; they are intentionally not
 claimed by the implementation commit.
 
@@ -214,15 +214,16 @@ claimed by the implementation commit.
 - [x] Add `check_clearance`, separate setup/pickup timers, legacy-compatible
   defaults, environment validation, and eligible outside-arc pickup sampling
   with a full clearance-plus-one inbounds margin.
-- [x] Implement per-environment sampled check locations and retry counters,
-  setup/pickup state transitions, single-team technical consequences, two
-  no-score double-violation retries, and the seeded third-violation draw.
+- [x] Implement per-environment sampled check locations, defense-only setup
+  clearance, setup/pickup state transitions, and the defensive technical
+  consequence for a final-boundary violation.
 - [x] Wire the new state through JAX training, native evaluation, inference,
   checkpoint snapshots, aggregate check diagnostics, and the JAX dev-runtime
   state payload.
 - [x] Add the schema-five policy features: sampled coordinates, clearance
-  radius, double-violation count, actual active-phase time, dynamic
-  ball-distance, and `inside_check_clearance`.
+  radius, actual active-phase time, dynamic ball-distance, and
+  `inside_check_clearance`. The retired double-violation slot remains
+  zero-valued compatibility padding.
 - [x] Add trainer form/backend/preset/import support for the three settings,
   including five-second new-run defaults and the nonzero-clearance setup-time
   validation.
@@ -289,24 +290,22 @@ the historical implementation decisions above.
 - Reject configurations with no eligible pickup tiles; do not silently
   relax the boundary margin, arc requirement, or radius.
 - Reveal the sampled location to both teams immediately and keep it fixed
-  throughout setup, pickup, and any repeat setup caused by a double
-  violation. A violation must not offer a new draw of the location.
+  throughout setup and pickup. A defensive technical restart does not offer a
+  new draw of the location for the interrupted check.
 - Preserve every player's on-court position when the check begins. In this
-  mode, even a player already on the ball tile must learn to leave it;
-  do not automatically relocate that player or allow setup-time pickup.
+  mode, an offensive player may remain on the ball tile; do not automatically
+  relocate players or allow setup-time pickup.
 
 #### Setup, pickup, and violations
 
-- During setup, a player outside the protected disk cannot move into it. A
-  player already inside may use only unoccupied moves that strictly increase
-  its hex distance from the ball whenever one exists; `NOOP` is unavailable in
-  that case. This permits a ball-cell player to clear one ring at a time. No
-  pickup occurs during setup.
-- Give both teams the entire `check_setup_steps` period to clear. Evaluate
-  positions only after the final setup movement step. Every player must then
-  have hex distance strictly greater than `check_clearance` from the ball.
-  If an inside player has no unoccupied outward move, it may wait, and the
-  final boundary violation remains the fallback.
+- During setup, offense may position freely but cannot pick up. A defender
+  outside the protected disk cannot move into it. A defender already inside
+  may use only unoccupied moves that strictly increase its hex distance from
+  the ball whenever one exists; `NOOP` is unavailable in that case.
+- Give the defense the entire `check_setup_steps` period to clear. Evaluate
+  defensive positions only after the final setup movement step. If an inside
+  defender has no unoccupied outward move, it may wait, and the final boundary
+  violation remains the fallback.
 - Only a successful setup starts the full pickup countdown. Keep the shot
   clock frozen during setup and pickup, as in the existing check phases.
 - During pickup, offensive players may enter the protected area to collect
@@ -316,27 +315,10 @@ the historical implementation decisions above.
   same possession, and uses the existing defensive technical restart:
   sideline inbound, or direct handoff when inbounds are disabled. It does
   not complete a possession or terminate the game trajectory by itself.
-- An offense-only setup violation awards one point to the defense and
-  ends the offending offense's possession exactly once. The new offense
-  receives the technical restart, mirroring the existing pickup-timeout
-  consequence. Respect the normal game-end check before starting a restart.
-- Multiple offending players on one team produce one team violation and
-  one point, not one penalty per player.
-- On the first and second consecutive double violations at the setup
-  boundary, award **no points**, retain the same offense and possession
-  count, and repeat the full setup period at the same location. Preserve
-  positions and keep the pickup clock stopped.
-- On the **third consecutive double violation**, randomly assign a single
-  violation to one team with equal probability, using the environment RNG.
-  Apply that team's normal single-team penalty and technical restart as
-  defined above. Penalizing the offense completes its possession once;
-  penalizing the defense retains the possession. Award only one point to
-  the non-penalized team, never offsetting points to both teams.
-- The limit counts double-violation events, not retries: the initial setup
-  can fail twice and be repeated twice; the third failure resolves the
-  check without another setup. Initialize the count to zero for each new
-  check, preserve it across repeat setup periods and checkpoint resume,
-  and clear it when setup succeeds or a penalty resolves the check.
+- Multiple defenders inside produce one defensive team violation and one
+  point, not one penalty per player. Offense occupancy is never a setup
+  violation, so there are no double violations, setup retries, or random
+  penalty assignments.
 - Keep the existing offensive pickup-timeout penalty after a valid setup.
   After a valid pickup, the check-space restriction ends and normal live
   play resumes.
@@ -345,19 +327,18 @@ the historical implementation decisions above.
 
 - Carry configuration through training CLI/presets, checkpoint and env
   metadata, native evaluation, training UI, and dev app controls.
-- Store the sampled location and consecutive double-violation count in
-  per-environment state. Use that location consistently in movement rules, observations,
-  pickup detection, snapshots, checkpoint resume, and app rendering rather
-  than assuming one static check coordinate for the whole batch.
+- Store the sampled location in per-environment state. Use that location
+  consistently in movement rules, observations, pickup detection, snapshots,
+  checkpoint resume, and app rendering rather than assuming one static check
+  coordinate for the whole batch. Retain the retired double-violation state
+  field as zero-valued serialized compatibility data.
 - Expose the current ball location, protected area, phase, separate
-  countdowns, and double-violation count/limit in the dev app. Both policies
-  must observe the count, location, and enough rule context to respond to it.
-- Record distinct offense, defense, and double check-space violations,
-  offending players, setup retries, random limit resolutions and selected
-  penalized teams, pickup success/timeouts, pickup latency,
-  and stable-team score/possession consequences. Keep these separate from
-  live-ball clearance violations and the existing pickup-timeout event.
-- Preserve continuous PPO/GAE behavior across setup, retries, and ordinary
+  countdowns, and defender-clearance events in the dev app. Both policies
+  must observe the location and enough rule context to respond to it.
+- Record defensive check-space violations, pickup success/timeouts, pickup
+  latency, and stable-team score/possession consequences. Keep these separate
+  from live-ball clearance violations and the existing pickup-timeout event.
+- Preserve continuous PPO/GAE behavior across setup and ordinary
   possession boundaries. Verify score changes feed the existing game
   reward and score-shaping paths exactly once.
 
@@ -367,21 +348,21 @@ the historical implementation decisions above.
   and normalized active countdown. The phase continues to distinguish
   setup from pickup; the role determines which players remain restricted
   during pickup.
-- Add four global values for the check mechanic: sampled pickup `q` and
-  `r` coordinates, `check_clearance` radius, and consecutive double-violation
-  count. Both actor and critic, for both teams, receive these features.
-  The count makes the different consequences after zero, one, or two
-  double violations observable even when positions and clocks match.
+- Add four live global values for the check mechanic: sampled pickup `q` and
+  `r` coordinates, `check_clearance` radius, and actual active-phase time.
+  Both actor and critic, for both teams, receive these features. Retain the
+  former double-violation global as zero-valued schema-v5 compatibility
+  padding.
 - Update the existing per-player distance-to-ball feature to use the
   sampled per-environment check location during setup and pickup, rather
   than the old fixed coordinate. Expose coordinates directly as well so
   policies can determine the direction to the randomized destination.
 - Add one derived per-player boolean, `inside_check_clearance`, indicating
   hex distance less than or equal to the configured radius, including the
-  ball tile, during a nonzero-clearance check. This reports geometry, not
-  a completed violation: occupancy is allowed before the setup boundary,
-  and offensive players may enter during pickup. Role and phase provide
-  that context. Clear the flag outside the relevant check phases.
+  ball tile, during a nonzero-clearance check. This reports geometry, not a
+  completed violation: offense occupancy is legal, while role and phase
+  identify when a defender must clear. Clear the flag outside the relevant
+  check phases.
 - Also expose the actual remaining time of the active setup/pickup phase
   as a global value. Reuse the phase indicator to identify which timer it
   describes. If scaled, use a fixed documented scale so different timer
@@ -389,8 +370,7 @@ the historical implementation decisions above.
   Retain the existing normalized countdown. This adds five global values
   in total, including the four check-context values above.
 - Define consistent scaling and inactive-phase values for the new fields;
-  do not expose a stale sampled location or retry count after the check.
-  Do not expose the future random penalty draw.
+  do not expose a stale sampled location after the check.
 - Introduce a new observation schema version for this extension. Preserve
   old checkpoint dimensions, feature ordering, and legacy observation
   semantics. Persist the version in model/checkpoint metadata and use the
@@ -411,9 +391,9 @@ the historical implementation decisions above.
 - Explain the effective rules beside the controls: nonzero clearance uses a
   safe eligible pickup location, `random_check_location` selects randomized
   locations or a deterministic anchor, boundary margin is clearance
-  plus one ring, and the third consecutive double violation triggers a
-  50/50 assignment of the normal single-team penalty. These agreed rules
-  need not become separate toggles simply to appear in the UI.
+  plus one ring, offense may set up freely, and only defenders must clear the
+  disk before pickup. These agreed rules need not become separate toggles
+  simply to appear in the UI.
 - Keep frontend defaults, backend models/validation, application presets,
   and compiled training arguments consistent. Validate check-mode
   applicability, positive setup time for nonzero clearance, available
@@ -438,20 +418,19 @@ the historical implementation decisions above.
   as planned rather than describing it as already available.
 - Describe the full check lifecycle in the environment/movement rules:
   sampled location outside the arc, clearance-plus-one boundary margin,
-  unchanged player positions, five-second setup, both-team clearance,
-  five-second pickup, defender-only restrictions during pickup, and the
-  transition to live play. Distinguish check-space clearance from the
-  existing requirement to clear the ball beyond the arc before shooting.
-- Document offense-only and defense-only violations, their point and
-  possession consequences, defender pickup-zone entry blocking, and
-  the first two no-score double-violation retries followed by the third
-  violation's 50/50 single-team penalty. Include a short worked example.
+  unchanged player positions, five-second defensive-clearance setup,
+  five-second pickup, defender-only restrictions through pickup, and the
+  transition to live play. Distinguish check-space clearance from the existing
+  requirement to clear the ball beyond the arc before shooting.
+- Document the defensive violation's point and possession consequences and
+  defender pickup-zone entry blocking. Explain that the offense may occupy
+  the disk during setup but cannot pick up before the pickup countdown.
 - Update the training and trainer app guides with configuration names,
   units, defaults, validation constraints, valid example settings, trainer
   controls, saved settings, and checkpoint compatibility. Explain radius
   zero and legacy timer behavior without implying old runs change rules.
 - Update the dev app guide to explain the displayed pickup location,
-  protected area, setup/pickup timers, double-violation count, and events.
+  protected area, setup/pickup timers, and defensive-clearance events.
   Describe the diagnostics used to assess learned compliance and pickups.
 - Document the approved observation fields, per-player geometry flag,
   actual-time encoding, phase semantics, scaling, and schema compatibility
@@ -466,19 +445,13 @@ the historical implementation decisions above.
 #### Acceptance and validation
 
 - [ ] Test hex radii `0`, `1`, and `2`, including the ball tile, exact radius
-  boundaries, both teams, and multiple offending players.
+  boundaries, offensive setup occupancy, and multiple offending defenders.
 - [ ] Test seeded eligible-location sampling, outside-arc geometry, full
   boundary margins, empty candidate rejection, and deadline feasibility.
 - [ ] Test five setup steps followed by five pickup steps, final-step
   movement, frozen shot clock, and no premature pickup.
-- [ ] Test both single-team penalties, unchanged possession accounting for
-  defensive violations, one completed possession for offensive violations,
-  double violations, fixed-location retries, and blocked defensive pickup-zone
-  entry.
-- [ ] Test no penalty on double violations one and two, exactly one seeded
-  50/50 team selection on the third, both resulting penalty paths, counter
-  reset/persistence, and no fourth setup period. Verify reproducibility and
-  equal-probability selection independent of stable team identity.
+- [ ] Test the defensive technical penalty, unchanged possession accounting,
+  no offense setup penalty, and blocked defensive pickup-zone entry.
 - [ ] Test that a masked or direct defensive move into the pickup zone does
   not prevent a same-step offensive pickup, and that defenders may enter on
   the following live step.
@@ -490,8 +463,8 @@ the historical implementation decisions above.
 - [ ] Verify training, evaluation, and dev runtime agreement; build affected
   frontends and run focused regression tests.
 - [ ] Test observed sampled coordinates and distances for distinct check
-  locations in one batch; radius and retry-count visibility for both teams;
-  inside-clearance flags at the ball tile and radius boundary; setup versus
+  locations in one batch; inside-clearance flags at the ball tile and radius
+  boundary; setup versus
   pickup semantics; and inactive-phase values. Verify actual remaining
   time distinguishes different durations with equal normalized countdowns.
 - [ ] Test new schema dimensions, labels, actor/critic inputs, metadata
@@ -505,13 +478,11 @@ the historical implementation decisions above.
 - [ ] Update the rules, training, trainer app, and dev app documentation;
   verify examples/defaults against the implemented configuration, check
   links, and run the repository's documentation build/checks where available.
-- [ ] Train a fresh policy for nonzero clearance and evaluate setup
-  compliance, retries, and pickup behavior separately. Random locations
+- [ ] Train a fresh policy for nonzero clearance and evaluate defensive setup
+  compliance and pickup behavior separately. Random locations
   may improve adaptation; measure that rather than assuming improvement.
-- [ ] Track how often the three-violation limit is reached and whether
-  compliance improves. Random assignment ends setup deadlocks without a
-  preferred team in the draw, but does not guarantee improved learning;
-  check that policies do not learn to tolerate or exploit the lottery.
+- [ ] Track defensive setup compliance and pickup rate after warmup. Verify
+  that policies do not learn to tolerate the technical penalty.
 
 #### Decision status
 

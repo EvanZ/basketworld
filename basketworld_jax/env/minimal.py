@@ -152,7 +152,6 @@ TURNOVER_REASON_INBOUND_TIMEOUT = 7
 TURNOVER_REASON_INBOUND_INVALID_PASS = 8
 TURNOVER_REASON_CLEARANCE_VIOLATION = 9
 TURNOVER_REASON_CHECK_TIMEOUT = 10
-TURNOVER_REASON_CHECK_CLEARANCE_VIOLATION = 11
 TEAM_A = 0
 TEAM_B = 1
 GAME_PHASE_LIVE = 0
@@ -490,6 +489,8 @@ class KernelState(NamedTuple):
     inbound_steps_remaining: Any
     check_team: Any
     check_ball_position: Any
+    # Retained as a zero-valued serialized field for pre-defense-only check
+    # checkpoints. The current rule has no double-violation mechanic.
     check_double_violation_count: Any
     check_setup_steps_remaining: Any
     check_steps_remaining: Any
@@ -559,6 +560,7 @@ class StepBatchOutput(NamedTuple):
     check_setup_step: Any
     check_pickup: Any
     check_violation: Any
+    # Retained zero-valued rollout diagnostics preserve existing trace shapes.
     check_space_offense_violation: Any
     check_space_defense_violation: Any
     check_space_double_violation: Any
@@ -2325,15 +2327,13 @@ def build_action_masks_batch(static: KernelStatic, state: KernelState, jnp):
         move_masks,
     )
 
-    # During setup, a positive clearance radius closes the whole protected
-    # disk to both teams. Players inherited inside the disk must take an
-    # unoccupied move that increases their distance from the ball whenever one
-    # is available; this prevents a learnable "stand in the violation zone"
-    # pattern while allowing a player on the ball cell to leave one ring at a
-    # time. The final setup
-    # boundary still owns violation resolution if a player remains trapped in
-    # the disk.  During pickup, the disk remains closed only to the defense.
-    # Radius zero preserves the legacy loose-ball-cell restriction.
+    # A positive clearance radius is a defense-only rule. During setup,
+    # defenders outside the protected disk cannot enter it, and defenders
+    # inherited inside must take an unoccupied outward move whenever one is
+    # available. The offense may position freely but cannot pick up until the
+    # setup countdown ends. During pickup, the disk remains closed to the
+    # defense until a valid pickup makes play live. Radius zero preserves the
+    # legacy loose-ball-cell restriction.
     player_ids = jnp.arange(n_players, dtype=jnp.int32)
     stable_team_a = jnp.any(
         player_ids[:, None] == static.offense_ids[None, :],
@@ -2375,7 +2375,9 @@ def build_action_masks_batch(static: KernelStatic, state: KernelState, jnp):
     )
     setup_forbidden = setup_phase & jnp.where(
         clearance_enabled,
-        (~currently_inside_clearance[:, :, None]) & targets_clearance,
+        active_defender[:, :, None]
+        & (~currently_inside_clearance[:, :, None])
+        & targets_clearance,
         targets_check,
     )
     pickup_defense_forbidden = (
@@ -2397,6 +2399,7 @@ def build_action_masks_batch(static: KernelStatic, state: KernelState, jnp):
     )
     must_egress = (
         setup_clearance
+        & active_defender
         & currently_inside_clearance
     )
     move_masks = jnp.where(
@@ -3727,7 +3730,7 @@ def build_check_clearance_observation_features_batch(
             ),
             jnp.where(
                 check_active,
-                state.check_double_violation_count.astype(jnp.float32) / 3.0,
+                jnp.zeros_like(state.check_double_violation_count, dtype=jnp.float32),
                 0.0,
             ),
             jnp.where(check_active, active_timer / 120.0, 0.0),
@@ -4446,14 +4449,18 @@ def _resolve_movement_single(static: KernelStatic, state: KernelState, actions, 
     currently_inside_clearance = (
         current_clearance_distance <= static.check_clearance.astype(jnp.int32)
     )
-    setup_entry_forbidden = (state.game_phase == GAME_PHASE_CHECK_SETUP) & jnp.where(
-        static.check_clearance.astype(jnp.bool_),
-        jnp.where(
-            currently_inside_clearance,
-            target_clearance_distance <= current_clearance_distance,
-            targets_clearance,
-        ),
-        targets_check,
+    setup_entry_forbidden = (
+        (state.game_phase == GAME_PHASE_CHECK_SETUP)
+        & jnp.where(
+            static.check_clearance.astype(jnp.bool_),
+            active_defender
+            & jnp.where(
+                currently_inside_clearance,
+                target_clearance_distance <= current_clearance_distance,
+                targets_clearance,
+            ),
+            targets_check,
+        )
     )
     pickup_defense_entry_forbidden = (
         (state.game_phase == GAME_PHASE_AWAITING_CHECK)
@@ -5246,11 +5253,9 @@ def _finalize_possession_single(
                 state.check_ball_position,
             ),
         ),
-        check_double_violation_count=jnp.where(
-            check_restart | advance,
-            jnp.asarray(0, dtype=jnp.int32),
-            state.check_double_violation_count,
-        ),
+        # Keep the field in serialized state trees for legacy checkpoints.
+        # Defense-only clearance has no retry counter.
+        check_double_violation_count=jnp.asarray(0, dtype=jnp.int32),
         check_setup_steps_remaining=jnp.where(
             check_setup,
             static.check_setup_steps.astype(jnp.int32),
@@ -5594,65 +5599,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             check_position[None, :],
             jnp,
         ) <= static.check_clearance.astype(jnp.int32)
-        offense_inside = jnp.any(inside_clearance & (active_roles > 0.0))
         defense_inside = jnp.any(inside_clearance & (active_roles < 0.0))
-
-        def _offense_space_violation(_):
-            """Award the defense a point and finish the violating possession."""
-            opponent_team = (1 - moved_state.offense_team).astype(jnp.int8)
-            point = jnp.asarray(1.0, dtype=jnp.float32)
-            penalized_state = _replace_state(
-                moved_state,
-                offense_score=moved_state.offense_score
-                + jnp.where(opponent_team == TEAM_A, point, 0.0),
-                defense_score=moved_state.defense_score
-                + jnp.where(opponent_team == TEAM_B, point, 0.0),
-                team_a_score=moved_state.team_a_score
-                + jnp.where(opponent_team == TEAM_A, point, 0.0),
-                team_b_score=moved_state.team_b_score
-                + jnp.where(opponent_team == TEAM_B, point, 0.0),
-                check_double_violation_count=jnp.asarray(0, dtype=jnp.int32),
-            )
-            (
-                final_state,
-                game_done,
-                possession_ended,
-                completed_possession_live_steps,
-            ) = _finalize_possession_single(
-                static,
-                penalized_state,
-                possession_ended=jnp.asarray(True),
-                possession_end_reason=jnp.asarray(
-                    POSSESSION_END_CHECK_VIOLATION,
-                    dtype=jnp.int32,
-                ),
-                next_offense_team=opponent_team,
-                requires_inbound=jnp.asarray(True),
-                inbound_selection_key=next_check_key,
-                jax=jax,
-                jnp=jnp,
-            )
-            return base_output._replace(
-                state=final_state,
-                done=game_done,
-                terminal_episode_steps=jnp.where(
-                    game_done,
-                    final_state.step_count.astype(jnp.int32),
-                    zero_steps,
-                ),
-                turnover_reason=jnp.asarray(
-                    TURNOVER_REASON_CHECK_CLEARANCE_VIOLATION,
-                    dtype=jnp.int32,
-                ),
-                possession_ended=possession_ended.astype(jnp.int8),
-                possession_end_reason=jnp.asarray(
-                    POSSESSION_END_CHECK_VIOLATION,
-                    dtype=jnp.int32,
-                ),
-                completed_possession_live_steps=completed_possession_live_steps,
-                check_violation=jnp.asarray(1, dtype=jnp.int8),
-                check_space_offense_violation=jnp.asarray(1, dtype=jnp.int8),
-            )
 
         def _defense_space_violation(_):
             """Award the offense a technical point without ending possession."""
@@ -5708,12 +5655,9 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 jnp.asarray(0, dtype=jnp.int32),
                 state.check_steps_elapsed,
             ),
-            # Completing a valid setup breaks the double-violation sequence.
-            check_double_violation_count=jnp.where(
-                setup_complete,
-                jnp.asarray(0, dtype=jnp.int32),
-                moved_state.check_double_violation_count,
-            ),
+            # Retain the serialized field for legacy state compatibility, but
+            # defense-only clearance no longer has double-violation retries.
+            check_double_violation_count=jnp.asarray(0, dtype=jnp.int32),
         )
         setup_output = _already_done(None)._replace(
             state=setup_state,
@@ -5722,65 +5666,9 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
         )
 
         def _clearance_setup_output(_):
-            next_double_count = (
-                moved_state.check_double_violation_count
-                + jnp.asarray(1, dtype=jnp.int32)
-            )
-
-            def _repeat_setup(_):
-                repeat_state = _replace_state(
-                    moved_state,
-                    game_phase=jnp.asarray(GAME_PHASE_CHECK_SETUP, dtype=jnp.int8),
-                    check_setup_steps_remaining=static.check_setup_steps.astype(jnp.int32),
-                    check_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
-                    check_steps_elapsed=jnp.asarray(0, dtype=jnp.int32),
-                    check_double_violation_count=next_double_count,
-                )
-                return base_output._replace(
-                    state=repeat_state,
-                    check_setup_step=jnp.asarray(1, dtype=jnp.int8),
-                    check_space_double_violation=jnp.asarray(1, dtype=jnp.int8),
-                )
-
-            def _randomly_resolve_double(_):
-                penalize_offense = jax.random.bernoulli(next_check_key)
-                resolved = jax.lax.cond(
-                    penalize_offense,
-                    _offense_space_violation,
-                    _defense_space_violation,
-                    operand=None,
-                )
-                return resolved._replace(
-                    check_space_double_violation=jnp.asarray(1, dtype=jnp.int8),
-                    check_space_random_resolution=jnp.asarray(1, dtype=jnp.int8),
-                )
-
-            def _resolve_completed_setup(_):
-                return jax.lax.cond(
-                    offense_inside & defense_inside,
-                    lambda __: jax.lax.cond(
-                        next_double_count < 3,
-                        _repeat_setup,
-                        _randomly_resolve_double,
-                        operand=None,
-                    ),
-                    lambda __: jax.lax.cond(
-                        offense_inside,
-                        _offense_space_violation,
-                        lambda ___: jax.lax.cond(
-                            defense_inside,
-                            _defense_space_violation,
-                            lambda ____: setup_output,
-                            operand=None,
-                        ),
-                        operand=None,
-                    ),
-                    operand=None,
-                )
-
             return jax.lax.cond(
-                setup_complete,
-                _resolve_completed_setup,
+                setup_complete & defense_inside,
+                _defense_space_violation,
                 lambda __: setup_output,
                 operand=None,
             )

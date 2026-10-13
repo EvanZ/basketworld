@@ -449,13 +449,13 @@ function checkRuleNote(name) {
     return 'Milestones beyond the update limit are saved for future copies and extensions. Only milestones within this run’s limit execute.'
   }
   if (name === 'check_clearance') {
-    return 'A positive radius requires an eligible outside-arc pickup tile. Its protected disk and one extra inbounds ring must fit on the court. During setup, players outside cannot enter it and players inside must move outward when an unoccupied outward move exists.'
+    return 'A positive radius requires an eligible outside-arc pickup tile. Its protected disk and one extra inbounds ring must fit on the court. During setup, defenders outside cannot enter it and defenders inside must move outward when an unoccupied outward move exists; the offense may position freely.'
   }
   if (name === 'random_check_location') {
     return 'When enabled, each nonzero-clearance check samples uniformly from safe locations. When disabled, every check uses one deterministic safe anchor while retaining the same clearance rule.'
   }
   if (name === 'check_setup_steps') {
-    return 'Both teams receive this entire setup period to clear the protected disk before pickup starts. A clearance violation is evaluated only after the final setup movement step; the first two double violations repeat setup at the same tile.'
+    return 'The defense receives this entire setup period to clear the protected disk before pickup starts. A clearance violation is evaluated only after the final setup movement step; the offense may remain in the disk but cannot pick up until setup ends.'
   }
   if (name === 'check_deadline_steps') {
     return 'After valid setup, the offense has this many seconds to collect the ball. Defenders cannot enter the clearance radius until pickup makes play live.'

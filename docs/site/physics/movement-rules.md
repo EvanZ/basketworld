@@ -76,15 +76,15 @@ In multi-possession check mode, a made basket can begin a loose-ball check.
 With a positive `check_clearance` radius, the ball is placed at an eligible
 outside-arc tile whose protected disk and one extra inbounds ring fit on the
 court. `random_check_location` samples an eligible tile; otherwise checks use
-the deterministic safe anchor. The sampled tile remains fixed through setup,
-pickup, and any double-violation retries.
+the deterministic safe anchor. The sampled tile remains fixed through setup and
+pickup.
 
-Setup lasts the full `check_setup_steps` countdown. A player outside the disk
-cannot move into it. A player already inside may choose only unoccupied moves
-that strictly increase hex distance from the ball whenever such a move exists;
-`NOOP` is masked in that case. This lets a player on the ball tile leave one
-ring at a time. Clearance is evaluated only after the final setup movement
-step, so the restriction does not award an early violation.
+Setup lasts the full `check_setup_steps` countdown. The offense may position
+freely but cannot pick up during setup. A defender outside the disk cannot
+move into it. A defender already inside may choose only unoccupied moves that
+strictly increase hex distance from the ball whenever such a move exists;
+`NOOP` is masked in that case. Clearance is evaluated only after the final
+setup movement step, so the restriction does not award an early violation.
 
 During the following pickup countdown, offensive players may enter the disk
 to collect the ball. Defensive moves into the disk are masked and blocked by

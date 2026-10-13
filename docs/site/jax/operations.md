@@ -80,10 +80,12 @@ the 50/50 jump-ball result then assigns the opening ball-handler without
 rearranging either team.
 
 For top-of-key check restarts, `--check-setup-steps N` optionally inserts N
-movement-only dead-ball ticks before the existing pickup countdown. Both teams
-may reposition during setup, but neither may enter the protected ball cell;
-the shot clock, lane clocks, and `--check-deadline-steps` countdown remain
-paused. The default is `0`, which preserves the immediate-check behavior.
+movement-only dead-ball ticks before the existing pickup countdown. The offense
+may reposition freely but cannot pick up during setup. Defenders cannot enter
+the positive-clearance disk and must move outward when they begin inside it.
+The shot clock, lane clocks, and `--check-deadline-steps` countdown remain
+paused. New configurations default to five setup steps; `0` preserves the
+immediate-check behavior.
 `CHECK_SETUP_STEPS` exposes the same setting in the multi-possession launcher.
 Training and native evaluation report setup opportunities, executed setup
 steps, and mean executed setup duration separately from live-possession pace

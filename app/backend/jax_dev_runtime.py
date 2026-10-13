@@ -2614,9 +2614,6 @@ class JaxDevRuntime:
                     "team": "team_a" if check_team == TEAM_A else "team_b",
                     "completed": _as_bool(out.check_pickup[0]),
                     "violation": _as_bool(out.check_violation[0]),
-                    "offense_space_violation": _as_bool(
-                        out.check_space_offense_violation[0]
-                    ),
                     "defense_space_violation": _as_bool(
                         out.check_space_defense_violation[0]
                     ),
@@ -2637,20 +2634,8 @@ class JaxDevRuntime:
                 {
                     "team": "team_a" if check_team == TEAM_A else "team_b",
                     "setup": True,
-                    "offense_space_violation": _as_bool(
-                        out.check_space_offense_violation[0]
-                    ),
                     "defense_space_violation": _as_bool(
                         out.check_space_defense_violation[0]
-                    ),
-                    "double_violation": _as_bool(
-                        out.check_space_double_violation[0]
-                    ),
-                    "random_resolution": _as_bool(
-                        out.check_space_random_resolution[0]
-                    ),
-                    "double_violation_count": _as_int(
-                        _field0(next_state, "check_double_violation_count")
                     ),
                     "setup_steps_remaining": _as_int(
                         _field0(next_state, "check_setup_steps_remaining")
@@ -3583,9 +3568,6 @@ class JaxDevRuntime:
             "inbound_steps_remaining": _field0(self.state, "inbound_steps_remaining"),
             "check_team": _field0(self.state, "check_team"),
             "check_ball_position": _field0(self.state, "check_ball_position"),
-            "check_double_violation_count": _field0(
-                self.state, "check_double_violation_count"
-            ),
             "check_setup_steps_remaining": _field0(
                 self.state, "check_setup_steps_remaining"
             ),
@@ -3813,10 +3795,6 @@ class JaxDevRuntime:
             "random_check_location": bool(_int_from_static_field(
                 self.static, "random_check_location", 0
             )),
-            "check_double_violation_count": int(
-                np.asarray(host["check_double_violation_count"]).reshape(-1)[0]
-            ),
-            "check_double_violation_limit": 3,
             "check_steps_remaining": int(
                 np.asarray(host["check_steps_remaining"]).reshape(-1)[0]
             ),
@@ -4197,10 +4175,6 @@ class JaxDevRuntime:
             "random_check_location": bool(_int_from_static_field(
                 self.static, "random_check_location", 0
             )),
-            "check_double_violation_count": _as_int(
-                _field0(self.state, "check_double_violation_count")
-            ),
-            "check_double_violation_limit": 3,
             "check_steps_remaining": _as_int(
                 _field0(self.state, "check_steps_remaining")
             ),

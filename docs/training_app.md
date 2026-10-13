@@ -47,8 +47,9 @@ uniformly from safe outside-arc pickup tiles; either setting retains the same
 clearance mechanics and policy observation schema.
 
 For a positive check-clearance radius, the clearance rule is active from the
-first update and evaluation uses that same rule. Setup gives both teams the
-configured full setup period to clear the protected disk.
+first update and evaluation uses that same rule. Setup gives the defense the
+configured full setup period to clear the protected disk; the offense may set
+up freely but cannot pick up until the countdown ends.
 
 ## v0 lifecycle
 
@@ -60,7 +61,7 @@ configured full setup period to clear the protected disk.
 
 Every durable checkpoint records its Git commit, tracked-worktree cleanliness, and (when dirty) a SHA-256 fingerprint of the tracked diff. The trainer app compares that record with the current checkout before Resume, Recover, or Continue. An exact match proceeds normally; a mismatch, unavailable Git metadata, or a legacy checkpoint requires explicit confirmation. This provenance is diagnostic only—it does not guarantee dependency or runtime compatibility.
 
-For check-based made-basket restarts, the trainer configuration exposes **Pre-check setup steps**, **Check pickup seconds**, and **Check-clearance rings**. New configurations use five seconds for setup and five seconds for pickup. A nonzero clearance samples one eligible pickup tile outside the clearance arc; the protected disk, plus one inbounds ring, must fit on the court. During setup, players outside the disk cannot enter it, and players inside must use unoccupied outward moves whenever available. Both teams receive the entire setup period to clear; any remaining player is penalized only at the final setup boundary. During pickup, defenders cannot enter the disk until the offense collects the ball. An offense-only violation awards the defense one point and ends possession; a defense-only violation awards the offense one point and restarts the same possession with a defensive technical. The first two double violations repeat setup at the same tile, and the third assigns one of those single-team penalties with a seeded 50/50 draw. Nonzero-clearance policies use a new observation schema and should train from scratch.
+For check-based made-basket restarts, the trainer configuration exposes **Pre-check setup steps**, **Check pickup seconds**, and **Check-clearance rings**. New configurations use five seconds for setup and five seconds for pickup. A nonzero clearance samples one eligible pickup tile outside the clearance arc; the protected disk, plus one inbounds ring, must fit on the court. During setup, the offense may position freely but cannot pick up; defenders outside the disk cannot enter it, and defenders inside must use unoccupied outward moves whenever available. The defense receives the entire setup period to clear, and only a defender remaining inside at the final setup boundary is penalized. During pickup, defenders cannot enter the disk until the offense collects the ball. A defensive violation awards the offense one point and restarts the same possession with a defensive technical. Nonzero-clearance policies use the check-clearance observation schema and should train from scratch.
 
 Run detail shows the full Git commit and worktree state captured for the most
 recent worker launch. For a resumed or continued run, these fields describe the

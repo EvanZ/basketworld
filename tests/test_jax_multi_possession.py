@@ -493,7 +493,7 @@ def _check_state(static, *, countdown: int = 5, seed: int = 310):
     )
 
 
-def _clearance_setup_state(static, positions, *, double_violations: int = 0, seed: int = 610):
+def _clearance_setup_state(static, positions, *, seed: int = 610):
     state = reset_batch_minimal(
         static,
         jax.random.split(jax.random.PRNGKey(seed), 1),
@@ -511,7 +511,7 @@ def _clearance_setup_state(static, positions, *, double_violations: int = 0, see
         check_ball_position=jnp.asarray([check_position], dtype=jnp.int32),
         check_setup_steps_remaining=jnp.asarray([1], dtype=jnp.int32),
         check_steps_remaining=jnp.asarray([0], dtype=jnp.int32),
-        check_double_violation_count=jnp.asarray([double_violations], dtype=jnp.int32),
+        check_double_violation_count=jnp.asarray([0], dtype=jnp.int32),
         clearance_achieved=jnp.asarray([0], dtype=jnp.int8),
     )
 
@@ -578,10 +578,11 @@ def test_check_clearance_samples_safe_locations_and_exposes_schema_five_features
         check_position / float(np.asarray(static.court_norm_den)),
     )
     assert float(np.asarray(globals_vec)[0, -3]) > 0.0
+    assert float(np.asarray(globals_vec)[0, -2]) == pytest.approx(0.0)
     assert float(np.asarray(globals_vec)[0, -1]) == pytest.approx(1.0 / 120.0)
 
 
-def test_check_clearance_applies_single_team_penalties_and_breaks_double_violation_symmetry():
+def test_check_clearance_penalizes_only_defense_and_allows_offense_to_wait_at_ball():
     static = _multi_possession_static(
         players=2,
         court_rows=9,
@@ -611,62 +612,38 @@ def test_check_clearance_applies_single_team_penalties_and_breaks_double_violati
     assert int(np.asarray(defense_out.possession_ended)[0]) == 0
     assert float(np.asarray(defense_out.team_a_score_delta)[0]) == pytest.approx(1.0)
 
-    offense_only = _clearance_setup_state(
+    offense_at_ball = _clearance_setup_state(
         static,
         np.vstack([check_position[None, :], outside[:1], outside[1:3]]),
         seed=612,
     )
-    offense_out = step_batch_minimal(
+    setup_out = step_batch_minimal(
         static,
-        offense_only,
+        offense_at_ball,
         actions,
         jax.random.split(jax.random.PRNGKey(613), 1),
         jax,
         jnp,
     )
-    assert int(np.asarray(offense_out.check_space_offense_violation)[0]) == 1
-    assert int(np.asarray(offense_out.possession_ended)[0]) == 1
-    assert float(np.asarray(offense_out.team_b_score_delta)[0]) == pytest.approx(1.0)
+    assert int(np.asarray(setup_out.check_violation)[0]) == 0
+    assert int(np.asarray(setup_out.possession_ended)[0]) == 0
+    assert float(np.asarray(setup_out.team_a_score_delta)[0]) == pytest.approx(0.0)
+    assert float(np.asarray(setup_out.team_b_score_delta)[0]) == pytest.approx(0.0)
+    assert int(np.asarray(setup_out.state.game_phase)[0]) == GAME_PHASE_AWAITING_CHECK
 
-    double_positions = np.broadcast_to(check_position, (4, 2)).copy()
-    retry_state = _clearance_setup_state(static, double_positions, seed=614)
-    first_retry = step_batch_minimal(
+    pickup_out = step_batch_minimal(
         static,
-        retry_state,
+        setup_out.state,
         actions,
-        jax.random.split(jax.random.PRNGKey(615), 1),
+        jax.random.split(jax.random.PRNGKey(614), 1),
         jax,
         jnp,
     )
-    second_retry = step_batch_minimal(
-        static,
-        first_retry.state,
-        actions,
-        jax.random.split(jax.random.PRNGKey(616), 1),
-        jax,
-        jnp,
-    )
-    resolved = step_batch_minimal(
-        static,
-        second_retry.state,
-        actions,
-        jax.random.split(jax.random.PRNGKey(617), 1),
-        jax,
-        jnp,
-    )
-    assert int(np.asarray(first_retry.check_space_double_violation)[0]) == 1
-    assert int(np.asarray(first_retry.state.check_double_violation_count)[0]) == 1
-    assert int(np.asarray(second_retry.state.check_double_violation_count)[0]) == 2
-    assert int(np.asarray(resolved.check_space_double_violation)[0]) == 1
-    assert int(np.asarray(resolved.check_space_random_resolution)[0]) == 1
-    assert int(np.asarray(resolved.state.check_double_violation_count)[0]) == 0
-    assert float(
-        np.asarray(resolved.team_a_score_delta)[0]
-        + np.asarray(resolved.team_b_score_delta)[0]
-    ) == pytest.approx(1.0)
+    assert int(np.asarray(pickup_out.check_pickup)[0]) == 1
+    assert int(np.asarray(pickup_out.check_violation)[0]) == 0
 
 
-def test_check_clearance_masks_zone_entry_and_forces_setup_egress():
+def test_check_clearance_forces_only_defensive_setup_egress():
     static = _multi_possession_static(
         players=2,
         court_rows=9,
@@ -682,6 +659,7 @@ def test_check_clearance_masks_zone_entry_and_forces_setup_egress():
     outside = cells[_hex_distance_np(cells, check_position) > 1]
     used = {
         tuple(check_position.tolist()),
+        tuple((check_position + exit_direction).tolist()),
         tuple((check_position + (2 * exit_direction)).tolist()),
         tuple((check_position + (2 * entry_direction)).tolist()),
     }
@@ -691,9 +669,9 @@ def test_check_clearance_masks_zone_entry_and_forces_setup_egress():
     positions = np.vstack(
         [
             check_position,
-            check_position + (2 * entry_direction),
             remaining_outside[0],
-            remaining_outside[1],
+            check_position + exit_direction,
+            check_position + (2 * entry_direction),
         ]
     )
     state = _clearance_setup_state(static, positions, seed=618)._replace(
@@ -709,21 +687,22 @@ def test_check_clearance_masks_zone_entry_and_forces_setup_egress():
         if np.array_equal(candidate_direction, -entry_direction)
     )
     masks = np.asarray(build_action_masks_batch(static, state, jnp), dtype=np.int8)
-    assert masks[0, 0, ActionType.NOOP.value] == 0
-    assert masks[0, 0, exit_action] == 1
-    assert masks[0, 1, entry_action] == 0
+    assert masks[0, 0, ActionType.NOOP.value] == 1
+    assert masks[0, 2, ActionType.NOOP.value] == 0
+    assert masks[0, 2, exit_action] == 1
+    assert masks[0, 3, entry_action] == 0
 
     first = step_batch_minimal(
         static,
         state,
-        _noops(state).at[0, 0].set(exit_action),
+        _noops(state).at[0, 2].set(exit_action),
         jax.random.split(jax.random.PRNGKey(619), 1),
         jax,
         jnp,
     )
     assert np.array_equal(
-        np.asarray(first.state.positions)[0, 0],
-        check_position + exit_direction,
+        np.asarray(first.state.positions)[0, 2],
+        check_position + (2 * exit_direction),
     )
     assert int(np.asarray(first.check_violation)[0]) == 0
     assert int(np.asarray(first.state.game_phase)[0]) == GAME_PHASE_CHECK_SETUP
@@ -731,13 +710,13 @@ def test_check_clearance_masks_zone_entry_and_forces_setup_egress():
     second = step_batch_minimal(
         static,
         first.state,
-        _noops(first.state).at[0, 0].set(exit_action),
+        _noops(first.state),
         jax.random.split(jax.random.PRNGKey(620), 1),
         jax,
         jnp,
     )
     assert np.array_equal(
-        np.asarray(second.state.positions)[0, 0],
+        np.asarray(second.state.positions)[0, 2],
         check_position + (2 * exit_direction),
     )
     assert int(np.asarray(second.check_violation)[0]) == 0
@@ -756,7 +735,6 @@ def test_check_clearance_blocks_defender_reentry_before_same_step_pickup():
     check_position = cells[int(np.flatnonzero(np.asarray(static.check_candidate_mask))[0])]
     direction = np.asarray(static.hex_directions, dtype=np.int32)[0]
     defender_start = check_position + (2 * direction)
-    defender_destination = check_position + direction
     outside = cells[_hex_distance_np(cells, check_position) > 1]
     positions = np.vstack(
         [

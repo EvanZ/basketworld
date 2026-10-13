@@ -151,8 +151,8 @@ Environment tab's **Defensive Skills (Episode)** table and as its own column in
 the Observation tab.
 
 `inside_check_clearance` is zero outside the check setup and pickup phases.
-It lets a policy distinguish the players that must leave during setup from
-offense players that may enter to collect the ball during pickup.
+It lets a policy distinguish defenders that must leave during setup from
+offense players that may position freely before collecting the ball.
 
 ### Global features
 
@@ -179,7 +179,9 @@ The positive check-clearance schema then appends `check_ball_q_norm`,
 `check_double_violation_count_norm`, and
 `check_timer_remaining_fixed_norm`. All five are zero outside setup and
 pickup. The timer is divided by the fixed scale of 120 so its absolute value
-remains distinguishable across timer configurations.
+remains distinguishable across timer configurations. The double-violation
+slot is retained as zero-valued schema-v5 compatibility padding: clearance is
+now defense-only and has no retry or random-resolution mechanic.
 
 ### Observer-role flag
 
