@@ -45,6 +45,9 @@ from basketworld_jax.train.main import (
     _checkpoint_interval_for_update,
     _checkpoint_observation_metadata,
     _checkpoint_trainer_config_from_args,
+    _check_clearance_activates_on_update,
+    _check_clearance_for_update,
+    _check_clearance_warmup_enabled,
     _entropy_coef_for_update,
     _filter_mlflow_deploy_metrics,
     _historical_eval_updates,
@@ -169,6 +172,44 @@ def test_multi_possession_limit_remains_fixed_without_enabled_curriculum():
     assert _multi_possession_curriculum_enabled(args) is False
     assert _multi_possession_limit_for_update(args, 1) == 7
     assert _multi_possession_limit_for_update(args, 10_000) == 7
+
+
+def test_check_clearance_warmup_activates_after_the_configured_boundary():
+    args = parse_args(
+        [
+            "--enable-multi-possession",
+            "--check-clearance",
+            "1",
+            "--check-setup-steps",
+            "5",
+            "--check-clearance-warmup-updates",
+            "3",
+        ]
+    )
+    validate_train_args(args)
+
+    assert _check_clearance_warmup_enabled(args) is True
+    assert [_check_clearance_for_update(args, update) for update in range(1, 5)] == [
+        0,
+        0,
+        0,
+        1,
+    ]
+    assert not _check_clearance_activates_on_update(args, 3)
+    assert _check_clearance_activates_on_update(args, 4)
+    assert _jax_env_config_from_args(args)["check_clearance"] == 1
+
+
+def test_check_clearance_warmup_validation_and_zero_radius_noop():
+    invalid = parse_args(
+        ["--enable-multi-possession", "--check-clearance-warmup-updates", "-1"]
+    )
+    with pytest.raises(SystemExit, match="check-clearance-warmup-updates"):
+        validate_train_args(invalid)
+
+    args = parse_args(["--enable-multi-possession", "--check-clearance", "0"])
+    assert _check_clearance_warmup_enabled(args) is False
+    assert _check_clearance_for_update(args, 999) == 0
 
 
 def test_shot_contest_skill_cli_values_reach_jax_environment_config():

@@ -40,9 +40,46 @@ def test_short_run_filters_default_historical_milestones(tmp_path):
         assert preview.argv[index + 1] == "0.0"
 
 
-def test_explicit_historical_milestone_after_target_is_rejected():
-    with pytest.raises(ValidationError, match="cannot exceed num_updates"):
-        TrainingRunConfig(num_updates=500, historical_eval_updates=[100, 1000])
+def test_shortened_run_saves_full_schedule_but_only_executes_in_range(tmp_path):
+    schedule = [100, 250, 500, 1000, 2500, 5000, 10000, 30000]
+    config = TrainingRunConfig(num_updates=500, historical_eval_updates=schedule)
+
+    def command_schedule(run_config):
+        preview = build_halfcourt_multi_possession_preview(
+            config=run_config,
+            run_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            repo_root=tmp_path,
+            data_dir=tmp_path / "data",
+        )
+        index = preview.argv.index("--historical-eval-updates")
+        return preview.argv[index + 1]
+
+    assert command_schedule(config) == "100,250,500"
+    saved = TrainingRunConfig.model_validate_json(config.model_dump_json())
+    assert saved.historical_eval_updates == schedule
+    extended = saved.model_copy(update={"num_updates": 30000})
+    assert command_schedule(extended) == ",".join(map(str, schedule))
+    assert config.historical_eval_updates == schedule
+
+
+@pytest.mark.parametrize("schedule", [[], [1000, 2500]])
+def test_no_in_range_explicit_milestones_does_not_fall_back_to_defaults(tmp_path, schedule):
+    config = TrainingRunConfig(num_updates=500, historical_eval_updates=schedule)
+    preview = build_halfcourt_multi_possession_preview(
+        config=config,
+        run_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        repo_root=tmp_path,
+        data_dir=tmp_path / "data",
+    )
+    index = preview.argv.index("--historical-eval-updates")
+    assert preview.argv[index + 1] == ""
+    assert config.historical_eval_updates == schedule
+
+
+@pytest.mark.parametrize("milestone", [0, -1])
+def test_nonpositive_historical_milestone_is_rejected(milestone):
+    with pytest.raises(ValidationError, match="must be positive"):
+        TrainingRunConfig(historical_eval_updates=[milestone])
 
 
 def test_historical_eval_episode_count_must_be_even():
@@ -124,6 +161,7 @@ def test_preview_carries_check_clearance_controls_and_validates_check_mode(tmp_p
         check_deadline_steps=7,
         check_setup_steps=5,
         check_clearance=2,
+        check_clearance_warmup_updates=123,
         random_check_location=False,
     )
     preview = build_halfcourt_multi_possession_preview(
@@ -136,6 +174,7 @@ def test_preview_carries_check_clearance_controls_and_validates_check_mode(tmp_p
         "--check-deadline-steps": "7",
         "--check-setup-steps": "5",
         "--check-clearance": "2",
+        "--check-clearance-warmup-updates": "123",
     }
     for option, value in expected.items():
         index = preview.argv.index(option)

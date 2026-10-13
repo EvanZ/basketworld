@@ -244,6 +244,10 @@ the historical implementation decisions above.
   one deterministic eligible anchor nearest the legacy check location while
   retaining the clearance rule and observations; random locations are an
   explicit future-experiment opt-in.
+- `check_clearance_warmup_updates` defaults to 500 for new runs. It keeps the
+  clearance observation schema from update one while using a zero-radius check
+  through the warmup. On the first protected-disk update, training batches
+  reset once so no legacy-location check carries into the new rule.
 - The intended default for new configurations is **five setup seconds,
   followed by a separate five-second pickup deadline**. One simulation step
   represents one countdown second. Currently setup defaults to zero and
@@ -388,7 +392,8 @@ the historical implementation decisions above.
   addition to the separate interactive dev app.
 - Provide labeled trainer controls for `check_clearance` (hex rings),
   `check_setup_steps` (default five seconds for new configurations), and
-  `check_deadline_steps` (default five seconds). Every additional training
+  `check_deadline_steps` (default five seconds), plus
+  `check_clearance_warmup_updates` (default 500). Every additional training
   configuration option introduced for #62 must also be available in the
   trainer app, rather than requiring manual CLI arguments or raw overrides.
 - Explain the effective rules beside the controls: nonzero clearance uses a

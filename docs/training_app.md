@@ -46,6 +46,12 @@ by default. **Randomize check location** is an opt-in that samples each check
 uniformly from safe outside-arc pickup tiles; either setting retains the same
 clearance mechanics and policy observation schema.
 
+**Check-clearance warmup updates** defaults to 500 for new runs. During those
+updates, the policy sees the clearance-context fields but plays the zero-radius
+check rule, allowing it to learn collection first. On the next update the
+configured clearance activates and every training environment resets once;
+evaluation always uses the configured final clearance rule.
+
 ## v0 lifecycle
 
 - **Checkpoint** writes a request file that the JAX trainer consumes after its current PPO update.

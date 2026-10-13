@@ -1270,6 +1270,15 @@ def build_train_parser():
         ),
     )
     parser.add_argument(
+        "--check-clearance-warmup-updates",
+        type=int,
+        default=500,
+        help=(
+            "PPO updates that use a zero-radius check before the configured "
+            "check-clearance rule activates."
+        ),
+    )
+    parser.add_argument(
         "--random-check-location",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1881,6 +1890,8 @@ def validate_train_args(args) -> None:
             raise SystemExit("--check-setup-steps must be >= 0.")
         if int(getattr(args, "check_clearance", 0)) < 0:
             raise SystemExit("--check-clearance must be >= 0.")
+        if int(getattr(args, "check_clearance_warmup_updates", 0)) < 0:
+            raise SystemExit("--check-clearance-warmup-updates must be >= 0.")
         if (
             int(getattr(args, "check_clearance", 0)) > 0
             and int(getattr(args, "check_setup_steps", 0)) < 1
@@ -2204,6 +2215,39 @@ def _multi_possession_curriculum_enabled(args) -> bool:
         bool(getattr(args, "enable_multi_possession", False))
         and _multi_possession_start_limit(args) != _multi_possession_final_limit(args)
         and int(getattr(args, "multi_possession_limit_ramp_updates", 0)) > 0
+    )
+
+
+def _check_clearance_warmup_enabled(args) -> bool:
+    return (
+        bool(getattr(args, "enable_multi_possession", False))
+        and int(getattr(args, "check_clearance", 0)) > 0
+        and int(getattr(args, "check_clearance_warmup_updates", 0)) > 0
+    )
+
+
+def _check_clearance_for_update(args, update_index: int) -> int:
+    """Return the clearance radius active for one PPO update.
+
+    The full check-clearance observation schema is selected from the configured
+    final radius before training begins. During the warmup the runtime radius is
+    zero, so those features remain present but describe the unconstrained check.
+    """
+    configured = max(0, int(getattr(args, "check_clearance", 0)))
+    if configured == 0:
+        return 0
+    warmup_updates = max(
+        0,
+        int(getattr(args, "check_clearance_warmup_updates", 0)),
+    )
+    return 0 if int(update_index) <= warmup_updates else configured
+
+
+def _check_clearance_activates_on_update(args, update_index: int) -> bool:
+    return (
+        _check_clearance_warmup_enabled(args)
+        and int(update_index)
+        == int(getattr(args, "check_clearance_warmup_updates", 0)) + 1
     )
 
 
@@ -5387,6 +5431,7 @@ def _static_with_training_schedules(
     *,
     phi_beta: float,
     possession_limit: int,
+    check_clearance: int,
     jnp,
 ):
     return static._replace(
@@ -5394,6 +5439,10 @@ def _static_with_training_schedules(
         multi_possession_limit=jnp.asarray(
             int(possession_limit),
             dtype=static.multi_possession_limit.dtype,
+        ),
+        check_clearance=jnp.asarray(
+            int(check_clearance),
+            dtype=static.check_clearance.dtype,
         ),
     )
 
@@ -6475,6 +6524,7 @@ def run_training_loop(args) -> dict[str, Any]:
     jax, jnp = ensure_jax_available("basketworld_jax/train/main.py")
     final_possession_limit = _multi_possession_final_limit(args)
     initial_possession_limit = _multi_possession_limit_for_update(args, 1)
+    initial_check_clearance = _check_clearance_for_update(args, 1)
     role_args = {role: _args_for_training_role(args, role) for role in TRAINING_ROLES}
     for role in TRAINING_ROLES:
         role_args[role].multi_possession_limit = final_possession_limit
@@ -6486,7 +6536,11 @@ def run_training_loop(args) -> dict[str, Any]:
             multi_possession_limit=jnp.asarray(
                 initial_possession_limit,
                 dtype=statics[role].multi_possession_limit.dtype,
-            )
+            ),
+            check_clearance=jnp.asarray(
+                initial_check_clearance,
+                dtype=statics[role].check_clearance.dtype,
+            ),
         )
         for role in TRAINING_ROLES
     }
@@ -7098,11 +7152,13 @@ def run_training_loop(args) -> dict[str, Any]:
                 args,
                 update_idx,
             )
+            active_check_clearance = _check_clearance_for_update(args, update_idx)
             active_statics = {
                 role: _static_with_training_schedules(
                     statics[role],
                     phi_beta=phi_beta,
                     possession_limit=active_possession_limit,
+                    check_clearance=active_check_clearance,
                     jnp=jnp,
                 )
                 for role in TRAINING_ROLES
@@ -7113,6 +7169,29 @@ def run_training_loop(args) -> dict[str, Any]:
                 role: _static_with_phi_beta(statics[role], phi_beta, jnp)
                 for role in TRAINING_ROLES
             }
+            if _check_clearance_activates_on_update(args, update_idx):
+                # A state can span PPO updates. Restart the batch at the
+                # curriculum handoff so a check placed at the warmup's legacy
+                # location never begins enforcing a protected disk mid-game.
+                update_key, reset_root_key = jax.random.split(update_key)
+                reset_keys = jax.random.split(
+                    reset_root_key,
+                    len(TRAINING_ROLES),
+                )
+                current_states = {
+                    role: reset_batch_minimal(
+                        active_statics[role],
+                        jax.random.split(reset_key, int(args.kernel_batch_size)),
+                        jax,
+                        jnp,
+                    )
+                    for role, reset_key in zip(
+                        TRAINING_ROLES,
+                        reset_keys,
+                        strict=True,
+                    )
+                }
+                block_until_ready_tree(current_states)
             selector_alpha, selector_eps = _selector_schedules_for_update(
                 args, update_idx
             )
@@ -7757,6 +7836,14 @@ def run_training_loop(args) -> dict[str, Any]:
             last_metrics["multi_possession_limit_active"] = int(active_possession_limit)
             last_metrics["multi_possession_limit_curriculum_enabled"] = float(
                 _multi_possession_curriculum_enabled(args)
+            )
+            last_metrics["check_clearance_active"] = int(active_check_clearance)
+            last_metrics["check_clearance_warmup_updates"] = int(
+                getattr(args, "check_clearance_warmup_updates", 0)
+            )
+            last_metrics["check_clearance_warmup_active"] = float(
+                _check_clearance_warmup_enabled(args)
+                and active_check_clearance == 0
             )
             last_metrics["episode_possession_limit_mean"] = float(
                 np.mean(episode_possession_limits)

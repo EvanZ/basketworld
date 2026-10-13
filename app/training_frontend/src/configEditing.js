@@ -8,10 +8,10 @@ export function historicalEvalUpdatesForTarget(updates, previousTarget, nextTarg
   const retained = updates.filter((update) => (
     Number.isInteger(update)
     && update > 0
-    && update <= nextTarget
-    && (!previousWasFinalMilestone || update !== previousTarget)
   ))
 
+  // Keep future milestones in the saved config so copying a shorter run cannot
+  // lose them. The backend filters only the command used for this run.
   if (previousWasFinalMilestone) retained.push(nextTarget)
   return [...new Set(retained)].sort((left, right) => left - right)
 }

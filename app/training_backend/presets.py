@@ -25,7 +25,10 @@ def format_display_command(argv: list[str], environment: dict[str, str]) -> str:
 
 def _historical_updates(config: TrainingRunConfig) -> list[int]:
     if config.historical_eval_updates is not None:
-        return list(config.historical_eval_updates)
+        return [
+            value for value in config.historical_eval_updates
+            if value <= config.num_updates
+        ]
     updates = [
         value for value in DEFAULT_HISTORICAL_UPDATES if value <= config.num_updates
     ]
@@ -75,6 +78,7 @@ def build_halfcourt_multi_possession_preview(
         "check_deadline_steps": config.check_deadline_steps,
         "check_setup_steps": config.check_setup_steps,
         "check_clearance": config.check_clearance,
+        "check_clearance_warmup_updates": config.check_clearance_warmup_updates,
         "random_check_location": config.random_check_location,
         "checkpoint_dir": str(checkpoint_dir),
         "control_file": str(control_file),

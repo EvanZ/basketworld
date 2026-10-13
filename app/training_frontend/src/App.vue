@@ -32,6 +32,7 @@ const defaultConfig = () => ({
   check_deadline_steps: 5,
   check_setup_steps: 5,
   check_clearance: 0,
+  check_clearance_warmup_updates: 500,
   random_check_location: false,
   multi_possession_use_inbounds: true,
   overrides: {},
@@ -39,12 +40,14 @@ const defaultConfig = () => ({
 
 const PIN_STORAGE_KEY = 'basketworld.training.pinned-configs.v1'
 const PIN_MIGRATION_KEY = 'basketworld.training.pinned-configs.migration.v1'
-const PIN_MIGRATION_VERSION = 'shot-contest-skill-v2'
+const PIN_MIGRATION_VERSION = 'check-clearance-curriculum-v3'
 const MIGRATED_PINNED_FIELDS = [
   'entropy_decay_updates',
   'shot_contest_skill_mean',
   'shot_contest_skill_std',
   'shot_contest_skill_effect_weight',
+  'random_check_location',
+  'check_clearance_warmup_updates',
 ]
 const METRIC_STORAGE_KEY = 'basketworld.training.sparkline-metrics.v1'
 const MAX_SELECTED_METRICS = 16
@@ -75,6 +78,7 @@ const DEFAULT_PINNED_FIELDS = [
   'check_deadline_steps',
   'check_setup_steps',
   'check_clearance',
+  'check_clearance_warmup_updates',
   'random_check_location',
   'multi_possession_use_inbounds',
 ]
@@ -94,6 +98,7 @@ const APP_CONFIG_KEYS = {
   check_deadline_steps: 'check_deadline_steps',
   check_setup_steps: 'check_setup_steps',
   check_clearance: 'check_clearance',
+  check_clearance_warmup_updates: 'check_clearance_warmup_updates',
   random_check_location: 'random_check_location',
 }
 
@@ -130,6 +135,7 @@ function loadSelectedMetricNames() {
 const runs = ref([])
 const selected = ref(null)
 const config = ref(defaultConfig())
+const configInputDrafts = ref({})
 const historicalEvalScheduleSource = ref({
   updates: config.value.historical_eval_updates,
   target: config.value.num_updates,
@@ -255,6 +261,7 @@ const applicationConfigValues = computed(() => ({
   check_deadline_steps: config.value.check_deadline_steps,
   check_setup_steps: config.value.check_setup_steps,
   check_clearance: config.value.check_clearance,
+  check_clearance_warmup_updates: config.value.check_clearance_warmup_updates,
   random_check_location: config.value.random_check_location,
 }))
 
@@ -443,8 +450,14 @@ function configHelp(name, fallback = '') {
 }
 
 function checkRuleNote(name) {
+  if (name === 'historical_eval_updates') {
+    return 'Milestones beyond the update limit are saved for future copies and extensions. Only milestones within this run’s limit execute.'
+  }
   if (name === 'check_clearance') {
     return 'A positive radius requires an eligible outside-arc pickup tile. Its protected disk and one extra inbounds ring must fit on the court.'
+  }
+  if (name === 'check_clearance_warmup_updates') {
+    return 'The first updates use the legacy zero-radius check while keeping the clearance observation fields present. All environments reset once when the protected-disk rule activates.'
   }
   if (name === 'random_check_location') {
     return 'When enabled, each nonzero-clearance check samples uniformly from safe locations. When disabled, every check uses one deterministic safe anchor while retaining the same clearance rule.'
@@ -485,6 +498,7 @@ function fieldLabel(field) {
     check_deadline_steps: 'Check pickup seconds',
     check_setup_steps: 'Pre-check setup steps',
     check_clearance: 'Check-clearance rings',
+    check_clearance_warmup_updates: 'Check-clearance warmup updates',
     random_check_location: 'Randomize check location',
     multi_possession_use_inbounds: 'Use inbounds for dead-ball restarts',
   }
@@ -506,6 +520,9 @@ function togglePinned(field) {
 }
 
 function inputValue(field) {
+  if (Object.prototype.hasOwnProperty.call(configInputDrafts.value, field.name)) {
+    return configInputDrafts.value[field.name]
+  }
   const value = configFieldValue(field)
   if (Array.isArray(value)) return value.join(', ')
   return value ?? ''
@@ -535,6 +552,11 @@ function rememberHistoricalEvalSchedule(source) {
 }
 
 function setConfigField(field, rawValue) {
+  // Keep separators and spacing while a list is being typed. Formatting the
+  // parsed array back into the input would erase a newly entered trailing comma.
+  if (field.type === 'list' || field.name === 'historical_eval_updates') {
+    configInputDrafts.value[field.name] = rawValue
+  }
   let value = parseConfigFieldValue(field, rawValue)
   const appConfigKey = APP_CONFIG_KEYS[field.name]
   if (appConfigKey) {
@@ -545,6 +567,7 @@ function setConfigField(field, rawValue) {
       value = items.length ? items.map((item) => Number.parseInt(item, 10)) : null
     }
     if (field.name === 'num_updates') {
+      delete configInputDrafts.value.historical_eval_updates
       const scheduleSource = historicalEvalScheduleSource.value
       config.value = {
         ...config.value,
@@ -567,12 +590,14 @@ function setConfigField(field, rawValue) {
 }
 
 function resetOverride(field) {
+  delete configInputDrafts.value[field.name]
   const next = { ...config.value.overrides }
   delete next[field.name]
   config.value.overrides = next
 }
 
 function cloneRun(run) {
+  configInputDrafts.value = {}
   const source = JSON.parse(JSON.stringify(run.config || {}))
   config.value = {
     ...defaultConfig(),
@@ -591,6 +616,7 @@ async function importFromMlflow() {
   error.value = ''
   try {
     const result = await api.importMlflowRun(config.value.mlflow_tracking_uri, mlflowRunId.value.trim())
+    configInputDrafts.value = {}
     config.value = {
       ...defaultConfig(),
       ...result.config,
