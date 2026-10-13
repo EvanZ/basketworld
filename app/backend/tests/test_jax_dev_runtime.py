@@ -1840,6 +1840,7 @@ def test_jax_dev_runtime_serializes_check_restart_in_full_and_fast_modes():
             "made_basket_restart_mode": "check",
             "check_deadline_steps": 4,
             "check_setup_steps": 2,
+            "random_check_location": False,
         }
     )
     runtime.raw_model.spec = _FakeSpec(multi_possession_features=True)
@@ -1875,6 +1876,7 @@ def test_jax_dev_runtime_serializes_check_restart_in_full_and_fast_modes():
         assert state["check_steps_remaining"] == 3
         assert state["check_deadline_steps"] == 4
         assert state["check_setup_steps"] == 2
+        assert state["random_check_location"] is False
         assert state["check_setup_steps_remaining"] == 0
         assert state["ball_holder"] is None
 

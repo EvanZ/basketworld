@@ -279,6 +279,7 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "check_deadline_steps",
         "check_setup_steps",
         "check_clearance",
+        "random_check_location",
     }
 )
 JAX_ENV_MLFLOW_PARAM_KEYS = (
@@ -417,6 +418,7 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "check_deadline_steps",
     "check_setup_steps",
     "check_clearance",
+    "random_check_location",
 )
 
 
@@ -1263,8 +1265,17 @@ def build_train_parser():
         default=0,
         help=(
             "Hex-ring radius that both teams must clear during check setup. "
-            "Zero preserves the legacy fixed check; positive values randomize "
-            "an eligible pickup location outside the clearance arc."
+            "Zero preserves the legacy fixed check; positive values use an "
+            "eligible pickup location outside the clearance arc."
+        ),
+    )
+    parser.add_argument(
+        "--random-check-location",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Randomize eligible nonzero-clearance check locations. The default "
+            "uses one deterministic safe anchor while retaining clearance."
         ),
     )
     parser.add_argument(
@@ -2241,6 +2252,7 @@ _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
     "check_deadline_steps": 5,
     "check_setup_steps": 0,
     "check_clearance": 0,
+    "random_check_location": False,
     "pressure_skill_mean": 0.0,
     "pressure_skill_std": 0.0,
     "shot_contest_skill_mean": 0.0,

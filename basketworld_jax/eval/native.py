@@ -241,6 +241,7 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "check_deadline_steps",
     "check_setup_steps",
     "check_clearance",
+    "random_check_location",
 }
 
 _JAX_STATIC_ONLY_ENV_DEFAULTS = {
@@ -281,6 +282,7 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "check_deadline_steps": 5,
     "check_setup_steps": 0,
     "check_clearance": 0,
+    "random_check_location": False,
 }
 
 _JAX_STATIC_ONLY_ENV_CASTS = {
@@ -321,6 +323,7 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "check_deadline_steps": "int",
     "check_setup_steps": "int",
     "check_clearance": "int",
+    "random_check_location": "bool",
 }
 
 

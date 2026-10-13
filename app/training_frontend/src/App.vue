@@ -32,6 +32,7 @@ const defaultConfig = () => ({
   check_deadline_steps: 5,
   check_setup_steps: 5,
   check_clearance: 0,
+  random_check_location: false,
   multi_possession_use_inbounds: true,
   overrides: {},
 })
@@ -74,6 +75,7 @@ const DEFAULT_PINNED_FIELDS = [
   'check_deadline_steps',
   'check_setup_steps',
   'check_clearance',
+  'random_check_location',
   'multi_possession_use_inbounds',
 ]
 const APP_CONFIG_KEYS = {
@@ -92,6 +94,7 @@ const APP_CONFIG_KEYS = {
   check_deadline_steps: 'check_deadline_steps',
   check_setup_steps: 'check_setup_steps',
   check_clearance: 'check_clearance',
+  random_check_location: 'random_check_location',
 }
 
 function loadPinnedConfigNames() {
@@ -252,6 +255,7 @@ const applicationConfigValues = computed(() => ({
   check_deadline_steps: config.value.check_deadline_steps,
   check_setup_steps: config.value.check_setup_steps,
   check_clearance: config.value.check_clearance,
+  random_check_location: config.value.random_check_location,
 }))
 
 function formatDate(value) {
@@ -440,7 +444,10 @@ function configHelp(name, fallback = '') {
 
 function checkRuleNote(name) {
   if (name === 'check_clearance') {
-    return 'A positive radius randomizes an eligible outside-arc pickup tile. Its protected disk and one extra inbounds ring must fit on the court.'
+    return 'A positive radius requires an eligible outside-arc pickup tile. Its protected disk and one extra inbounds ring must fit on the court.'
+  }
+  if (name === 'random_check_location') {
+    return 'When enabled, each nonzero-clearance check samples uniformly from safe locations. When disabled, every check uses one deterministic safe anchor while retaining the same clearance rule.'
   }
   if (name === 'check_setup_steps') {
     return 'Both teams must clear the protected disk before pickup starts. The first two double violations repeat setup at the same tile.'
@@ -478,6 +485,7 @@ function fieldLabel(field) {
     check_deadline_steps: 'Check pickup seconds',
     check_setup_steps: 'Pre-check setup steps',
     check_clearance: 'Check-clearance rings',
+    random_check_location: 'Randomize check location',
     multi_possession_use_inbounds: 'Use inbounds for dead-ball restarts',
   }
   return labels[field.name] || field.name.replaceAll('_', ' ')

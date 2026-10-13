@@ -75,6 +75,7 @@ def build_halfcourt_multi_possession_preview(
         "check_deadline_steps": config.check_deadline_steps,
         "check_setup_steps": config.check_setup_steps,
         "check_clearance": config.check_clearance,
+        "random_check_location": config.random_check_location,
         "checkpoint_dir": str(checkpoint_dir),
         "control_file": str(control_file),
         "training_status_file": str(status_file),

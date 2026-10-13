@@ -41,6 +41,11 @@ The combined production-style application is available at <http://localhost:8090
 
 Closing the browser or stopping the frontend does not stop a training worker. The backend launches each worker in a new process session and records its PID plus Linux process-start token to guard against PID reuse.
 
+For a nonzero check-clearance radius, checks use one deterministic safe anchor
+by default. **Randomize check location** is an opt-in that samples each check
+uniformly from safe outside-arc pickup tiles; either setting retains the same
+clearance mechanics and policy observation schema.
+
 ## v0 lifecycle
 
 - **Checkpoint** writes a request file that the JAX trainer consumes after its current PPO update.

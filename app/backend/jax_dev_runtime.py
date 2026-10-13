@@ -107,6 +107,7 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "check_deadline_steps",
     "check_setup_steps",
     "check_clearance",
+    "random_check_location",
 }
 
 
@@ -151,6 +152,7 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "check_deadline_steps": 5,
     "check_setup_steps": 0,
     "check_clearance": 0,
+    "random_check_location": False,
 }
 
 _JAX_STATIC_ONLY_ENV_CASTS = {
@@ -194,6 +196,7 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "check_deadline_steps": "int",
     "check_setup_steps": "int",
     "check_clearance": "int",
+    "random_check_location": "bool",
 }
 
 
@@ -3807,6 +3810,9 @@ class JaxDevRuntime:
                 "check_clearance",
                 0,
             ),
+            "random_check_location": bool(_int_from_static_field(
+                self.static, "random_check_location", 0
+            )),
             "check_double_violation_count": int(
                 np.asarray(host["check_double_violation_count"]).reshape(-1)[0]
             ),
@@ -4188,6 +4194,9 @@ class JaxDevRuntime:
                 "check_clearance",
                 0,
             ),
+            "random_check_location": bool(_int_from_static_field(
+                self.static, "random_check_location", 0
+            )),
             "check_double_violation_count": _as_int(
                 _field0(self.state, "check_double_violation_count")
             ),

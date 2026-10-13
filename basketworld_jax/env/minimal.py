@@ -414,6 +414,8 @@ class KernelStatic(NamedTuple):
     inbound_deadline_steps: Any
     check_position: Any
     check_candidate_mask: Any
+    check_anchor_position: Any
+    random_check_location: Any
     check_clearance: Any
     check_deadline_steps: Any
     check_setup_steps: Any
@@ -1513,6 +1515,18 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
     else:
         # Radius zero retains the legacy fixed check location.
         check_candidate_mask[check_idx] = 1
+    # A deterministic nonzero-clearance check still needs a pickup tile whose
+    # protected disk fits inbounds. Choose the eligible tile closest to the
+    # legacy location, then use axial coordinates as a stable tie-breaker.
+    check_anchor_idx = min(
+        np.flatnonzero(check_candidate_mask).tolist(),
+        key=lambda idx: (
+            int(cell_distance_matrix[check_idx, idx]),
+            int(cells[idx][0]),
+            int(cells[idx][1]),
+        ),
+    )
+    check_anchor_position = np.asarray(cells[check_anchor_idx], dtype=np.int32)
     offensive_lane_mask = np.asarray(
         [1 if cell in getattr(env, "offensive_lane_hexes", set()) else 0 for cell in cells],
         dtype=np.int8,
@@ -1903,6 +1917,11 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
         ),
         check_position=xp.asarray(check_position, dtype=xp.int32),
         check_candidate_mask=xp.asarray(check_candidate_mask, dtype=xp.int8),
+        check_anchor_position=xp.asarray(check_anchor_position, dtype=xp.int32),
+        random_check_location=xp.asarray(
+            bool(getattr(env, "random_check_location", False)),
+            dtype=xp.bool_,
+        ),
         check_clearance=xp.asarray(check_clearance, dtype=xp.int32),
         check_deadline_steps=xp.asarray(
             max(1, int(getattr(env, "check_deadline_steps", 5))),
@@ -4563,16 +4582,21 @@ def _active_check_ball_position_single(static: KernelStatic, state: KernelState,
 
 
 def _sample_check_ball_position_single(static: KernelStatic, selection_key, jax, jnp):
-    """Sample one eligible location for a nonzero-clearance check."""
+    """Choose an eligible location for a nonzero-clearance check."""
     candidate = static.check_candidate_mask.astype(jnp.bool_)
     scores = jax.random.uniform(selection_key, shape=candidate.shape)
     sampled_index = jnp.argmax(
         jnp.where(candidate, scores, -jnp.ones_like(scores))
     )
     sampled = static.cell_coords[sampled_index].astype(jnp.int32)
+    nonzero_clearance_position = jnp.where(
+        static.random_check_location.astype(jnp.bool_),
+        sampled,
+        static.check_anchor_position,
+    )
     return jnp.where(
         static.check_clearance > 0,
-        sampled,
+        nonzero_clearance_position,
         static.check_position,
     ).astype(jnp.int32)
 
@@ -7924,6 +7948,7 @@ def sample_state_batch(args, xp) -> tuple[KernelStatic, KernelState]:
         "check_deadline_steps",
         "check_setup_steps",
         "check_clearance",
+        "random_check_location",
     ):
         if hasattr(args, key):
             setattr(base_env, key, getattr(args, key))

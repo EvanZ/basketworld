@@ -124,6 +124,7 @@ def test_preview_carries_check_clearance_controls_and_validates_check_mode(tmp_p
         check_deadline_steps=7,
         check_setup_steps=5,
         check_clearance=2,
+        random_check_location=False,
     )
     preview = build_halfcourt_multi_possession_preview(
         config=config,
@@ -139,6 +140,7 @@ def test_preview_carries_check_clearance_controls_and_validates_check_mode(tmp_p
     for option, value in expected.items():
         index = preview.argv.index(option)
         assert preview.argv[index + 1] == value
+    assert "--no-random-check-location" in preview.argv
 
     with pytest.raises(ValidationError, match="requires made_basket_restart_mode"):
         TrainingRunConfig(

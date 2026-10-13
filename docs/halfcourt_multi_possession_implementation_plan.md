@@ -240,6 +240,10 @@ the historical implementation decisions above.
   `2` protects the first two rings. The ball tile is also protected.
 - `check_clearance=0` disables the new clearance/random-location rules and
   retains the legacy check mechanic, including its existing ball-cell handling.
+- `random_check_location` defaults to disabled. Nonzero-clearance checks use
+  one deterministic eligible anchor nearest the legacy check location while
+  retaining the clearance rule and observations; random locations are an
+  explicit future-experiment opt-in.
 - The intended default for new configurations is **five setup seconds,
   followed by a separate five-second pickup deadline**. One simulation step
   represents one countdown second. Currently setup defaults to zero and
@@ -387,8 +391,9 @@ the historical implementation decisions above.
   `check_deadline_steps` (default five seconds). Every additional training
   configuration option introduced for #62 must also be available in the
   trainer app, rather than requiring manual CLI arguments or raw overrides.
-- Explain the effective rules beside the controls: nonzero clearance
-  enables random eligible pickup locations, boundary margin is clearance
+- Explain the effective rules beside the controls: nonzero clearance uses a
+  safe eligible pickup location, `random_check_location` selects randomized
+  locations or a deterministic anchor, boundary margin is clearance
   plus one ring, and the third consecutive double violation triggers a
   50/50 assignment of the normal single-team penalty. These agreed rules
   need not become separate toggles simply to appear in the UI.

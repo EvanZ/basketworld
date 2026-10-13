@@ -38,6 +38,7 @@ from basketworld_jax.env.minimal import (
     TURNOVER_REASON_INBOUND_INVALID_PASS,
     TURNOVER_REASON_INBOUND_TIMEOUT,
     TURNOVER_REASON_INTERCEPTED,
+    _sample_check_ball_position_single,
     _select_inbounder_single,
     _select_technical_inbound_position_single,
     _prepare_check_positions_single,
@@ -71,6 +72,7 @@ def _multi_possession_static(
     overtime_round_cap: int = 0,
     check_clearance: int = 0,
     check_setup_steps: int = 0,
+    random_check_location: bool = False,
 ):
     env = HexagonBasketballEnv(
         players=players,
@@ -97,6 +99,7 @@ def _multi_possession_static(
     env.multi_possession_overtime_round_cap = overtime_round_cap
     env.check_clearance = check_clearance
     env.check_setup_steps = check_setup_steps
+    env.random_check_location = random_check_location
     return build_kernel_static_from_env(env, xp=jnp)
 
 
@@ -313,6 +316,10 @@ def test_multi_possession_cli_validates_limit_and_disables_start_templates():
     assert parse_args(["--enable-multi-possession"]).check_deadline_steps == 5
     assert parse_args(["--enable-multi-possession"]).check_setup_steps == 5
     assert parse_args(["--enable-multi-possession"]).check_clearance == 0
+    assert not parse_args(["--enable-multi-possession"]).random_check_location
+    assert parse_args(
+        ["--enable-multi-possession", "--random-check-location"]
+    ).random_check_location
     assert (
         parse_args(["--enable-multi-possession"]).made_basket_restart_mode
         == "baseline_inbound"
@@ -532,6 +539,22 @@ def test_check_clearance_samples_safe_locations_and_exposes_schema_five_features
     assert candidates.size > 0
     for candidate in candidates:
         assert int(np.sum(_hex_distance_np(np.asarray(static.cell_coords), candidate) <= 2)) == 19
+
+    fixed_static = _multi_possession_static(
+        players=2,
+        court_rows=9,
+        court_cols=8,
+        check_clearance=1,
+        check_setup_steps=1,
+        random_check_location=False,
+    )
+    anchor = np.asarray(fixed_static.check_anchor_position)
+    assert any(np.array_equal(anchor, candidate) for candidate in candidates)
+    for seed in range(3):
+        sampled = _sample_check_ball_position_single(
+            fixed_static, jax.random.PRNGKey(seed), jax, jnp
+        )
+        np.testing.assert_array_equal(np.asarray(sampled), anchor)
 
     positions = np.asarray(static.cell_coords, dtype=np.int32)[:4]
     state = _clearance_setup_state(static, positions)

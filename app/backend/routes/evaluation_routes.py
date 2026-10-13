@@ -155,6 +155,7 @@ _EVAL_ENV_OVERRIDE_KEYS = {
     "check_deadline_steps",
     "check_setup_steps",
     "check_clearance",
+    "random_check_location",
 }
 
 
@@ -163,6 +164,7 @@ def _coerce_eval_env_override(key: str, value):
         "enable_multi_possession",
         "multi_possession_aux_rewards_enabled",
         "multi_possession_use_inbounds",
+        "random_check_location",
     }:
         if isinstance(value, bool):
             return value

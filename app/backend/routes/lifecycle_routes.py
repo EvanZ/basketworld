@@ -110,6 +110,7 @@ _JAX_RUNTIME_STATIC_ENV_KEYS = {
     "check_deadline_steps",
     "check_setup_steps",
     "check_clearance",
+    "random_check_location",
 }
 
 
@@ -292,6 +293,7 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "check_deadline_steps": int,
     "check_setup_steps": int,
     "check_clearance": int,
+    "random_check_location": _str_to_bool,
 }
 
 
