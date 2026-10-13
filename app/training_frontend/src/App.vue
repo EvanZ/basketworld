@@ -32,7 +32,6 @@ const defaultConfig = () => ({
   check_deadline_steps: 5,
   check_setup_steps: 5,
   check_clearance: 0,
-  check_clearance_warmup_updates: 500,
   random_check_location: false,
   multi_possession_use_inbounds: true,
   overrides: {},
@@ -47,7 +46,6 @@ const MIGRATED_PINNED_FIELDS = [
   'shot_contest_skill_std',
   'shot_contest_skill_effect_weight',
   'random_check_location',
-  'check_clearance_warmup_updates',
 ]
 const METRIC_STORAGE_KEY = 'basketworld.training.sparkline-metrics.v1'
 const MAX_SELECTED_METRICS = 16
@@ -78,7 +76,6 @@ const DEFAULT_PINNED_FIELDS = [
   'check_deadline_steps',
   'check_setup_steps',
   'check_clearance',
-  'check_clearance_warmup_updates',
   'random_check_location',
   'multi_possession_use_inbounds',
 ]
@@ -98,7 +95,6 @@ const APP_CONFIG_KEYS = {
   check_deadline_steps: 'check_deadline_steps',
   check_setup_steps: 'check_setup_steps',
   check_clearance: 'check_clearance',
-  check_clearance_warmup_updates: 'check_clearance_warmup_updates',
   random_check_location: 'random_check_location',
 }
 
@@ -261,7 +257,6 @@ const applicationConfigValues = computed(() => ({
   check_deadline_steps: config.value.check_deadline_steps,
   check_setup_steps: config.value.check_setup_steps,
   check_clearance: config.value.check_clearance,
-  check_clearance_warmup_updates: config.value.check_clearance_warmup_updates,
   random_check_location: config.value.random_check_location,
 }))
 
@@ -454,19 +449,16 @@ function checkRuleNote(name) {
     return 'Milestones beyond the update limit are saved for future copies and extensions. Only milestones within this run’s limit execute.'
   }
   if (name === 'check_clearance') {
-    return 'A positive radius requires an eligible outside-arc pickup tile. Its protected disk and one extra inbounds ring must fit on the court.'
-  }
-  if (name === 'check_clearance_warmup_updates') {
-    return 'The first updates use the legacy zero-radius check while keeping the clearance observation fields present. All environments reset once when the protected-disk rule activates.'
+    return 'A positive radius requires an eligible outside-arc pickup tile. Its protected disk and one extra inbounds ring must fit on the court. During setup, players outside cannot enter it and players inside must move outward when an unoccupied outward move exists.'
   }
   if (name === 'random_check_location') {
     return 'When enabled, each nonzero-clearance check samples uniformly from safe locations. When disabled, every check uses one deterministic safe anchor while retaining the same clearance rule.'
   }
   if (name === 'check_setup_steps') {
-    return 'Both teams must clear the protected disk before pickup starts. The first two double violations repeat setup at the same tile.'
+    return 'Both teams receive this entire setup period to clear the protected disk before pickup starts. A clearance violation is evaluated only after the final setup movement step; the first two double violations repeat setup at the same tile.'
   }
   if (name === 'check_deadline_steps') {
-    return 'After valid setup, the offense has this many seconds to collect the ball while defenders remain outside the clearance radius.'
+    return 'After valid setup, the offense has this many seconds to collect the ball. Defenders cannot enter the clearance radius until pickup makes play live.'
   }
   return ''
 }
@@ -498,7 +490,6 @@ function fieldLabel(field) {
     check_deadline_steps: 'Check pickup seconds',
     check_setup_steps: 'Pre-check setup steps',
     check_clearance: 'Check-clearance rings',
-    check_clearance_warmup_updates: 'Check-clearance warmup updates',
     random_check_location: 'Randomize check location',
     multi_possession_use_inbounds: 'Use inbounds for dead-ball restarts',
   }

@@ -83,11 +83,15 @@ players. Tokens are ordered by player ID: offense first, then defense.
 | Skill-only rebound observations (`--no-rebound-target-observation-features`) | 16 | 4 | `(P × 16) + 4 + 1` |
 | `--rebound-win-prob-features` | 19 | 8 | `(P × 19) + 8 + 1` |
 | Multi-possession | 25 | 12 | `(P × 25) + 12 + 1` |
+| Multi-possession with positive check clearance | 26 | 17 | `(P × 26) + 17 + 1` |
 
 For 5-on-5, these dimensions are 188 by default, 165 in skill-only mode, and
 199 with the optional rebound probability features. The multi-possession
 schema is 263 by default for 5-on-5. It appends seven player features and five
-global features to the selected rebound-feature schema.
+global features to the selected rebound-feature schema. Positive
+`check_clearance` selects schema version 5, which is 278 by default for 5-on-5
+and adds one player feature plus five global check-context features. It should
+train from scratch; older checkpoint schemas are not silently reinterpreted.
 
 `--rebound-target-observation-features` defaults to enabled; disable it for the
 skill-only ablation. It removes all target-derived policy inputs and the
@@ -139,11 +143,16 @@ the selected rebound features:
 | `ball_handling_skill` | sampled scalar | Offensive resistance to live-ball pressure |
 | `passing_skill` | sampled scalar | Offensive resistance to pass interception |
 | `shot_contest_skill` | sampled scalar | Defensive logit-space adjustment to eligible geometric shot pressure |
+| `inside_check_clearance` | 0 or 1 | **Positive check-clearance schema only.** Player is in the protected disk while setup or pickup is active |
 
 The episode-stable skills remain attached to player identity when teams switch
 offense and defense. `shot_contest_skill` is also shown as **Contest** in the
 Environment tab's **Defensive Skills (Episode)** table and as its own column in
 the Observation tab.
+
+`inside_check_clearance` is zero outside the check setup and pickup phases.
+It lets a policy distinguish the players that must leave during setup from
+offense players that may enter to collect the ball during pickup.
 
 ### Global features
 
@@ -164,6 +173,13 @@ The multi-possession schema then appends `relative_score`,
 `possessions_remaining_norm`, `clearance_required`, `restart_phase`, and
 `restart_countdown_norm`. These begin at index 7 without the optional rebound
 probability feature, or index 8 with it.
+
+The positive check-clearance schema then appends `check_ball_q_norm`,
+`check_ball_r_norm`, `check_clearance_norm`,
+`check_double_violation_count_norm`, and
+`check_timer_remaining_fixed_norm`. All five are zero outside setup and
+pickup. The timer is divided by the fixed scale of 120 so its absolute value
+remains distinguishable across timer configurations.
 
 ### Observer-role flag
 
@@ -227,6 +243,8 @@ observations removes `4N + 3` values, producing `5N² + 15N + 7`. Enabling
 Multi-possession observations additionally append `14N + 5` values: two
 status features per player, five globals, four previously defined latent
 skills per player, and the per-player shot-contest skill.
+Positive check clearance additionally appends `2N + 5` values: one protected-
+disk flag per player and the five check-context globals.
 
 | Order | Feature group | Width |
 |---:|---|---:|
@@ -255,8 +273,9 @@ skills per player, and the per-player shot-contest skill.
 | 23 | **Multi-possession:** relative score, possessions remaining, clearance, restart phase, and restart countdown | 5 |
 | 24 | **Multi-possession:** per-player pressure, steal, ball-handling, and passing skills | `8N` |
 | 25 | **Multi-possession:** per-player shot-contest skill | `2N` |
-| 26 | Observer-role flag | 1 |
-| 27 | Offensive layup, three-point, and dunk deltas from base skill | `3N` |
+| 26 | **Positive check clearance:** per-player protected-disk flag and check-context globals | `2N + 5` |
+| 27 | Observer-role flag | 1 |
+| 28 | Offensive layup, three-point, and dunk deltas from base skill | `3N` |
 
 Unlike player token feature 7, the flat lane-counter group contains the raw
 active counters rather than values divided by the configured maximum.
@@ -271,6 +290,7 @@ application Observation tab reconstruct the schema from the saved policy
 specification.
 
 Multi-possession schema version 4 adds `shot_contest_skill` after the four
-existing latent player skills. Supported schema-version migrations pad the new
-policy input with zeros so older compatible checkpoints preserve their prior
-behavior.
+existing latent player skills. Schema version 5 adds the positive
+check-clearance geometry and context fields. Checkpoint loading preserves the
+saved schema and rejects incompatible policy input dimensions rather than
+silently changing an older policy's observation meaning.

@@ -666,7 +666,85 @@ def test_check_clearance_applies_single_team_penalties_and_breaks_double_violati
     ) == pytest.approx(1.0)
 
 
-def test_check_clearance_defender_reentry_wins_over_same_step_pickup():
+def test_check_clearance_masks_zone_entry_and_forces_setup_egress():
+    static = _multi_possession_static(
+        players=2,
+        court_rows=9,
+        court_cols=8,
+        check_clearance=1,
+        check_setup_steps=2,
+    )
+    cells = np.asarray(static.cell_coords, dtype=np.int32)
+    check_position = cells[int(np.flatnonzero(np.asarray(static.check_candidate_mask))[0])]
+    directions = np.asarray(static.hex_directions, dtype=np.int32)
+    exit_direction = directions[0]
+    entry_direction = directions[1]
+    outside = cells[_hex_distance_np(cells, check_position) > 1]
+    used = {
+        tuple(check_position.tolist()),
+        tuple((check_position + (2 * exit_direction)).tolist()),
+        tuple((check_position + (2 * entry_direction)).tolist()),
+    }
+    remaining_outside = [
+        cell for cell in outside if tuple(cell.tolist()) not in used
+    ]
+    positions = np.vstack(
+        [
+            check_position,
+            check_position + (2 * entry_direction),
+            remaining_outside[0],
+            remaining_outside[1],
+        ]
+    )
+    state = _clearance_setup_state(static, positions, seed=618)._replace(
+        check_setup_steps_remaining=jnp.asarray([2], dtype=jnp.int32),
+    )
+    exit_action = MOVE_ACTION_START
+    entry_action = next(
+        action
+        for action, candidate_direction in enumerate(
+            directions,
+            start=MOVE_ACTION_START,
+        )
+        if np.array_equal(candidate_direction, -entry_direction)
+    )
+    masks = np.asarray(build_action_masks_batch(static, state, jnp), dtype=np.int8)
+    assert masks[0, 0, ActionType.NOOP.value] == 0
+    assert masks[0, 0, exit_action] == 1
+    assert masks[0, 1, entry_action] == 0
+
+    first = step_batch_minimal(
+        static,
+        state,
+        _noops(state).at[0, 0].set(exit_action),
+        jax.random.split(jax.random.PRNGKey(619), 1),
+        jax,
+        jnp,
+    )
+    assert np.array_equal(
+        np.asarray(first.state.positions)[0, 0],
+        check_position + exit_direction,
+    )
+    assert int(np.asarray(first.check_violation)[0]) == 0
+    assert int(np.asarray(first.state.game_phase)[0]) == GAME_PHASE_CHECK_SETUP
+
+    second = step_batch_minimal(
+        static,
+        first.state,
+        _noops(first.state).at[0, 0].set(exit_action),
+        jax.random.split(jax.random.PRNGKey(620), 1),
+        jax,
+        jnp,
+    )
+    assert np.array_equal(
+        np.asarray(second.state.positions)[0, 0],
+        check_position + (2 * exit_direction),
+    )
+    assert int(np.asarray(second.check_violation)[0]) == 0
+    assert int(np.asarray(second.state.game_phase)[0]) == GAME_PHASE_AWAITING_CHECK
+
+
+def test_check_clearance_blocks_defender_reentry_before_same_step_pickup():
     static = _multi_possession_static(
         players=2,
         court_rows=9,
@@ -703,6 +781,8 @@ def test_check_clearance_defender_reentry_wins_over_same_step_pickup():
     )
     actions = jnp.full((1, 4), ActionType.NOOP.value, dtype=jnp.int32)
     actions = actions.at[0, 2].set(defender_move)
+    masks = np.asarray(build_action_masks_batch(static, state, jnp), dtype=np.int8)
+    assert masks[0, 2, defender_move] == 0
     out = step_batch_minimal(
         static,
         state,
@@ -711,12 +791,12 @@ def test_check_clearance_defender_reentry_wins_over_same_step_pickup():
         jax,
         jnp,
     )
-    assert int(np.asarray(out.check_pickup)[0]) == 0
-    assert int(np.asarray(out.check_space_defense_violation)[0]) == 1
+    assert int(np.asarray(out.check_pickup)[0]) == 1
+    assert int(np.asarray(out.check_space_defense_violation)[0]) == 0
     assert int(np.asarray(out.possession_ended)[0]) == 0
     assert np.array_equal(
         np.asarray(out.state.positions)[0, 2],
-        defender_destination,
+        defender_start,
     )
 
 

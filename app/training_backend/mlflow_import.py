@@ -87,7 +87,6 @@ def config_from_mlflow_values(
         "check_deadline_steps": "check_deadline_steps",
         "check_setup_steps": "check_setup_steps",
         "check_clearance": "check_clearance",
-        "check_clearance_warmup_updates": "check_clearance_warmup_updates",
         "random_check_location": "random_check_location",
         "multi_possession_use_inbounds": "multi_possession_use_inbounds",
     }

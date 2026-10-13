@@ -1255,8 +1255,9 @@ def build_train_parser():
         default=5,
         help=(
             "Movement-only setup steps before the receiving team's check pickup "
-            "clock begins. New configurations default to five seconds; zero "
-            "preserves the immediate-check behavior."
+            "clock begins. A positive clearance radius gives both teams this "
+            "entire period to leave its protected disk. New configurations "
+            "default to five seconds; zero preserves the immediate-check behavior."
         ),
     )
     parser.add_argument(
@@ -1264,18 +1265,10 @@ def build_train_parser():
         type=int,
         default=0,
         help=(
-            "Hex-ring radius that both teams must clear during check setup. "
-            "Zero preserves the legacy fixed check; positive values use an "
-            "eligible pickup location outside the clearance arc."
-        ),
-    )
-    parser.add_argument(
-        "--check-clearance-warmup-updates",
-        type=int,
-        default=500,
-        help=(
-            "PPO updates that use a zero-radius check before the configured "
-            "check-clearance rule activates."
+            "Hex-ring radius closed to both teams during check setup and to "
+            "defenders during pickup. Zero preserves the legacy fixed check; "
+            "positive values use an eligible pickup location outside the "
+            "clearance arc."
         ),
     )
     parser.add_argument(
@@ -1890,8 +1883,6 @@ def validate_train_args(args) -> None:
             raise SystemExit("--check-setup-steps must be >= 0.")
         if int(getattr(args, "check_clearance", 0)) < 0:
             raise SystemExit("--check-clearance must be >= 0.")
-        if int(getattr(args, "check_clearance_warmup_updates", 0)) < 0:
-            raise SystemExit("--check-clearance-warmup-updates must be >= 0.")
         if (
             int(getattr(args, "check_clearance", 0)) > 0
             and int(getattr(args, "check_setup_steps", 0)) < 1
@@ -2218,37 +2209,15 @@ def _multi_possession_curriculum_enabled(args) -> bool:
     )
 
 
-def _check_clearance_warmup_enabled(args) -> bool:
-    return (
-        bool(getattr(args, "enable_multi_possession", False))
-        and int(getattr(args, "check_clearance", 0)) > 0
-        and int(getattr(args, "check_clearance_warmup_updates", 0)) > 0
-    )
-
-
 def _check_clearance_for_update(args, update_index: int) -> int:
-    """Return the clearance radius active for one PPO update.
+    """Return the shared check-clearance rule for a policy matchup.
 
-    The full check-clearance observation schema is selected from the configured
-    final radius before training begins. During the warmup the runtime radius is
-    zero, so those features remain present but describe the unconstrained check.
+    Clearance is active from the first update. ``update_index`` remains in the
+    signature because evaluation resolves every shared game rule through one
+    checkpoint-update context.
     """
-    configured = max(0, int(getattr(args, "check_clearance", 0)))
-    if configured == 0:
-        return 0
-    warmup_updates = max(
-        0,
-        int(getattr(args, "check_clearance_warmup_updates", 0)),
-    )
-    return 0 if int(update_index) <= warmup_updates else configured
-
-
-def _check_clearance_activates_on_update(args, update_index: int) -> bool:
-    return (
-        _check_clearance_warmup_enabled(args)
-        and int(update_index)
-        == int(getattr(args, "check_clearance_warmup_updates", 0)) + 1
-    )
+    del update_index
+    return max(0, int(getattr(args, "check_clearance", 0)))
 
 
 def _jax_env_config_from_args(args) -> dict[str, Any]:
@@ -3900,11 +3869,8 @@ def _log_mlflow_params(
             getattr(args, "multi_possession_overtime_round_cap", 0)
         ),
         "jax/check_clearance": int(getattr(args, "check_clearance", 0)),
-        "jax/check_clearance_warmup_updates": int(
-            getattr(args, "check_clearance_warmup_updates", 0)
-        ),
         "jax/check_setup_steps": int(getattr(args, "check_setup_steps", 0)),
-        "jax/check_pickup_steps": int(getattr(args, "check_pickup_steps", 5)),
+        "jax/check_deadline_steps": int(getattr(args, "check_deadline_steps", 5)),
         "jax/random_check_location": bool(
             getattr(args, "random_check_location", False)
         ),
@@ -4147,7 +4113,6 @@ _CORE_TRAIN_METRICS = frozenset(
         "task_reward_scale",
         "multi_possession_limit_active",
         "check_clearance_active",
-        "check_clearance_warmup_active",
         "episode_possession_limit_mean",
         "episode_overtime_round_cap_mean",
         "opponent_update_index",
@@ -7238,29 +7203,6 @@ def run_training_loop(args) -> dict[str, Any]:
             # uses this update's active game rules. Policy matchups select a
             # shared older-checkpoint context at evaluation time below.
             deployment_eval_statics = active_statics
-            if _check_clearance_activates_on_update(args, update_idx):
-                # A state can span PPO updates. Restart the batch at the
-                # curriculum handoff so a check placed at the warmup's legacy
-                # location never begins enforcing a protected disk mid-game.
-                update_key, reset_root_key = jax.random.split(update_key)
-                reset_keys = jax.random.split(
-                    reset_root_key,
-                    len(TRAINING_ROLES),
-                )
-                current_states = {
-                    role: reset_batch_minimal(
-                        active_statics[role],
-                        jax.random.split(reset_key, int(args.kernel_batch_size)),
-                        jax,
-                        jnp,
-                    )
-                    for role, reset_key in zip(
-                        TRAINING_ROLES,
-                        reset_keys,
-                        strict=True,
-                    )
-                }
-                block_until_ready_tree(current_states)
             selector_alpha, selector_eps = _selector_schedules_for_update(
                 args, update_idx
             )
@@ -7908,13 +7850,6 @@ def run_training_loop(args) -> dict[str, Any]:
                 _multi_possession_curriculum_enabled(args)
             )
             last_metrics["check_clearance_active"] = int(active_check_clearance)
-            last_metrics["check_clearance_warmup_updates"] = int(
-                getattr(args, "check_clearance_warmup_updates", 0)
-            )
-            last_metrics["check_clearance_warmup_active"] = float(
-                _check_clearance_warmup_enabled(args)
-                and active_check_clearance == 0
-            )
             last_metrics["selector_active"] = float(selector_active)
             last_metrics["episode_possession_limit_mean"] = float(
                 np.mean(episode_possession_limits)

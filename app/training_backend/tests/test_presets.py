@@ -161,7 +161,6 @@ def test_preview_carries_check_clearance_controls_and_validates_check_mode(tmp_p
         check_deadline_steps=7,
         check_setup_steps=5,
         check_clearance=2,
-        check_clearance_warmup_updates=123,
         random_check_location=False,
     )
     preview = build_halfcourt_multi_possession_preview(
@@ -174,7 +173,6 @@ def test_preview_carries_check_clearance_controls_and_validates_check_mode(tmp_p
         "--check-deadline-steps": "7",
         "--check-setup-steps": "5",
         "--check-clearance": "2",
-        "--check-clearance-warmup-updates": "123",
     }
     for option, value in expected.items():
         index = preview.argv.index(option)

@@ -54,6 +54,18 @@ The first component applies on the attempt; the second applies only on a make.
 A defensive lane violation adds `violation_reward` to the offense perspective,
 increments the offense score by one, and terminates the episode.
 
+### Check-clearance violation
+
+At the final setup boundary, any offense-only protected-disk violation awards
+the defense one point and ends that offense's possession. A defense-only
+violation awards the offense one point and restarts the same possession with a
+defensive technical restart. If both teams remain inside, the first two
+consecutive double violations award no points and repeat setup at the same
+location. The third uses the environment RNG to assign one of the two normal
+single-team penalties with equal probability, so only one team receives a
+point. A player that has no unoccupied outward setup move may remain in place
+until this final boundary.
+
 ## Rebound reward redistribution
 
 When enabled, an offensive rebound can pay

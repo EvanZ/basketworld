@@ -2325,8 +2325,15 @@ def build_action_masks_batch(static: KernelStatic, state: KernelState, jnp):
         move_masks,
     )
 
-    # During setup nobody may enter the loose-ball cell. Once the pickup clock
-    # begins, that cell is reserved for the receiving team.
+    # During setup, a positive clearance radius closes the whole protected
+    # disk to both teams. Players inherited inside the disk must take an
+    # unoccupied move that increases their distance from the ball whenever one
+    # is available; this prevents a learnable "stand in the violation zone"
+    # pattern while allowing a player on the ball cell to leave one ring at a
+    # time. The final setup
+    # boundary still owns violation resolution if a player remains trapped in
+    # the disk.  During pickup, the disk remains closed only to the defense.
+    # Radius zero preserves the legacy loose-ball-cell restriction.
     player_ids = jnp.arange(n_players, dtype=jnp.int32)
     stable_team_a = jnp.any(
         player_ids[:, None] == static.offense_ids[None, :],
@@ -2341,19 +2348,72 @@ def build_action_masks_batch(static: KernelStatic, state: KernelState, jnp):
         neighbor_positions == state.check_ball_position[:, None, None, :],
         axis=-1,
     )
-    setup_forbidden = (
-        (state.game_phase[:, None, None] == GAME_PHASE_CHECK_SETUP)
-        & targets_check
+    clearance_enabled = static.check_clearance.astype(jnp.bool_)
+    target_clearance_distance = _hex_distance(
+        neighbor_positions,
+        state.check_ball_position[:, None, None, :],
+        jnp,
     )
-    check_forbidden = (
-        (
-            (state.game_phase[:, None, None] == GAME_PHASE_AWAITING_CHECK)
-            & active_defender[:, :, None]
-            & targets_check
+    current_clearance_distance = _hex_distance(
+        state.positions,
+        state.check_ball_position[:, None, :],
+        jnp,
+    )
+    targets_clearance = (
+        target_clearance_distance <= static.check_clearance.astype(jnp.int32)
+    )
+    currently_inside_clearance = (
+        current_clearance_distance <= static.check_clearance.astype(jnp.int32)
+    )
+    setup_phase = state.game_phase[:, None, None] == GAME_PHASE_CHECK_SETUP
+    awaiting_check_phase = (
+        state.game_phase[:, None, None] == GAME_PHASE_AWAITING_CHECK
+    )
+    setup_clearance = (
+        (state.game_phase[:, None] == GAME_PHASE_CHECK_SETUP)
+        & clearance_enabled
+    )
+    setup_forbidden = setup_phase & jnp.where(
+        clearance_enabled,
+        (~currently_inside_clearance[:, :, None]) & targets_clearance,
+        targets_check,
+    )
+    pickup_defense_forbidden = (
+        awaiting_check_phase
+        & active_defender[:, :, None]
+        & jnp.where(clearance_enabled, targets_clearance, targets_check)
+    )
+    pre_clearance_move_masks = move_masks
+    move_masks = move_masks * (~(setup_forbidden | pickup_defense_forbidden)).astype(
+        jnp.int8
+    )
+    forced_egress_candidates = (
+        pre_clearance_move_masks
+        * (
+            target_clearance_distance
+            > current_clearance_distance[:, :, None]
+        ).astype(jnp.int8)
+        * (~occupied).astype(jnp.int8)
+    )
+    must_egress = (
+        setup_clearance
+        & currently_inside_clearance
+    )
+    move_masks = jnp.where(
+        must_egress[:, :, None],
+        forced_egress_candidates,
+        move_masks,
+    )
+    forced_egress = must_egress & jnp.any(
+        forced_egress_candidates.astype(jnp.bool_), axis=-1
+    )
+    masks = masks.at[:, :, ActionType.NOOP.value].set(
+        jnp.where(
+            forced_egress,
+            jnp.asarray(0, dtype=jnp.int8),
+            masks[:, :, ActionType.NOOP.value],
         )
-        | setup_forbidden
     )
-    move_masks = move_masks * (~check_forbidden).astype(jnp.int8)
 
     # After releasing an inbound pass, the inbounder remains at the single
     # outside-baseline coordinate until taking a legal adjacent move onto the
@@ -4368,20 +4428,43 @@ def _resolve_movement_single(static: KernelStatic, state: KernelState, actions, 
         ~stable_team_a,
         stable_team_a,
     )
-    protected_check_entry = (
-        (
-            (state.game_phase == GAME_PHASE_CHECK_SETUP)
-            | (
-                (state.game_phase == GAME_PHASE_AWAITING_CHECK)
-                & active_defender
-            )
-        )
-        & jnp.all(
-            proposed
-            == _active_check_ball_position_single(static, state, jnp)[None, :],
-            axis=-1,
+    check_position = _active_check_ball_position_single(static, state, jnp)
+    targets_check = jnp.all(proposed == check_position[None, :], axis=-1)
+    target_clearance_distance = _hex_distance(
+        proposed,
+        check_position[None, :],
+        jnp,
+    )
+    current_clearance_distance = _hex_distance(
+        current_positions,
+        check_position[None, :],
+        jnp,
+    )
+    targets_clearance = (
+        target_clearance_distance <= static.check_clearance.astype(jnp.int32)
+    )
+    currently_inside_clearance = (
+        current_clearance_distance <= static.check_clearance.astype(jnp.int32)
+    )
+    setup_entry_forbidden = (state.game_phase == GAME_PHASE_CHECK_SETUP) & jnp.where(
+        static.check_clearance.astype(jnp.bool_),
+        jnp.where(
+            currently_inside_clearance,
+            target_clearance_distance <= current_clearance_distance,
+            targets_clearance,
+        ),
+        targets_check,
+    )
+    pickup_defense_entry_forbidden = (
+        (state.game_phase == GAME_PHASE_AWAITING_CHECK)
+        & active_defender
+        & jnp.where(
+            static.check_clearance.astype(jnp.bool_),
+            targets_clearance,
+            targets_check,
         )
     )
+    protected_check_entry = setup_entry_forbidden | pickup_defense_entry_forbidden
     valid_move = (
         requested_move
         & proposed_found

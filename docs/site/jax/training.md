@@ -161,3 +161,16 @@ The outer loop can schedule:
 Schedule values are calculated once per update and included in metrics and
 checkpoint metadata. They are Python orchestration values, while the rollout
 and optimizer remain compiled array programs.
+
+## Protected multi-possession checks
+
+For check-based made-basket restarts, new configurations use five
+`check_setup_steps` and a five-step `check_deadline_steps` pickup clock. A
+positive `check_clearance` is a game rule from update one, not a curriculum
+flag. It selects the check-clearance observation schema, so train that policy
+from scratch.
+
+The movement constraints and final-boundary violation mechanics are described
+in [Movement and rules](../physics/movement-rules.md). Evaluation uses the
+shared game rules of the earlier checkpoint when comparing checkpoint pairs;
+policy-internal schedules such as the intent selector remain checkpoint-local.

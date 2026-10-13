@@ -150,7 +150,6 @@ APPLICATION_PRESET_VALUES: dict[str, Any] = {
     "check_deadline_steps": 5,
     "check_setup_steps": 5,
     "check_clearance": 0,
-    "check_clearance_warmup_updates": 500,
     "random_check_location": False,
     "min_shot_clock": 24,
     "mlflow_experiment_name": "halfcourt_multi_possessions",

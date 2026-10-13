@@ -45,9 +45,7 @@ from basketworld_jax.train.main import (
     _checkpoint_interval_for_update,
     _checkpoint_observation_metadata,
     _checkpoint_trainer_config_from_args,
-    _check_clearance_activates_on_update,
     _check_clearance_for_update,
-    _check_clearance_warmup_enabled,
     _entropy_coef_for_update,
     _evaluation_game_rule_context,
     _filter_mlflow_deploy_metrics,
@@ -176,7 +174,7 @@ def test_multi_possession_limit_remains_fixed_without_enabled_curriculum():
     assert _multi_possession_limit_for_update(args, 10_000) == 7
 
 
-def test_check_clearance_warmup_activates_after_the_configured_boundary():
+def test_check_clearance_is_active_from_the_first_update():
     args = parse_args(
         [
             "--enable-multi-possession",
@@ -184,33 +182,21 @@ def test_check_clearance_warmup_activates_after_the_configured_boundary():
             "1",
             "--check-setup-steps",
             "5",
-            "--check-clearance-warmup-updates",
-            "3",
         ]
     )
     validate_train_args(args)
 
-    assert _check_clearance_warmup_enabled(args) is True
     assert [_check_clearance_for_update(args, update) for update in range(1, 5)] == [
-        0,
-        0,
-        0,
+        1,
+        1,
+        1,
         1,
     ]
-    assert not _check_clearance_activates_on_update(args, 3)
-    assert _check_clearance_activates_on_update(args, 4)
     assert _jax_env_config_from_args(args)["check_clearance"] == 1
 
 
-def test_check_clearance_warmup_validation_and_zero_radius_noop():
-    invalid = parse_args(
-        ["--enable-multi-possession", "--check-clearance-warmup-updates", "-1"]
-    )
-    with pytest.raises(SystemExit, match="check-clearance-warmup-updates"):
-        validate_train_args(invalid)
-
+def test_zero_radius_keeps_clearance_disabled_at_every_update():
     args = parse_args(["--enable-multi-possession", "--check-clearance", "0"])
-    assert _check_clearance_warmup_enabled(args) is False
     assert _check_clearance_for_update(args, 999) == 0
 
 
@@ -234,8 +220,6 @@ def test_policy_match_uses_older_shared_game_rules_but_own_selector_schedule():
             "1",
             "--check-setup-steps",
             "5",
-            "--check-clearance-warmup-updates",
-            "3",
             "--intent-selector-enabled",
             "true",
             "--intent-selector-alpha-start",
@@ -257,7 +241,7 @@ def test_policy_match_uses_older_shared_game_rules_but_own_selector_schedule():
     assert context == {
         "rule_update": 3,
         "multi_possession_limit": 3,
-        "check_clearance": 0,
+        "check_clearance": 1,
     }
     assert _selector_active_for_update(args, 8) is True
     assert _selector_active_for_update(args, 3) is False
@@ -2796,6 +2780,8 @@ def test_mlflow_params_include_jax_env_skill_stds():
             "200",
             "--phi-blend-weight",
             "0.5",
+            "--check-deadline-steps",
+            "7",
             "--rebound-win-prob-features",
             "--no-rebound-target-observation-features",
         ]
@@ -2856,6 +2842,8 @@ def test_mlflow_params_include_jax_env_skill_stds():
     assert recorder.params["jax/multi_possession_limit_ramp_updates"] == 0
     assert recorder.params["jax/multi_possession_limit_curriculum_enabled"] is False
     assert recorder.params["jax/multi_possession_overtime_round_cap"] == 0
+    assert recorder.params["jax/check_deadline_steps"] == args.check_deadline_steps
+    assert recorder.params["jax/env/check_deadline_steps"] == args.check_deadline_steps
     assert recorder.params["jax/ent_coef_start"] == 0.02
     assert recorder.params["jax/ent_coef_end"] == 0.003
     assert recorder.params["jax/ent_schedule"] == "exp"

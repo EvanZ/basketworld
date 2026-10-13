@@ -43,7 +43,6 @@ class TrainingRunConfig(BaseModel):
     check_deadline_steps: int = Field(default=5, ge=1, le=120)
     check_setup_steps: int = Field(default=5, ge=0, le=120)
     check_clearance: int = Field(default=0, ge=0, le=12)
-    check_clearance_warmup_updates: int = Field(default=500, ge=0, le=1_000_000)
     random_check_location: bool = False
     multi_possession_use_inbounds: bool = True
     overrides: dict[str, Any] = Field(default_factory=dict)
