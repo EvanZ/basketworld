@@ -519,6 +519,13 @@ function inputValue(field) {
   return value ?? ''
 }
 
+function inputType(field) {
+  // Browsers normalize incomplete number input such as `0.` before Vue can
+  // render it back. Float settings use text input with a decimal keyboard so
+  // the raw draft stays intact until the number is complete.
+  return field.type === 'float' ? 'text' : field.type === 'int' ? 'number' : 'text'
+}
+
 function parseConfigFieldValue(field, rawValue) {
   let value = rawValue
   if (field.type === 'int') value = rawValue === '' ? null : Number.parseInt(rawValue, 10)
@@ -543,9 +550,10 @@ function rememberHistoricalEvalSchedule(source) {
 }
 
 function setConfigField(field, rawValue) {
-  // Keep separators and spacing while a list is being typed. Formatting the
-  // parsed array back into the input would erase a newly entered trailing comma.
-  if (field.type === 'list' || field.name === 'historical_eval_updates') {
+  // Keep raw list and float input while it is being typed. Formatting the
+  // parsed value back into the input would erase list separators or a float's
+  // trailing decimal point.
+  if (field.type === 'list' || field.type === 'float' || field.name === 'historical_eval_updates') {
     configInputDrafts.value[field.name] = rawValue
   }
   let value = parseConfigFieldValue(field, rawValue)
@@ -881,7 +889,7 @@ onBeforeUnmount(() => {
                 <select v-else-if="field.choices" class="config-input" :value="inputValue(field)" :disabled="!fieldIsEditable(field)" @change="setConfigField(field, $event.target.value)">
                   <option v-for="choice in field.choices" :key="choice" :value="choice">{{ choice }}</option>
                 </select>
-                <input v-else class="config-input" :type="['int', 'float'].includes(field.type) ? 'number' : 'text'" :step="field.type === 'float' ? 'any' : undefined" :value="inputValue(field)" :disabled="!fieldIsEditable(field)" @input="setConfigField(field, $event.target.value)" />
+                <input v-else class="config-input" :type="inputType(field)" :inputmode="field.type === 'float' ? 'decimal' : undefined" :value="inputValue(field)" :disabled="!fieldIsEditable(field)" @input="setConfigField(field, $event.target.value)" />
                 <small v-if="checkRuleNote(field.name)" class="field-meta">{{ checkRuleNote(field.name) }}</small>
                 <small class="field-meta">{{ field.name }} · {{ field.type }}<span v-if="!fieldIsEditable(field)"> · {{ field.frozen ? 'frozen' : 'internal' }}</span></small>
               </article>
@@ -914,7 +922,7 @@ onBeforeUnmount(() => {
                 <select v-else-if="field.choices" class="config-input" :value="inputValue(field)" :disabled="!fieldIsEditable(field)" @change="setConfigField(field, $event.target.value)">
                   <option v-for="choice in field.choices" :key="choice" :value="choice">{{ choice }}</option>
                 </select>
-                <input v-else class="config-input" :type="['int', 'float'].includes(field.type) ? 'number' : 'text'" :step="field.type === 'float' ? 'any' : undefined" :value="inputValue(field)" :disabled="!fieldIsEditable(field)" @input="setConfigField(field, $event.target.value)" />
+                <input v-else class="config-input" :type="inputType(field)" :inputmode="field.type === 'float' ? 'decimal' : undefined" :value="inputValue(field)" :disabled="!fieldIsEditable(field)" @input="setConfigField(field, $event.target.value)" />
                 <div class="field-actions">
                   <button type="button" class="pin-button" :class="{ active: isPinned(field) }" :aria-label="`${isPinned(field) ? 'Unpin' : 'Pin'} ${field.name}`" :title="`${isPinned(field) ? 'Unpin' : 'Pin'} ${field.name}`" @click="togglePinned(field)">📌</button>
                   <button v-if="Object.prototype.hasOwnProperty.call(config.overrides, field.name)" type="button" class="reset-button" title="Restore preset default" @click="resetOverride(field)">Reset</button>
