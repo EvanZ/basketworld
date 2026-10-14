@@ -66,3 +66,24 @@ def test_resolve_run_config_schema_reports_effective_values():
 
     assert values["num_updates"] == 321
     assert values["gamma"] == 0.97
+
+
+def test_resolve_run_config_schema_tolerates_retired_launch_arguments():
+    fields = resolve_run_config_schema(
+        (
+            "/repo/.env/bin/python",
+            "-m",
+            "basketworld_jax.train.main",
+            "--check-clearance",
+            "1",
+            "--check-clearance-warmup-updates",
+            "500",
+            "--num-updates",
+            "321",
+        )
+    )
+    values = {field["name"]: field["value"] for field in fields}
+
+    assert values["check_clearance"] == 1
+    assert values["num_updates"] == 321
+    assert "check_clearance_warmup_updates" not in values

@@ -231,15 +231,27 @@ def load_application_config_schema(repo_root_text: str) -> list[dict[str, Any]]:
 
 @lru_cache(maxsize=128)
 def resolve_run_config_schema(command: tuple[str, ...]) -> list[dict[str, Any]]:
-    from basketworld_jax.train.main import build_train_config_schema, parse_args
+    from basketworld_jax.train.main import build_train_config_schema, build_train_parser
 
     try:
         module_index = command.index("basketworld_jax.train.main")
     except ValueError as exc:
         raise ValueError("Run command does not invoke the JAX trainer module.") from exc
     trainer_argv = list(command[module_index + 1 :])
+    # A saved launch command is immutable historical evidence.  The trainer
+    # evolves, so a command can legitimately contain an option that has since
+    # been retired (for example, the former check-clearance warmup flag).
+    # Inspecting that run must not make its detail endpoint unusable.  Parse
+    # recognized arguments and omit retired options from the current schema;
+    # the original command remains visible in the run detail.
+    parser = build_train_parser()
+    args, _retired_argv = parser.parse_known_args(trainer_argv)
+    if bool(getattr(args, "use_set_obs", False)):
+        args.policy_model = "attention"
+    if str(args.policy_model) == "attention":
+        args.use_set_obs = True
     return [
         {**field, "value": field["effective_value"]}
-        for field in build_train_config_schema(parse_args(trainer_argv))
+        for field in build_train_config_schema(args)
         if field["name"] not in JAX_INAPPLICABLE_FIELDS
     ]
