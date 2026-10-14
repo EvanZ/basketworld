@@ -106,7 +106,7 @@ APPLICATION_PRESET_VALUES: dict[str, Any] = {
     "eval_deploy_batches": 2,
     "eval_deploy_every_updates": 250,
     "eval_deploy_horizon": 2048,
-    "eval_every_updates": 0,
+    "eval_every_updates": 250,
     "game_winner_reward": 5.0,
     "gamma": 1.0,
     "historical_eval_horizon": 2048,

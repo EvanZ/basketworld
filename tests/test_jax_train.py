@@ -3492,6 +3492,48 @@ def test_train_loop_checkpoint_resume_round_trip(tmp_path):
     assert len(resumed_result["train_history"]) == 1
 
 
+def test_historical_eval_checkpoint_works_without_regular_eval(tmp_path):
+    pytest.importorskip("jax")
+
+    checkpoint_dir = tmp_path / "historical_ckpts"
+    args = parse_args(
+        [
+            "--run-train-loop",
+            "--enable-multi-possession",
+            "--players",
+            "2",
+            "--kernel-batch-size",
+            "2",
+            "--rollout-horizon",
+            "4",
+            "--num-updates",
+            "1",
+            "--policy-update-epochs",
+            "1",
+            "--log-every-updates",
+            "1",
+            "--eval-every-updates",
+            "0",
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "--historical-eval-updates",
+            "1",
+            "--historical-eval-episodes",
+            "2",
+            "--historical-eval-horizon",
+            "8",
+            "--no-progress",
+        ]
+    )
+    validate_train_args(args)
+
+    result = run_training_loop(args)
+
+    assert result["completed_updates"] == 1
+    assert result["latest_checkpoint_path"] == str(checkpoint_dir / "latest")
+    assert len(result["historical_eval_history"]) == 1
+
+
 def test_train_loop_accepts_frozen_opponent_checkpoint(tmp_path):
     pytest.importorskip("jax")
 

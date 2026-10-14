@@ -44,6 +44,10 @@ def test_application_preset_does_not_depend_on_inapplicable_fields(tmp_path):
     )
 
 
+def test_application_preset_runs_ordinary_eval_every_250_updates(tmp_path):
+    assert application_preset_values(tmp_path)["eval_every_updates"] == 250
+
+
 def test_application_schema_rejects_excluded_sb3_override(tmp_path):
     schema = load_application_config_schema(str(tmp_path))
     with pytest.raises(ValueError, match="Unknown training configuration"):

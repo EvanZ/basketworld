@@ -6922,7 +6922,12 @@ def run_training_loop(args) -> dict[str, Any]:
             eval_initial_states = {
                 role: jax.device_put(
                     _restore_like_template(
-                        restored_eval_initial_state[role], eval_initial_states[role]
+                        # Evaluation state has the same JAX state schema as
+                        # the live training state.  It is intentionally
+                        # created only when an evaluation or checkpoint needs
+                        # it, so use the already-initialized train state as
+                        # the restore template.
+                        restored_eval_initial_state[role], current_states[role]
                     )
                 )
                 for role in TRAINING_ROLES
@@ -8364,6 +8369,38 @@ def run_training_loop(args) -> dict[str, Any]:
                 or force_control_checkpoint
             )
             if should_checkpoint:
+                # Ordinary evaluation creates an initial state using the
+                # active shared game rules above.  Checkpoints also persist an
+                # evaluation state for a future resume, including runs that
+                # disable ordinary evaluation and checkpoint only at a
+                # historical-evaluation milestone.  Build that state here in
+                # the latter case without perturbing the training RNG stream.
+                if should_eval:
+                    checkpoint_eval_initial_states = eval_initial_states
+                else:
+                    checkpoint_eval_key = jax.random.PRNGKey(
+                        int(args.policy_seed) + 1_750_000 + update_idx
+                    )
+                    checkpoint_eval_reset_keys = jax.random.split(
+                        checkpoint_eval_key,
+                        len(TRAINING_ROLES),
+                    )
+                    checkpoint_eval_initial_states = {
+                        role: reset_batch_minimal(
+                            active_statics[role],
+                            jax.random.split(
+                                reset_key,
+                                int(args.kernel_batch_size),
+                            ),
+                            jax,
+                            jnp,
+                        )
+                        for role, reset_key in zip(
+                            TRAINING_ROLES,
+                            checkpoint_eval_reset_keys,
+                            strict=True,
+                        )
+                    }
                 saved_candidate_info = None
                 if opponent_pool_enabled and pinned_opponent_pool_enabled:
                     _add_opponent_candidate(
@@ -8413,7 +8450,7 @@ def run_training_loop(args) -> dict[str, Any]:
                             opt_state=opt_state,
                             selector_opt_state=selector_opt_state,
                             current_state=current_states,
-                            eval_initial_state=eval_initial_states,
+                            eval_initial_state=checkpoint_eval_initial_states,
                             base_key=base_key,
                             eval_trajectories=eval_trajectories,
                             last_metrics=last_metrics,
@@ -8478,7 +8515,7 @@ def run_training_loop(args) -> dict[str, Any]:
                                 opt_state=opt_state,
                                 selector_opt_state=selector_opt_state,
                                 current_state=current_states,
-                                eval_initial_state=eval_initial_states,
+                                eval_initial_state=checkpoint_eval_initial_states,
                                 base_key=base_key,
                                 eval_trajectories=eval_trajectories,
                                 last_metrics=last_metrics,
