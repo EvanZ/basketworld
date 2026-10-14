@@ -401,8 +401,10 @@ def test_historical_match_summary_includes_compact_gameplay_diagnostics():
             "candidate_clearance_events": np.asarray([5]),
             "candidate_clearance_elapsed_steps": np.asarray([11]),
             "check_opportunities": np.asarray([4]),
+            "check_setup_opportunities": np.asarray([4]),
             "check_pickups": np.asarray([3]),
             "check_violations": np.asarray([1]),
+            "check_space_defense_violations": np.asarray([1]),
             "check_pickup_steps": np.asarray([7]),
         },
         team_b_candidate_diagnostics={
@@ -439,6 +441,8 @@ def test_historical_match_summary_includes_compact_gameplay_diagnostics():
     assert summary["check_opportunity_count"] == 4
     assert summary["check_pickup_count"] == 3
     assert summary["check_violation_count"] == 1
+    assert summary["check_space_defense_violation_count"] == 1
+    assert summary["check_space_defense_violation_rate"] == pytest.approx(0.25)
     assert summary["check_pickup_rate"] == pytest.approx(0.75)
     assert summary["check_mean_pickup_steps"] == pytest.approx(7.0 / 3.0)
     assert summary["mean_live_steps_per_completed_possession"] == pytest.approx(2.8)
@@ -1001,8 +1005,10 @@ def test_summarize_deploy_eval_outputs_aggregates_counts_and_rebound_rates():
         defensive_rebounds=3.0,
         rebound_global_contests=2.0,
         check_opportunities=4.0,
+        check_setup_opportunities=4.0,
         check_pickups=3.0,
         check_violations=1.0,
+        check_space_defense_violations=1.0,
         check_pickup_steps=7.0,
     )
     diagnostics = {field: 0.0 for field in ReboundDiagnosticTotals._fields}
@@ -1050,6 +1056,8 @@ def test_summarize_deploy_eval_outputs_aggregates_counts_and_rebound_rates():
     assert summary["check_opportunity_count"] == 4
     assert summary["check_pickup_count"] == 3
     assert summary["check_violation_count"] == 1
+    assert summary["check_space_defense_violation_count"] == 1
+    assert summary["check_space_defense_violation_rate"] == pytest.approx(0.25)
     assert summary["check_pickup_rate"] == pytest.approx(0.75)
     assert summary["check_mean_pickup_steps"] == pytest.approx(7.0 / 3.0)
     assert summary["completed_possession_count"] == 3
@@ -2642,6 +2650,8 @@ def test_core_mlflow_train_metric_filter_drops_redundant_aliases():
         "intent_disc_label_prob_by_intent/0": 0.125,
         "selector_used_count": 500,
         "selector_usage_by_intent/0": 0.2,
+        "check_space_defense_violation_count": 4,
+        "check_space_defense_violation_rate": 0.2,
         "end_to_end_steps_per_sec": 30000.0,
     }
 
@@ -2672,6 +2682,8 @@ def test_core_mlflow_train_metric_filter_drops_redundant_aliases():
     assert "intent_disc_label_prob_by_intent/0" not in filtered
     assert "selector_used_count" not in filtered
     assert "selector_usage_by_intent/0" not in filtered
+    assert filtered["check_space_defense_violation_count"] == 4
+    assert filtered["check_space_defense_violation_rate"] == pytest.approx(0.2)
     assert filtered["end_to_end_steps_per_sec"] == 30000.0
     assert _filter_mlflow_train_metrics(metrics, profile="full") == metrics
 
@@ -2688,6 +2700,8 @@ def test_core_mlflow_deploy_metric_filter_keeps_compact_aggregates():
         "turnover_intercepted_share": 0.25,
         "turnover_defender_pressure_count": 3,
         "turnover_defender_pressure_share": 0.15,
+        "check_space_defense_violation_count": 4,
+        "check_space_defense_violation_rate": 0.2,
     }
 
     filtered = _filter_mlflow_deploy_metrics(metrics)
@@ -2699,6 +2713,8 @@ def test_core_mlflow_deploy_metric_filter_keeps_compact_aggregates():
         "shot_make_rate": 0.5,
         "turnover_intercepted_share": 0.25,
         "turnover_defender_pressure_share": 0.15,
+        "check_space_defense_violation_count": 4,
+        "check_space_defense_violation_rate": 0.2,
     }
     assert _filter_mlflow_deploy_metrics(metrics, profile="full") == metrics
 

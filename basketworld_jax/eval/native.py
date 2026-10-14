@@ -5499,6 +5499,14 @@ def run_native_jax_evaluation(
         "check_space_defense_violation_count": check_space_defense_violation_count,
         "check_space_double_violation_count": check_space_double_violation_count,
         "check_space_random_resolution_count": check_space_random_resolution_count,
+        "check_space_defense_violation_rate": (
+            float(
+                check_space_defense_violation_count
+                / check_setup_opportunity_count
+            )
+            if check_setup_opportunity_count > 0
+            else 0.0
+        ),
         "check_pickup_rate": float(check_diag_final["pickup_rate"]),
         "check_mean_pickup_steps": float(check_diag_final["mean_pickup_steps"]),
         "inbound_started_count": int(

@@ -523,6 +523,8 @@ def test_native_multi_possession_evaluation_pairs_starters_and_separates_cutoffs
     assert "check_opportunity_count" in summary
     assert "check_pickup_count" in summary
     assert "check_violation_count" in summary
+    assert "check_space_defense_violation_count" in summary
+    assert "check_space_defense_violation_rate" in summary
     assert "check_pickup_rate" in summary
     assert "check_mean_pickup_steps" in summary
     assert summary["spatial_live_step_count"] > 0

@@ -4489,6 +4489,10 @@ def summarize_deploy_eval_outputs(
         "check_space_random_resolution_count": int(
             totals["check_space_random_resolutions"]
         ),
+        "check_space_defense_violation_rate": _rate(
+            totals["check_space_defense_violations"],
+            totals["check_setup_opportunities"],
+        ),
         "check_pickup_rate": _rate(
             totals["check_pickups"], totals["check_opportunities"]
         ),
@@ -6007,6 +6011,10 @@ def summarize_training_step(
             ),
             "check_space_random_resolution_count": int(
                 check_space_random_resolutions
+            ),
+            "check_space_defense_violation_rate": float(
+                check_space_defense_violations
+                / max(1.0, check_setup_opportunities)
             ),
             "check_pickup_rate": float(
                 check_pickups / max(1.0, check_opportunities)

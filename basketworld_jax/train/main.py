@@ -4071,6 +4071,8 @@ _CORE_TRAIN_METRICS = frozenset(
         "check_pickup_rate",
         "check_mean_pickup_steps",
         "check_violation_count",
+        "check_space_defense_violation_count",
+        "check_space_defense_violation_rate",
         "clearance_elapsed_steps_mean",
         "offense_learner_points_per_completed_episode",
         "offense_opponent_points_per_completed_episode",
@@ -4236,6 +4238,9 @@ _CORE_DEPLOY_METRICS = frozenset(
         "defensive_rebound_rate",
         "check_pickup_rate",
         "check_mean_pickup_steps",
+        "check_violation_count",
+        "check_space_defense_violation_count",
+        "check_space_defense_violation_rate",
         "mean_live_all_player_pair_distance",
         "mean_live_offense_teammate_pair_distance",
         "mean_live_defense_teammate_pair_distance",
@@ -4569,6 +4574,13 @@ def _summarize_historical_match(
         ),
         "check_pickup_count": _total("check_pickups"),
         "check_violation_count": _total("check_violations"),
+        "check_space_defense_violation_count": _total(
+            "check_space_defense_violations"
+        ),
+        "check_space_defense_violation_rate": _rate(
+            _total("check_space_defense_violations"),
+            _total("check_setup_opportunities"),
+        ),
         "check_pickup_rate": _rate(
             _total("check_pickups"),
             _total("check_opportunities"),
@@ -8180,6 +8192,69 @@ def run_training_loop(args) -> dict[str, Any]:
                                 offensive_three_seconds=eval_trace.offensive_three_seconds,
                                 defensive_lane_violations=eval_trace.defensive_lane_violations,
                             )
+                        )
+                        eval_check_opportunities = float(
+                            np.asarray(
+                                eval_trace.check_opportunities,
+                                dtype=np.float32,
+                            ).sum()
+                        )
+                        eval_check_setup_opportunities = float(
+                            np.asarray(
+                                eval_trace.check_setup_opportunities,
+                                dtype=np.float32,
+                            ).sum()
+                        )
+                        eval_check_pickups = float(
+                            np.asarray(
+                                eval_trace.check_pickups,
+                                dtype=np.float32,
+                            ).sum()
+                        )
+                        eval_check_violations = float(
+                            np.asarray(
+                                eval_trace.check_violations,
+                                dtype=np.float32,
+                            ).sum()
+                        )
+                        eval_check_space_defense_violations = float(
+                            np.asarray(
+                                eval_trace.check_space_defense_violations,
+                                dtype=np.float32,
+                            ).sum()
+                        )
+                        eval_check_pickup_steps = float(
+                            np.asarray(
+                                eval_trace.check_pickup_steps,
+                                dtype=np.float32,
+                            ).sum()
+                        )
+                        eval_metrics.update(
+                            {
+                                "check_opportunity_count": int(
+                                    eval_check_opportunities
+                                ),
+                                "check_setup_opportunity_count": int(
+                                    eval_check_setup_opportunities
+                                ),
+                                "check_pickup_count": int(eval_check_pickups),
+                                "check_violation_count": int(eval_check_violations),
+                                "check_space_defense_violation_count": int(
+                                    eval_check_space_defense_violations
+                                ),
+                                "check_space_defense_violation_rate": float(
+                                    eval_check_space_defense_violations
+                                    / max(1.0, eval_check_setup_opportunities)
+                                ),
+                                "check_pickup_rate": float(
+                                    eval_check_pickups
+                                    / max(1.0, eval_check_opportunities)
+                                ),
+                                "check_mean_pickup_steps": float(
+                                    eval_check_pickup_steps
+                                    / max(1.0, eval_check_pickups)
+                                ),
+                            }
                         )
                         eval_rebound_attempts = float(
                             np.asarray(
