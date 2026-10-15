@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import GameBoard from './components/GameBoard.vue';
 import PlayableControls from './components/PlayableControls.vue';
 import PlayableStatsPanel from './components/PlayableStatsPanel.vue';
+import { addEpisodeCheckPickupStats } from './services/stats';
 import PlayableEnvironmentInfo from './components/PlayableEnvironmentInfo.vue';
 import TutorialOverlay from './components/TutorialOverlay.vue';
 import basketworldLogo from './assets/basketworld-logo.jpg';
@@ -581,6 +582,10 @@ function createPlayableStats() {
       user: createTeamStatsLine(),
       ai: createTeamStatsLine(),
     },
+    checkPickups: {
+      player: { opportunities: 0, pickups: 0 },
+      ai: { opportunities: 0, pickups: 0 },
+    },
     turnoverReasons: {},
   };
 }
@@ -638,6 +643,17 @@ function recordPlayableStepStats(payload, context = {}) {
   }
   if (payload?.possession_ended) {
     stats.possessions = Number(stats.possessions || 0) + 1;
+  }
+
+  const completedCheckState = payload?.possession_ended
+    ? payload?.ended_state
+    : (payload?.game_result?.game_over ? payload?.state : null);
+  if (completedCheckState) {
+    addEpisodeCheckPickupStats(
+      stats,
+      completedCheckState.episode_check_stats,
+      completedCheckState.team_ownership,
+    );
   }
 
   const userIds = context.userIds instanceof Set ? context.userIds : new Set();

@@ -92,6 +92,10 @@ function makeEmptyStats() {
       user: makeEmptyTeamStats(),
       ai: makeEmptyTeamStats(),
     },
+    checkPickups: {
+      player: { opportunities: 0, pickups: 0 },
+      ai: { opportunities: 0, pickups: 0 },
+    },
     turnoverReasons: {},
   };
 }
@@ -105,6 +109,12 @@ function formatShotCell(line) {
   const made = asCount(line?.made);
   const attempts = asCount(line?.attempts);
   return `${made}-${attempts}`;
+}
+
+function formatRate(numerator, denominator) {
+  const total = asCount(denominator);
+  if (total === 0) return '\u2014';
+  return `${((asCount(numerator) / total) * 100).toFixed(1)}%`;
 }
 
 function getPlayerSurname(playerId) {
@@ -204,6 +214,25 @@ const boxScoreRows = computed(() => {
   ];
 });
 
+const checkPickupRows = computed(() => {
+  const checkPickups = statsSafe.value?.checkPickups || {};
+  return [
+    ['player', 'Player'],
+    ['ai', 'AI'],
+  ].map(([key, team]) => {
+    const line = checkPickups[key] || {};
+    const opportunities = asCount(line.opportunities);
+    const pickups = Math.min(opportunities, asCount(line.pickups));
+    return {
+      key,
+      team,
+      pickups,
+      opportunities,
+      rate: formatRate(pickups, opportunities),
+    };
+  });
+});
+
 const playByPlayRows = computed(() => {
   const rows = Array.isArray(props.playByPlay) ? props.playByPlay : [];
   return rows
@@ -251,6 +280,29 @@ const playByPlayRows = computed(() => {
               <td>{{ row.dunk }}</td>
               <td>{{ row.assists }}</td>
               <td>{{ row.turnovers }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="stats-card check-pickup-card">
+      <h3>Check Pickup Rate</h3>
+      <p class="check-pickup-description">Completed checks / check opportunities across this game.</p>
+      <div class="table-scroll">
+        <table class="check-pickup-table">
+          <thead>
+            <tr>
+              <th>Team</th>
+              <th>Pickups</th>
+              <th>Rate</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in checkPickupRows" :key="row.key">
+              <td>{{ row.team }}</td>
+              <td>{{ row.pickups }} / {{ row.opportunities }}</td>
+              <td>{{ row.rate }}</td>
             </tr>
           </tbody>
         </table>
@@ -337,6 +389,12 @@ h3 {
   font-size: 0.74rem;
 }
 
+.check-pickup-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.74rem;
+}
+
 .play-by-play-table {
   width: 100%;
   border-collapse: collapse;
@@ -345,6 +403,8 @@ h3 {
 
 .box-score-table th,
 .box-score-table td,
+.check-pickup-table th,
+.check-pickup-table td,
 .play-by-play-table th,
 .play-by-play-table td {
   border: 1px solid rgba(148, 163, 184, 0.22);
@@ -354,6 +414,8 @@ h3 {
 
 .box-score-table th:first-child,
 .box-score-table td:first-child,
+.check-pickup-table th:first-child,
+.check-pickup-table td:first-child,
 .play-by-play-table th:first-child,
 .play-by-play-table td:first-child {
   text-align: left;
@@ -363,6 +425,19 @@ h3 {
   color: var(--app-text-muted);
   background: rgba(15, 23, 42, 0.45);
   font-weight: 600;
+}
+
+.check-pickup-table th {
+  color: var(--app-text-muted);
+  background: rgba(15, 23, 42, 0.45);
+  font-weight: 600;
+}
+
+.check-pickup-description {
+  margin: -0.15rem 0 0;
+  color: var(--app-text-muted);
+  font-size: 0.72rem;
+  line-height: 1.35;
 }
 
 .play-by-play-table th {
