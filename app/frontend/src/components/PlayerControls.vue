@@ -32,7 +32,9 @@ import {
   setReboundParams,
 } from '@/services/api';
 import {
+  addEpisodeCheckPickupStats,
   countTeamOffensivePossessions,
+  ensureCheckPickupStats,
   getEpisodeMultiPossessionScoreTotals,
   getNativeMultiPossessionScoreTotals,
   loadStats,
@@ -5262,6 +5264,18 @@ const ppp = computed(() => safeDiv(statsState.value.points, offensivePossessions
 const opponentPpp = computed(() => (
   safeDiv(Number(statsState.value?.opponentPoints || 0), opponentOffensivePossessions.value)
 ));
+const playerCheckPickups = computed(() => (
+  statsState.value?.checkPickups?.player || { opportunities: 0, pickups: 0 }
+));
+const aiCheckPickups = computed(() => (
+  statsState.value?.checkPickups?.ai || { opportunities: 0, pickups: 0 }
+));
+const playerCheckPickupRate = computed(() => (
+  safeDiv(playerCheckPickups.value.pickups, playerCheckPickups.value.opportunities) * 100
+));
+const aiCheckPickupRate = computed(() => (
+  safeDiv(aiCheckPickups.value.pickups, aiCheckPickups.value.opportunities) * 100
+));
 const avgRewardPerEp = computed(() => safeDiv(statsState.value.rewardSum, Math.max(1, statsState.value.episodes)));
 const avgEpisodeLen = computed(() => safeDiv(statsState.value.episodeStepsSum, Math.max(1, statsState.value.episodes)));
 const totalReboundChances = computed(() => (
@@ -5464,6 +5478,7 @@ function ensureStatsDiagnosticFields(target) {
   target.totalPossessions = Number(target.totalPossessions || 0);
   target.offensivePossessions = Number(target.offensivePossessions || 0);
   target.opponentOffensivePossessions = Number(target.opponentOffensivePossessions || 0);
+  ensureCheckPickupStats(target);
   if (!target.intentSelectionCounts || typeof target.intentSelectionCounts !== 'object') {
     target.intentSelectionCounts = {};
   }
@@ -6228,6 +6243,11 @@ async function recordEpisodeStats(finalState, skipApiCall = false, episodeData =
   // Rebounds after missed shots. Prefer the full possession history when JAX rebounding extends play.
   const episodeRebounds = Array.isArray(finalState?.episode_rebounds) ? finalState.episode_rebounds : [];
   addReboundStats(statsState.value, episodeRebounds.length > 0 ? episodeRebounds : results);
+  addEpisodeCheckPickupStats(
+    statsState.value,
+    finalState?.episode_check_stats,
+    finalState?.team_ownership,
+  );
 
   // Turnovers at termination (array contains a single turnover if present)
   const turnovers = Array.isArray(results?.turnovers) ? results.turnovers : [];
@@ -6463,6 +6483,11 @@ function applyEvaluationStats(
     next.rewardSum += Number(rewardVal || 0);
 
     const finalState = row?.final_state || {};
+    addEpisodeCheckPickupStats(
+      next,
+      finalState?.episode_check_stats,
+      finalState?.team_ownership,
+    );
     const game = row?.game || {};
     const multiPossession = Boolean(
       isMultiPossessionGame.value || finalState?.enable_multi_possession
@@ -6854,6 +6879,8 @@ async function copyStatsMarkdown() {
       ['AI offensive possessions', String(s.opponentOffensivePossessions)],
       ['Player points', String(s.points)],
       ['AI points', String(s.opponentPoints)],
+      ['Player check pickups', `${playerCheckPickups.value.pickups} / ${playerCheckPickups.value.opportunities} (${playerCheckPickupRate.value.toFixed(1)}%)`],
+      ['AI check pickups', `${aiCheckPickups.value.pickups} / ${aiCheckPickups.value.opportunities} (${aiCheckPickupRate.value.toFixed(1)}%)`],
       ['Player PPP', ppp.value.toFixed(2)],
       ['AI PPP', opponentPpp.value.toFixed(2)],
       ['Avg total reward/ep', avgRewardPerEp.value.toFixed(2)],
@@ -9291,6 +9318,8 @@ function offenseSkillDeltaLabel(idx) {
             <div class="param-item" data-tooltip="Completed possessions in which the AI team was on offense. The Player and AI offensive-possession counts add up to completed possessions."><span class="param-name">AI offensive possessions:</span><span class="param-value">{{ opponentOffensivePossessions }}</span></div>
             <div class="param-item" data-tooltip="Points scored by the fixed blue Player team. In multi-possession evaluation, this comes from the stable team-A scoreboard rather than the changing offensive role."><span class="param-name">Player points:</span><span class="param-value">{{ statsState.points }}</span></div>
             <div class="param-item" data-tooltip="Points scored by the fixed red AI team. In multi-possession evaluation, this comes from the stable team-B scoreboard rather than the changing defensive role."><span class="param-name">AI points:</span><span class="param-value">{{ statsState.opponentPoints }}</span></div>
+            <div class="param-item" data-tooltip="Completed Player-team pickups divided by every check opportunity for the Player team. An opportunity begins when that team enters a check phase, whether it later picks up or violates."><span class="param-name">Player check pickups:</span><span class="param-value">{{ playerCheckPickups.pickups }} / {{ playerCheckPickups.opportunities }} ({{ playerCheckPickupRate.toFixed(1) }}%)</span></div>
+            <div class="param-item" data-tooltip="Completed AI-team pickups divided by every check opportunity for the AI team. An opportunity begins when that team enters a check phase, whether it later picks up or violates."><span class="param-name">AI check pickups:</span><span class="param-value">{{ aiCheckPickups.pickups }} / {{ aiCheckPickups.opportunities }} ({{ aiCheckPickupRate.toFixed(1) }}%)</span></div>
             <div class="param-item" data-tooltip="Total credited assists on made shots by the user team."><span class="param-name">Total assists:</span><span class="param-value">{{ totalAssists }}</span></div>
             <div class="param-item" data-tooltip="Missed shots that still qualified as potential assists."><span class="param-name">Total potential assists (missed):</span><span class="param-value">{{ totalPotentialAssists }}</span></div>
             <div class="param-item" data-tooltip="Total turnovers committed by the user team."><span class="param-name">Total turnovers:</span><span class="param-value">{{ statsState.turnovers }}</span></div>

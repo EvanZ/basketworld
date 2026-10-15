@@ -4,12 +4,40 @@ import { readFile } from 'node:fs/promises';
 
 const source = await readFile(new URL('../src/services/stats.js', import.meta.url), 'utf8');
 const {
+  addEpisodeCheckPickupStats,
   countTeamOffensivePossessions,
+  getDefaultStats,
   getEpisodeMultiPossessionScoreTotals,
   getNativeMultiPossessionScoreTotals,
 } = await import(
   `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`,
 );
+
+test('accumulates check pickups by stable Player and AI teams', () => {
+  const stats = getDefaultStats();
+  addEpisodeCheckPickupStats(
+    stats,
+    {
+      team_a: { opportunities: 4, pickups: 3 },
+      team_b: { opportunities: 3, pickups: 1 },
+    },
+    { team_a: 'user', team_b: 'ai' },
+  );
+  addEpisodeCheckPickupStats(
+    stats,
+    {
+      team_a: { opportunities: 2, pickups: 2 },
+      // Pickups are capped at opportunities when a malformed payload arrives.
+      team_b: { opportunities: 1, pickups: 9 },
+    },
+    { team_a: 'user', team_b: 'ai' },
+  );
+
+  assert.deepEqual(stats.checkPickups, {
+    player: { opportunities: 6, pickups: 5 },
+    ai: { opportunities: 4, pickups: 2 },
+  });
+});
 
 test('splits legacy aggregate counters by the actual jump-ball starter', () => {
   assert.equal(countTeamOffensivePossessions(25, 'team_a', true), 13);

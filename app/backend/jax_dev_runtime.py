@@ -591,6 +591,7 @@ class JaxDevRuntime:
         self.last_step_output = None
         self.last_action_results = self._empty_action_results()
         self.episode_rebounds: list[dict[str, Any]] = []
+        self.episode_check_stats = self._empty_episode_check_stats()
         self._reset_box_score()
         if rng_seed is None:
             rng_seed = int(np.random.default_rng().integers(0, 2**31 - 1))
@@ -902,6 +903,7 @@ class JaxDevRuntime:
             "last_step_output": self._clone_jax_tree(self.last_step_output),
             "last_action_results": copy.deepcopy(self.last_action_results),
             "episode_rebounds": copy.deepcopy(self.episode_rebounds),
+            "episode_check_stats": copy.deepcopy(self.episode_check_stats),
             "box_score_players": copy.deepcopy(self._box_score_players),
             "box_score_unattributed_turnovers": copy.deepcopy(
                 self._box_score_unattributed_turnovers
@@ -941,6 +943,9 @@ class JaxDevRuntime:
             snapshot.get("last_action_results") or self._empty_action_results()
         )
         self.episode_rebounds = copy.deepcopy(snapshot.get("episode_rebounds") or [])
+        self.episode_check_stats = copy.deepcopy(
+            snapshot.get("episode_check_stats") or self._empty_episode_check_stats()
+        )
         self._box_score_players = copy.deepcopy(
             snapshot.get("box_score_players") or self._empty_box_score_players()
         )
@@ -1118,6 +1123,7 @@ class JaxDevRuntime:
         self.last_step_output = None
         self.last_action_results = self._empty_action_results()
         self.episode_rebounds = []
+        self.episode_check_stats = self._empty_episode_check_stats()
         self._reset_box_score()
         self._fast_episode_metadata_cache = None
         self._last_policy_probs = None
@@ -1322,6 +1328,7 @@ class JaxDevRuntime:
         self.last_step_output = None
         self.last_action_results = self._empty_action_results()
         self.episode_rebounds = []
+        self.episode_check_stats = self._empty_episode_check_stats()
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         self._last_completed_pass_boundary = False
@@ -1726,6 +1733,7 @@ class JaxDevRuntime:
             out,
             include_rebound_diagnostics=not fast_mode,
         )
+        self._record_episode_check_stats(prev_state, out)
         self._record_box_score_step(prev_state, out)
         if self.last_action_results.get("rebounds"):
             self.episode_rebounds.extend(copy.deepcopy(self.last_action_results["rebounds"]))
@@ -1983,6 +1991,7 @@ class JaxDevRuntime:
         self.last_step_output = None
         self.last_action_results = self._empty_action_results()
         self.episode_rebounds = []
+        self.episode_check_stats = self._empty_episode_check_stats()
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         self._last_completed_pass_boundary = False
@@ -2416,6 +2425,40 @@ class JaxDevRuntime:
             "possession_events": [],
             "clearance": None,
         }
+
+    @staticmethod
+    def _empty_episode_check_stats() -> dict[str, dict[str, int]]:
+        return {
+            "team_a": {"opportunities": 0, "pickups": 0},
+            "team_b": {"opportunities": 0, "pickups": 0},
+        }
+
+    @staticmethod
+    def _check_team_key(team: int) -> str | None:
+        if team == TEAM_A:
+            return "team_a"
+        if team == TEAM_B:
+            return "team_b"
+        return None
+
+    def _record_episode_check_stats(self, prev_state: Any, out: Any) -> None:
+        """Accumulate check opportunities and pickups for the current game."""
+        previous_phase = _as_int(_field0(prev_state, "game_phase"))
+        next_state = out.state
+        next_phase = _as_int(_field0(next_state, "game_phase"))
+        check_phases = {GAME_PHASE_CHECK_SETUP, GAME_PHASE_AWAITING_CHECK}
+        if previous_phase not in check_phases and next_phase in check_phases:
+            team_key = self._check_team_key(
+                _as_int(_field0(next_state, "check_team"))
+            )
+            if team_key is not None:
+                self.episode_check_stats[team_key]["opportunities"] += 1
+        if _as_bool(out.check_pickup[0]):
+            team_key = self._check_team_key(
+                _as_int(_field0(prev_state, "check_team"))
+            )
+            if team_key is not None:
+                self.episode_check_stats[team_key]["pickups"] += 1
 
     @staticmethod
     def _append_episode_state(game_state: Any, state_payload: dict[str, Any]) -> None:
@@ -3836,6 +3879,7 @@ class JaxDevRuntime:
                 None,
             ),
             "last_action_results": copy.deepcopy(self.last_action_results),
+            "episode_check_stats": copy.deepcopy(self.episode_check_stats),
             "basket_position": tuple(int(v) for v in np.asarray(self.static.basket_position).tolist()),
             "court_width": int(self.display_env.court_width),
             "court_height": int(self.display_env.court_height),
@@ -4240,6 +4284,7 @@ class JaxDevRuntime:
             "obs_tokens_version": 1,
             "last_action_results": copy.deepcopy(self.last_action_results),
             "episode_rebounds": copy.deepcopy(self.episode_rebounds),
+            "episode_check_stats": copy.deepcopy(self.episode_check_stats),
             "player_shooting_skills": player_shooting_skills,
             "player_rebound_skills": player_rebound_skills,
             "player_rebound_skill_specialists": player_rebound_skill_specialists,

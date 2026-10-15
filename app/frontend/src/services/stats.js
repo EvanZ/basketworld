@@ -33,6 +33,50 @@ function normalizeSpatialDiagnostics(raw) {
   };
 }
 
+function nonNegativeInteger(value) {
+  return Math.max(0, Math.trunc(Number(value) || 0));
+}
+
+function normalizeCheckPickupSide(raw) {
+  const opportunities = nonNegativeInteger(raw?.opportunities);
+  return {
+    opportunities,
+    pickups: Math.min(opportunities, nonNegativeInteger(raw?.pickups)),
+  };
+}
+
+/**
+ * Normalize the persistent, stable-team check-pickup counters.  A check
+ * opportunity begins when a team enters its check phase; it has one eventual
+ * outcome (a pickup or a violation), so pickups cannot exceed opportunities.
+ */
+export function ensureCheckPickupStats(target) {
+  if (!target || typeof target !== 'object') return null;
+  target.checkPickups = {
+    player: normalizeCheckPickupSide(target?.checkPickups?.player),
+    ai: normalizeCheckPickupSide(target?.checkPickups?.ai),
+  };
+  return target.checkPickups;
+}
+
+/**
+ * Add one completed self-play game's check totals to the persistent stats,
+ * mapping kernel team ids to the fixed Player and AI teams.
+ */
+export function addEpisodeCheckPickupStats(target, episodeCheckStats, teamOwnership) {
+  const totals = ensureCheckPickupStats(target);
+  if (!totals || !episodeCheckStats || typeof episodeCheckStats !== 'object') return;
+
+  for (const [team, raw] of Object.entries(episodeCheckStats)) {
+    const owner = String(teamOwnership?.[team] || '').trim().toLowerCase();
+    const side = owner === 'user' ? 'player' : (owner === 'ai' ? 'ai' : null);
+    if (!side) continue;
+    const episode = normalizeCheckPickupSide(raw);
+    totals[side].opportunities += episode.opportunities;
+    totals[side].pickups += episode.pickups;
+  }
+}
+
 export function countTeamOffensivePossessions(
   completedPossessions,
   startingOffenseTeam,
@@ -186,6 +230,10 @@ export function getDefaultStats() {
     totalPossessions: 0,
     offensivePossessions: 0,
     opponentOffensivePossessions: 0,
+    checkPickups: {
+      player: { opportunities: 0, pickups: 0 },
+      ai: { opportunities: 0, pickups: 0 },
+    },
     rewardSum: 0,
     episodeStepsSum: 0,
     intentSelectionCounts: {},
@@ -312,6 +360,10 @@ export function loadStats() {
       totalPossessions: Number(parsed.totalPossessions) || 0,
       offensivePossessions: Number(parsed.offensivePossessions) || 0,
       opponentOffensivePossessions: Number(parsed.opponentOffensivePossessions) || 0,
+      checkPickups: {
+        player: normalizeCheckPickupSide(parsed?.checkPickups?.player),
+        ai: normalizeCheckPickupSide(parsed?.checkPickups?.ai),
+      },
       rewardSum: Number(parsed.rewardSum) || 0,
       episodeStepsSum: Number(parsed.episodeStepsSum) || 0,
       intentSelectionCounts: normalizeNumberRecord(parsed.intentSelectionCounts),

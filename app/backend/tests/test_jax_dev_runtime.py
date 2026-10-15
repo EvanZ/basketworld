@@ -1896,6 +1896,64 @@ def test_jax_dev_runtime_serializes_check_restart_in_full_and_fast_modes():
         assert state["check_steps_remaining"] == 0
 
 
+def test_jax_dev_runtime_tracks_and_serializes_check_pickup_rates_by_team():
+    runtime = _make_runtime()
+
+    def phase_state(phase, check_team):
+        return SimpleNamespace(
+            game_phase=jnp.asarray([phase], dtype=jnp.int8),
+            check_team=jnp.asarray([check_team], dtype=jnp.int8),
+        )
+
+    def outcome(previous, following, *, pickup=False):
+        return SimpleNamespace(
+            state=following,
+            check_pickup=jnp.asarray([int(pickup)], dtype=jnp.int8),
+        )
+
+    live = phase_state(GAME_PHASE_LIVE, -1)
+    team_a_setup = phase_state(GAME_PHASE_CHECK_SETUP, TEAM_A)
+    team_a_check = phase_state(GAME_PHASE_AWAITING_CHECK, TEAM_A)
+    team_b_check = phase_state(GAME_PHASE_AWAITING_CHECK, TEAM_B)
+
+    runtime._record_episode_check_stats(live, outcome(live, team_a_setup))
+    # Advancing setup into the actual pickup phase is still one opportunity.
+    runtime._record_episode_check_stats(
+        team_a_setup,
+        outcome(team_a_setup, team_a_check),
+    )
+    runtime._record_episode_check_stats(
+        team_a_check,
+        outcome(team_a_check, live, pickup=True),
+    )
+    runtime._record_episode_check_stats(live, outcome(live, team_b_check))
+
+    expected = {
+        "team_a": {"opportunities": 1, "pickups": 1},
+        "team_b": {"opportunities": 1, "pickups": 0},
+    }
+    assert runtime.episode_check_stats == expected
+
+    snapshot = runtime.capture_snapshot()
+    runtime.episode_check_stats["team_a"]["pickups"] = 0
+    runtime.restore_snapshot(snapshot)
+    assert runtime.episode_check_stats == expected
+
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.display_env
+    game_state.unified_policy = runtime.unified_policy
+    game_state.defense_policy = runtime.opponent_policy
+    game_state.user_team = Team.OFFENSE
+    for compact in (False, True):
+        state = runtime.get_full_game_state(
+            game_state,
+            include_policy_probs=False,
+            compact=compact,
+        )
+        assert state["episode_check_stats"] == expected
+
+
 def test_out_of_bounds_inbounder_does_not_satisfy_defensive_lane_guarding():
     runtime = _make_runtime(
         env_params={
