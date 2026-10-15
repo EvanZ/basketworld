@@ -310,6 +310,7 @@ def continue_run(
         lambda value: manager.continue_completed(
             value,
             additional_updates=request.additional_updates,
+            additional_historical_eval_updates=request.additional_historical_eval_updates,
             confirm_provenance_mismatch=request.confirm_provenance_mismatch,
         ),
         "Training continuation started.",

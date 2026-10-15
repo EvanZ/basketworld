@@ -147,7 +147,10 @@ def test_job_manager_continues_completed_run_in_same_mlflow_run(tmp_path):
     manager = JobManager(settings, repository)
 
     run = manager.create_and_launch(
-        config=TrainingRunConfig(num_updates=1),
+        config=TrainingRunConfig(
+            num_updates=1,
+            historical_eval_updates=[1, 30_000],
+        ),
         idempotency_key="job-continue-test",
     )
     for _ in range(100):
@@ -166,20 +169,53 @@ def test_job_manager_continues_completed_run_in_same_mlflow_run(tmp_path):
         mlflow_run_id="original-mlflow-run-id",
     )
 
+    with pytest.raises(RuntimeError, match="after the completed update"):
+        manager.continue_completed(
+            run["id"],
+            additional_updates=10_000,
+            additional_historical_eval_updates=[1],
+        )
+    with pytest.raises(RuntimeError, match="no later than"):
+        manager.continue_completed(
+            run["id"],
+            additional_updates=10_000,
+            additional_historical_eval_updates=[10_002],
+        )
+    with pytest.raises(RuntimeError, match="only once"):
+        manager.continue_completed(
+            run["id"],
+            additional_updates=10_000,
+            additional_historical_eval_updates=[2_500, 2_500],
+        )
     with pytest.raises(ProvenanceConfirmationRequired):
-        manager.continue_completed(run["id"], additional_updates=10_000)
+        manager.continue_completed(
+            run["id"],
+            additional_updates=10_000,
+            additional_historical_eval_updates=[2_500, 10_001],
+        )
 
     continued = manager.continue_completed(
-        run["id"], additional_updates=10_000, confirm_provenance_mismatch=True
+        run["id"],
+        additional_updates=10_000,
+        additional_historical_eval_updates=[2_500, 10_001],
+        confirm_provenance_mismatch=True,
     )
 
     assert continued["status"] == "running"
     assert continued["target_updates"] == 10_001
     assert continued["config"]["num_updates"] == 10_001
+    assert continued["config"]["historical_eval_updates"] == [
+        1,
+        2_500,
+        10_001,
+        30_000,
+    ]
     assert "--resume-checkpoint" in continued["command"]
     assert str(checkpoint) in continued["command"]
     assert "--mlflow-resume-run-id" in continued["command"]
     assert "original-mlflow-run-id" in continued["command"]
+    historical_index = continued["command"].index("--historical-eval-updates")
+    assert continued["command"][historical_index + 1] == "1,2500,10001"
     events = repository.list_events(run["id"])
     assert events[0]["event_type"] == "started"
     assert events[1]["event_type"] == "continuation_requested"
@@ -187,6 +223,14 @@ def test_job_manager_continues_completed_run_in_same_mlflow_run(tmp_path):
     assert payload["additional_updates"] == 10_000
     assert payload["previous_target_updates"] == 1
     assert payload["target_updates"] == 10_001
+    assert payload["previous_historical_eval_updates"] == [1, 30_000]
+    assert payload["added_historical_eval_updates"] == [2_500, 10_001]
+    assert payload["resulting_historical_eval_updates"] == [
+        1,
+        2_500,
+        10_001,
+        30_000,
+    ]
     assert payload["checkpoint_path"] == str(checkpoint)
     assert payload["checkpoint_update"] == 1
     assert payload["checkpoint_provenance"] is None

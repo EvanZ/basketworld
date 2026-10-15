@@ -65,10 +65,16 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ confirm_provenance_mismatch: confirmProvenanceMismatch }),
   }),
-  continueRun: (id, additionalUpdates, confirmProvenanceMismatch = false) => request(`/runs/${id}/continue`, {
+  continueRun: (
+    id,
+    additionalUpdates,
+    additionalHistoricalEvalUpdates = [],
+    confirmProvenanceMismatch = false,
+  ) => request(`/runs/${id}/continue`, {
     method: 'POST',
     body: JSON.stringify({
       additional_updates: additionalUpdates,
+      additional_historical_eval_updates: additionalHistoricalEvalUpdates,
       confirm_provenance_mismatch: confirmProvenanceMismatch,
     }),
   }),

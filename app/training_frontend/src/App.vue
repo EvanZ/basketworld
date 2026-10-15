@@ -13,7 +13,11 @@ import {
   estimateRemainingTrainingSeconds,
   remainingTrainingTimeCaption,
 } from './runTiming'
-import { historicalEvalUpdatesForTarget } from './configEditing'
+import {
+  continuationHistoricalEvalSchedule as buildContinuationHistoricalEvalSchedule,
+  historicalEvalUpdatesForTarget,
+  parseHistoricalEvalUpdates,
+} from './configEditing'
 import { launchGitCommit, launchWorktreeState } from './runProvenance'
 
 const defaultConfig = () => ({
@@ -174,6 +178,7 @@ const canPause = computed(() => selected.value?.status === 'running')
 const canResume = computed(() => selected.value?.status === 'paused')
 const canRecover = computed(() => selected.value?.status === 'stopped')
 const continuationUpdates = ref(10000)
+const continuationHistoricalEvalUpdates = ref('')
 const continuationTarget = computed(() => {
   const currentUpdate = Number(selected.value?.current_update) || 0
   const targetUpdates = Number(selected.value?.target_updates) || 0
@@ -181,10 +186,38 @@ const continuationTarget = computed(() => {
   if (!Number.isInteger(additionalUpdates) || additionalUpdates < 1) return null
   return Math.max(currentUpdate, targetUpdates) + additionalUpdates
 })
+const continuationPreviousTarget = computed(() => Math.max(
+  Number(selected.value?.current_update) || 0,
+  Number(selected.value?.target_updates) || 0,
+))
+const continuationExistingHistoricalEvalUpdates = computed(() => {
+  const updates = selected.value?.config?.historical_eval_updates
+  if (!Array.isArray(updates)) return []
+  return [...new Set(updates.filter((update) => Number.isSafeInteger(update) && update > 0))]
+    .sort((left, right) => left - right)
+})
+const continuationHistoricalEvalInput = computed(() => (
+  parseHistoricalEvalUpdates(continuationHistoricalEvalUpdates.value)
+))
+const continuationHistoricalEvalSchedule = computed(() => {
+  if (continuationHistoricalEvalInput.value.error) {
+    return {
+      updates: continuationExistingHistoricalEvalUpdates.value,
+      error: continuationHistoricalEvalInput.value.error,
+    }
+  }
+  return buildContinuationHistoricalEvalSchedule(
+    continuationExistingHistoricalEvalUpdates.value,
+    continuationHistoricalEvalInput.value.updates,
+    continuationPreviousTarget.value,
+    continuationTarget.value,
+  )
+})
 const canContinue = computed(() => (
   selected.value?.status === 'completed'
   && continuationTarget.value !== null
   && continuationTarget.value <= 1_000_000
+  && !continuationHistoricalEvalSchedule.value.error
 ))
 const canCheckpoint = computed(() => selected.value?.status === 'running')
 const canStop = computed(() => ['starting', 'running', 'pausing'].includes(selected.value?.status))
@@ -262,6 +295,12 @@ const applicationConfigValues = computed(() => ({
 
 function formatDate(value) {
   return value ? new Date(value).toLocaleString() : '—'
+}
+
+function formatUpdates(updates) {
+  return updates.length
+    ? updates.map((update) => `U${update.toLocaleString()}`).join(', ')
+    : 'None'
 }
 
 function formatDuration(totalSeconds) {
@@ -662,6 +701,7 @@ async function selectRun(run) {
     ])
     selected.value = detail
     continuationUpdates.value = 10000
+    continuationHistoricalEvalUpdates.value = ''
     logs.value = logText
     eloSummary.value = null
     eloError.value = ''
@@ -773,6 +813,7 @@ async function continueRun() {
       api.continueRun(
         selected.value.id,
         Number(continuationUpdates.value),
+        continuationHistoricalEvalInput.value.updates,
         confirmed,
       )
     ))
@@ -963,12 +1004,26 @@ onBeforeUnmount(() => {
               <button v-if="selected.status === 'paused'" class="primary" :disabled="loading || !canResume" @click="resumeRun">Resume</button>
               <button v-if="selected.status === 'stopped'" class="primary" :disabled="loading || !canRecover" @click="resumeRun">Recover checkpoint</button>
               <div v-if="selected.status === 'completed'" class="continue-control">
-                <label>
-                  <span>More updates</span>
-                  <input v-model.number="continuationUpdates" type="number" min="1" max="1000000" step="1000" :disabled="loading" />
-                </label>
-                <small v-if="continuationTarget">New target: {{ continuationTarget.toLocaleString() }} · same MLflow run</small>
-                <small v-else class="error-text">Enter at least one update.</small>
+                <div class="continuation-inputs">
+                  <label>
+                    <span>More updates</span>
+                    <input v-model.number="continuationUpdates" type="number" min="1" max="1000000" step="1000" :disabled="loading" />
+                  </label>
+                  <label class="continuation-checkpoints">
+                    <span>Add Elo checkpoints</span>
+                    <input v-model="continuationHistoricalEvalUpdates" type="text" inputmode="numeric" placeholder="e.g. 7500, 10000" :disabled="loading" />
+                  </label>
+                </div>
+                <div class="continuation-details">
+                  <small v-if="continuationTarget">New target: U{{ continuationTarget.toLocaleString() }} · same MLflow run</small>
+                  <small v-else class="error-text">Enter at least one update.</small>
+                  <small v-if="continuationHistoricalEvalSchedule.error" class="error-text">{{ continuationHistoricalEvalSchedule.error }}</small>
+                  <template v-else>
+                    <small>Saved Elo checkpoints: {{ formatUpdates(continuationExistingHistoricalEvalUpdates) }}</small>
+                    <small>Resulting schedule: {{ formatUpdates(continuationHistoricalEvalSchedule.updates) }}</small>
+                    <small v-if="continuationTarget">Only checkpoints through U{{ continuationTarget.toLocaleString() }} run in this continuation.</small>
+                  </template>
+                </div>
                 <button class="primary" :disabled="loading || !canContinue" @click="continueRun">Continue</button>
               </div>
               <button class="danger" :disabled="loading || !canStop" @click="runAction('stop')">Stop</button>

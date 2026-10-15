@@ -2,7 +2,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import { responseErrorMessage } from '../src/api.js'
-import { historicalEvalUpdatesForTarget } from '../src/configEditing.js'
+import {
+  continuationHistoricalEvalSchedule,
+  historicalEvalUpdatesForTarget,
+  parseHistoricalEvalUpdates,
+} from '../src/configEditing.js'
 
 test('keeps future evaluation milestones when a copied run is shortened', () => {
   assert.deepEqual(
@@ -89,6 +93,35 @@ test('does not add a final milestone when the explicit schedule omitted one', ()
     [100, 500],
   )
   assert.equal(historicalEvalUpdatesForTarget(null, 5000, 300), null)
+})
+
+test('parses append-only checkpoints for a completed-run continuation', () => {
+  assert.deepEqual(parseHistoricalEvalUpdates(' 7500, 10000 ').updates, [7500, 10000])
+  assert.match(parseHistoricalEvalUpdates('7500, nope').error, /whole-number/)
+  assert.match(parseHistoricalEvalUpdates('7500, 7500').error, /only once/)
+})
+
+test('merges new continuation checkpoints without replacing the saved schedule', () => {
+  assert.deepEqual(
+    continuationHistoricalEvalSchedule(
+      [100, 250, 500, 5000, 30000],
+      [7500, 10000],
+      5000,
+      10000,
+    ),
+    {
+      updates: [100, 250, 500, 5000, 7500, 10000, 30000],
+      error: '',
+    },
+  )
+  assert.match(
+    continuationHistoricalEvalSchedule([5000], [5000], 5000, 10000).error,
+    /after U5,000/,
+  )
+  assert.match(
+    continuationHistoricalEvalSchedule([5000], [10001], 5000, 10000).error,
+    /no later than U10,000/,
+  )
 })
 
 test('shows FastAPI validation messages instead of a generic 422 error', () => {

@@ -174,7 +174,17 @@ class RunActionResponse(BaseModel):
 
 class RunContinuationRequest(BaseModel):
     additional_updates: int = Field(default=10_000, ge=1, le=1_000_000)
+    additional_historical_eval_updates: list[int] = Field(default_factory=list)
     confirm_provenance_mismatch: bool = False
+
+    @field_validator("additional_historical_eval_updates")
+    @classmethod
+    def validate_added_historical_eval_updates(cls, value: list[int]) -> list[int]:
+        if any(update <= 0 for update in value):
+            raise ValueError("Added Elo checkpoints must be positive.")
+        if len(set(value)) != len(value):
+            raise ValueError("Each added Elo checkpoint must appear only once.")
+        return sorted(value)
 
 
 class RunResumeRequest(BaseModel):

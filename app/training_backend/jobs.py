@@ -298,6 +298,7 @@ class JobManager:
         run_id: str,
         *,
         additional_updates: int,
+        additional_historical_eval_updates: list[int] | None = None,
         confirm_provenance_mismatch: bool = False,
     ) -> dict[str, Any]:
         run = self._require_status(run_id, {RunStatus.COMPLETED.value})
@@ -314,9 +315,49 @@ class JobManager:
                 "Continuation target exceeds the maximum of 1,000,000 updates."
             )
 
-        config = TrainingRunConfig.model_validate(run["config"]).model_copy(
-            update={"num_updates": target_updates}
+        existing_config = TrainingRunConfig.model_validate(run["config"])
+        existing_historical_updates = list(
+            existing_config.historical_eval_updates or []
         )
+        added_historical_updates = list(additional_historical_eval_updates or [])
+        if any(
+            isinstance(update, bool) or not isinstance(update, int)
+            for update in added_historical_updates
+        ):
+            raise RuntimeError("Added Elo checkpoints must be whole-number updates.")
+        if any(update < 1 for update in added_historical_updates):
+            raise RuntimeError("Added Elo checkpoints must be positive.")
+        if len(set(added_historical_updates)) != len(added_historical_updates):
+            raise RuntimeError("Each added Elo checkpoint must appear only once.")
+        if any(update <= previous_target for update in added_historical_updates):
+            raise RuntimeError(
+                "Added Elo checkpoints must be after the completed update "
+                f"U{previous_target:,}."
+            )
+        if any(update > target_updates for update in added_historical_updates):
+            raise RuntimeError(
+                "Added Elo checkpoints must be no later than the continuation "
+                f"target U{target_updates:,}."
+            )
+        duplicated = set(existing_historical_updates).intersection(
+            added_historical_updates
+        )
+        if duplicated:
+            duplicate_list = ", ".join(
+                f"U{update:,}" for update in sorted(duplicated)
+            )
+            raise RuntimeError(
+                "Added Elo checkpoints are already in the saved schedule: "
+                f"{duplicate_list}."
+            )
+
+        resulting_historical_updates = sorted(
+            set(existing_historical_updates).union(added_historical_updates)
+        )
+        config_updates: dict[str, Any] = {"num_updates": target_updates}
+        if added_historical_updates:
+            config_updates["historical_eval_updates"] = resulting_historical_updates
+        config = existing_config.model_copy(update=config_updates)
         return self._resume_from_checkpoint(
             run,
             config,
@@ -325,6 +366,11 @@ class JobManager:
                 "additional_updates": int(additional_updates),
                 "previous_target_updates": previous_target,
                 "target_updates": target_updates,
+                "previous_historical_eval_updates": existing_historical_updates,
+                "added_historical_eval_updates": added_historical_updates,
+                "resulting_historical_eval_updates": list(
+                    config.historical_eval_updates or []
+                ),
             },
             target_updates=target_updates,
             confirm_provenance_mismatch=confirm_provenance_mismatch,
