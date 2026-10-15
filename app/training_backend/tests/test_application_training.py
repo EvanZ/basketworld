@@ -7,6 +7,7 @@ from app.training_backend.application_training import (
     application_preset_values,
     load_application_config_schema,
     resolve_run_config_schema,
+    resolve_run_training_config,
 )
 from app.training_backend.config_schema import compile_overrides
 
@@ -70,6 +71,27 @@ def test_resolve_run_config_schema_reports_effective_values():
 
     assert values["num_updates"] == 321
     assert values["gamma"] == 0.97
+
+
+def test_resume_config_resolution_keeps_fields_hidden_from_the_ui():
+    command = (
+        "/repo/.env/bin/python",
+        "-m",
+        "basketworld_jax.train.main",
+        "--num-updates",
+        "321",
+    )
+
+    ui_values = {field["name"] for field in resolve_run_config_schema(command)}
+    checkpoint_values = resolve_run_training_config(command)
+
+    assert not ui_values.intersection(JAX_INAPPLICABLE_FIELDS)
+    assert {
+        "alternations",
+        "batch_size",
+        "continue_schedule_mode",
+        "ent_bump_multiplier",
+    }.issubset(checkpoint_values)
 
 
 def test_resolve_run_config_schema_tolerates_retired_launch_arguments():

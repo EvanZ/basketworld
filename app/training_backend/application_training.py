@@ -229,8 +229,7 @@ def load_application_config_schema(repo_root_text: str) -> list[dict[str, Any]]:
     ]
 
 
-@lru_cache(maxsize=128)
-def resolve_run_config_schema(command: tuple[str, ...]) -> list[dict[str, Any]]:
+def _resolved_train_args(command: tuple[str, ...]):
     from basketworld_jax.train.main import build_train_config_schema, build_train_parser
 
     try:
@@ -250,6 +249,25 @@ def resolve_run_config_schema(command: tuple[str, ...]) -> list[dict[str, Any]]:
         args.policy_model = "attention"
     if str(args.policy_model) == "attention":
         args.use_set_obs = True
+    return args, build_train_config_schema
+
+
+@lru_cache(maxsize=128)
+def resolve_run_training_config(command: tuple[str, ...]) -> dict[str, Any]:
+    """Resolve the complete trainer configuration used for checkpoint checks."""
+
+    args, build_train_config_schema = _resolved_train_args(command)
+    return {
+        str(field["name"]): field["effective_value"]
+        for field in build_train_config_schema(args)
+    }
+
+
+@lru_cache(maxsize=128)
+def resolve_run_config_schema(command: tuple[str, ...]) -> list[dict[str, Any]]:
+    """Return the UI-safe subset of a saved JAX trainer command."""
+
+    args, build_train_config_schema = _resolved_train_args(command)
     return [
         {**field, "value": field["effective_value"]}
         for field in build_train_config_schema(args)

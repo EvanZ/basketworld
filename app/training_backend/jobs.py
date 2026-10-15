@@ -13,7 +13,7 @@ from app.training_backend.config import Settings
 from app.training_backend.database import TrainingRepository, utc_now
 from app.training_backend.models import RunStatus, TrainingRunConfig
 from app.training_backend.presets import build_halfcourt_multi_possession_preview
-from app.training_backend.application_training import resolve_run_config_schema
+from app.training_backend.application_training import resolve_run_training_config
 from basketworld_jax.checkpoints import CHECKPOINT_VERSION, load_checkpoint_metadata
 from basketworld_jax.provenance import (
     capture_source_provenance,
@@ -471,10 +471,7 @@ class JobManager:
 
     @staticmethod
     def _resolved_config_from_preview(preview) -> dict[str, Any]:
-        fields = resolve_run_config_schema(tuple(preview.argv))
-        return resume_config_snapshot(
-            {str(field["name"]): field.get("value") for field in fields}
-        )
+        return resume_config_snapshot(resolve_run_training_config(tuple(preview.argv)))
 
     @staticmethod
     def _validate_checkpoint_metadata(metadata: dict[str, Any]) -> None:
