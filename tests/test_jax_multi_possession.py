@@ -1591,6 +1591,48 @@ def test_inbounder_waits_for_occupied_entry_then_reenters_under_basket_and_becom
     assert eligible_masks[0, receiver, PASS_ACTION_START] == 1
 
 
+def test_live_turnover_restores_pending_inbounder_before_clearing_inbound_metadata():
+    """A possession boundary must not strand a prior inbounder off the court."""
+    static = _multi_possession_static(possession_limit=4)._replace(
+        defender_pressure_distance=jnp.asarray(100.0, dtype=jnp.float32),
+        defender_pressure_turnover_chance=jnp.asarray(1.0, dtype=jnp.float32),
+        defender_pressure_decay_lambda=jnp.asarray(0.0, dtype=jnp.float32),
+    )
+    inbound_state = _inbound_state(static, seed=82, receiver_at_basket=True)
+    inbounder = int(np.asarray(inbound_state.inbound_player)[0])
+    inbound_out = step_batch_minimal(
+        static,
+        inbound_state,
+        _noops(inbound_state).at[0, inbounder].set(PASS_ACTION_START),
+        jax.random.split(jax.random.PRNGKey(83), 1),
+        jax,
+        jnp,
+    )
+    live_state = inbound_out.state
+    np.testing.assert_array_equal(
+        np.asarray(live_state.positions)[0, inbounder],
+        np.asarray(static.inbound_position),
+    )
+    assert int(np.asarray(live_state.inbound_player)[0]) == inbounder
+
+    turnover_out = step_batch_minimal(
+        static,
+        live_state,
+        _noops(live_state),
+        jax.random.split(jax.random.PRNGKey(84), 1),
+        jax,
+        jnp,
+    )
+
+    assert int(np.asarray(turnover_out.turnover_reason)[0]) == TURNOVER_REASON_DEFENDER_PRESSURE
+    assert int(np.asarray(turnover_out.state.game_phase)[0]) == GAME_PHASE_LIVE
+    assert int(np.asarray(turnover_out.state.inbound_player)[0]) == -1
+    inbounder_position = np.asarray(turnover_out.state.positions)[0, inbounder]
+    assert np.any(
+        np.all(np.asarray(static.cell_coords) == inbounder_position[None, :], axis=1)
+    )
+
+
 def test_reentering_inbounder_wins_a_simultaneous_move_to_the_entry_cell():
     static = _multi_possession_static(possession_limit=4)
     state = _inbound_state(static, seed=177)

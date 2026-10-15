@@ -5067,11 +5067,12 @@ def _finalize_possession_single(
         jnp.where(
             awaiting_inbound,
             inbound_positions,
-            jnp.where(
-                game_done,
-                restored_positions,
-                state.positions,
-            ),
+            # A live turnover or direct handoff can interrupt the prior
+            # inbounder's re-entry.  Restore that player before clearing the
+            # inbound metadata below; otherwise their out-of-bounds coordinate
+            # becomes an ordinary position and they can remain stranded until
+            # the policy happens to choose a move back onto the court.
+            restored_positions,
         ),
     )
     receiving_player_ids = jnp.where(
