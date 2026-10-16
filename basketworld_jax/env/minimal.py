@@ -5251,18 +5251,21 @@ def _finalize_possession_single(
         jnp,
     )
     boundary_positions = jnp.where(
-        check_restart,
-        check_positions,
+        advance,
         jnp.where(
-            awaiting_inbound,
-            inbound_positions,
-            # A live turnover or direct handoff can interrupt the prior
-            # inbounder's re-entry.  Restore that player before clearing the
-            # inbound metadata below; otherwise their out-of-bounds coordinate
-            # becomes an ordinary position and they can remain stranded until
-            # the policy happens to choose a move back onto the court.
-            restored_positions,
+            check_restart,
+            check_positions,
+            jnp.where(
+                awaiting_inbound,
+                inbound_positions,
+                # A live turnover or direct handoff can interrupt the prior
+                # inbounder's re-entry. Restore that player before clearing
+                # the inbound metadata below; otherwise their out-of-bounds
+                # coordinate can remain stranded after the boundary.
+                restored_positions,
+            ),
         ),
+        state.positions,
     )
     receiving_player_ids = jnp.where(
         effective_next_offense_team == TEAM_A,
