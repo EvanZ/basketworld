@@ -1,9 +1,11 @@
 import numpy as np
+import pytest
 import torch
 
 import app.backend.evaluation as backend_evaluation
 from app.backend.selector_runtime import selector_segment_boundary_reason
 from basketworld.envs.basketworld_env_v2 import ActionType, HexagonBasketballEnv, Team
+from basketworld_jax.inference import UnsupportedCheckpointFormatError
 
 
 
@@ -252,3 +254,23 @@ def test_run_evaluation_forwards_selector_settings_to_native_jax(monkeypatch):
 
     assert captured["training_params"] is training_params
     assert captured["intent_selection_mode"] == "best_intent"
+
+
+def test_run_evaluation_rejects_sb3_checkpoint(tmp_path):
+    artifact = tmp_path / "policy.zip"
+    artifact.write_bytes(b"sb3")
+
+    with pytest.raises(UnsupportedCheckpointFormatError, match="SB3/PyTorch"):
+        backend_evaluation.run_evaluation(
+            num_episodes=1,
+            player_deterministic=True,
+            opponent_deterministic=True,
+            required_params={},
+            optional_params={},
+            training_params={},
+            unified_policy_path=str(artifact),
+            opponent_policy_path=None,
+            user_team_name="OFFENSE",
+            role_flag_offense=1.0,
+            role_flag_defense=-1.0,
+        )

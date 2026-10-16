@@ -10,8 +10,8 @@ from basketworld.utils.intent_policy_sensitivity import (
 )
 from basketworld.utils.policy_loading import load_ppo_for_inference
 from basketworld_jax.inference import (
-    is_checkpoint_path,
     load_inference_model,
+    require_checkpoint_path,
 )
 
 
@@ -286,13 +286,8 @@ def load_inference_policy(
     custom_objects: dict[str, Any] | None = None,
 ) -> InferencePolicyAdapter:
     candidate_path = Path(path)
-    if is_checkpoint_path(candidate_path):
-        return load_jax_adapter(str(candidate_path))
-    return load_sb3_policy_adapter(
-        str(candidate_path),
-        device=device,
-        custom_objects=custom_objects,
-    )
+    require_checkpoint_path(candidate_path)
+    return load_jax_adapter(str(candidate_path))
 
 
 def unwrap_inference_model(policy_obj: Any) -> Any:

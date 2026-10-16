@@ -9,6 +9,7 @@ from basketworld_jax.config.environment import (
     JaxEnvironmentConfig,
     JaxStaticEnvironment,
     build_static_environment,
+    normalize_runtime_environment_config,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "JaxEnvironmentConfig",
     "JaxStaticEnvironment",
     "build_static_environment",
+    "normalize_runtime_environment_config",
 ]

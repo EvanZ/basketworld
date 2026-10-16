@@ -45,6 +45,12 @@ def _args(tmp_path, checkpoint_path, *, create: bool):
     )
 
 
+def _mark_jax_checkpoint(path):
+    path.mkdir()
+    (path / "metadata.json").write_text("{}", encoding="utf-8")
+    (path / "state").mkdir()
+
+
 def _fake_native_runner(**kwargs):
     pool = kwargs["fixed_player_pool"]
     schedule = kwargs["fixed_lineup_schedule"]
@@ -174,7 +180,7 @@ def test_study_pool_sampling_has_support_for_each_active_skill():
 
 def test_operational_runner_creates_then_reuses_immutable_inputs(tmp_path, monkeypatch):
     checkpoint = tmp_path / "update_0000004"
-    checkpoint.mkdir()
+    _mark_jax_checkpoint(checkpoint)
     monkeypatch.setattr(
         "basketworld_jax.eval.fixed_pool_study.load_checkpoint_metadata",
         lambda _path: {
@@ -249,7 +255,7 @@ def test_operational_runner_extends_raw_evidence_without_replaying_base_games(
     tmp_path, monkeypatch
 ):
     checkpoint = tmp_path / "update_0000004"
-    checkpoint.mkdir()
+    _mark_jax_checkpoint(checkpoint)
     monkeypatch.setattr(
         "basketworld_jax.eval.fixed_pool_study.load_checkpoint_metadata",
         lambda _path: {

@@ -41,6 +41,7 @@ from basketworld_jax.eval.skills import (
     ACTIVE_PLAYER_SKILL_REGISTRY,
     PlayerSkillValidationError,
 )
+from basketworld_jax.inference import require_checkpoint_path
 
 
 # Worker-local storage (each process has its own copy)
@@ -1851,99 +1852,36 @@ def run_evaluation(
     progress_callback=None,
     eval_seed: int | None = None,
 ):
-    if can_run_native_jax_evaluation(
+    native_ready = can_run_native_jax_evaluation(
         unified_policy_path=unified_policy_path,
         opponent_policy_path=opponent_policy_path,
         custom_setup=custom_setup,
         randomize_offense_permutation=randomize_offense_permutation,
-    ):
-        print("[Evaluation] Using JAX-native compiled evaluation fast path")
-        return run_native_jax_evaluation(
-            num_episodes=num_episodes,
-            player_deterministic=player_deterministic,
-            opponent_deterministic=opponent_deterministic,
-            required_params=required_params,
-            optional_params=optional_params,
-            training_params=training_params,
-            unified_policy_path=unified_policy_path,
-            opponent_policy_path=opponent_policy_path,
-            user_team_name=user_team_name,
-            role_flag_offense=role_flag_offense,
-            role_flag_defense=role_flag_defense,
-            intent_selection_mode=intent_selection_mode,
-            custom_setup=custom_setup,
-            progress_callback=progress_callback,
-            eval_seed=eval_seed,
+    )
+    if not native_ready:
+        require_checkpoint_path(unified_policy_path)
+        if opponent_policy_path:
+            require_checkpoint_path(opponent_policy_path)
+        raise ValueError(
+            "The requested evaluation options are not supported by the JAX-native evaluator."
         )
-
-    if num_workers is None or num_workers <= 1:
-        env = basketworld.HexagonBasketballEnv(**required_params, **optional_params, render_mode=None)
-        custom_objects = {
-            "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
-            "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
-            "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
-            "SetAttentionExtractor": SetAttentionExtractor,
-        }
-        unified_policy = load_inference_policy(
-            unified_policy_path,
-            device="cpu",
-            custom_objects=custom_objects,
-        )
-        opponent_policy = (
-            load_inference_policy(
-                opponent_policy_path,
-                device="cpu",
-                custom_objects=custom_objects,
-            )
-            if opponent_policy_path
-            else None
-        )
-        pass_mode = str(optional_params.get("pass_mode", "directional"))
-        for policy_obj in (unified_policy, opponent_policy):
-            if policy_obj is None:
-                continue
-            try:
-                policy_obj.set_pass_mode(pass_mode)
-            except Exception:
-                pass
-        user_team = Team.OFFENSE if user_team_name == "OFFENSE" else Team.DEFENSE
-
-        return _run_sequential_evaluation(
-            num_episodes,
-            player_deterministic,
-            opponent_deterministic,
-            env,
-            training_params,
-            unified_policy,
-            opponent_policy,
-            user_team,
-            role_flag_offense,
-            role_flag_defense,
-            shot_accumulator=shot_accumulator,
-            custom_setup=custom_setup,
-            randomize_offense_permutation=randomize_offense_permutation,
-            intent_selection_mode=intent_selection_mode,
-            progress_callback=progress_callback,
-        )
-
-    return _run_parallel_evaluation(
-        num_episodes,
-        player_deterministic,
-        opponent_deterministic,
-        required_params,
-        optional_params,
-        training_params,
-        unified_policy_path,
-        opponent_policy_path,
-        user_team_name,
-        role_flag_offense,
-        role_flag_defense,
-        shot_accumulator=shot_accumulator,
-        custom_setup=custom_setup,
-        randomize_offense_permutation=randomize_offense_permutation,
+    print("[Evaluation] Using JAX-native compiled evaluation")
+    return run_native_jax_evaluation(
+        num_episodes=num_episodes,
+        player_deterministic=player_deterministic,
+        opponent_deterministic=opponent_deterministic,
+        required_params=required_params,
+        optional_params=optional_params,
+        training_params=training_params,
+        unified_policy_path=unified_policy_path,
+        opponent_policy_path=opponent_policy_path,
+        user_team_name=user_team_name,
+        role_flag_offense=role_flag_offense,
+        role_flag_defense=role_flag_defense,
         intent_selection_mode=intent_selection_mode,
-        num_workers=num_workers,
+        custom_setup=custom_setup,
         progress_callback=progress_callback,
+        eval_seed=eval_seed,
     )
 
 

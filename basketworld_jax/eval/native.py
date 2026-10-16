@@ -3,12 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 from threading import Event, Thread
 from time import perf_counter
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
-import basketworld
 from basketworld.domain import ActionType, Team
+from basketworld_jax.config import (
+    JaxEnvironmentConfig,
+    normalize_runtime_environment_config,
+)
 from basketworld_jax.checkpoints import load_checkpoint
 from basketworld_jax.env.minimal import (
     MOVE_ACTION_END,
@@ -37,7 +40,7 @@ from basketworld_jax.env.minimal import (
     TURNOVER_REASON_SHOT_CLOCK,
     assemble_full_actions_jax,
     build_action_masks_batch,
-    build_kernel_static_from_env,
+    build_kernel_static_from_config,
     build_pass_steal_probabilities_batch,
     build_spatial_diagnostics_batch,
     build_turnover_probabilities_batch,
@@ -47,7 +50,7 @@ from basketworld_jax.env.minimal import (
     set_offense_intent_state_batch,
     step_batch_minimal,
 )
-from basketworld_jax.inference import is_checkpoint_path
+from basketworld_jax.inference import is_checkpoint_path, require_checkpoint_path
 from basketworld_jax.models import (
     ActorCriticSpec,
     actor_critic_forward,
@@ -88,6 +91,7 @@ def can_run_native_jax_evaluation(
 def _load_checkpoint_params(
     path: str | Path, jax=None
 ) -> tuple[dict[str, Any], Any, ActorCriticSpec]:
+    require_checkpoint_path(path)
     payload = load_checkpoint(path)
     return _checkpoint_payload_params(payload, jax=jax)
 
@@ -203,141 +207,70 @@ def _param(training_params: dict[str, Any], key: str, default: Any = None) -> An
     return default
 
 
-_JAX_STATIC_ONLY_ENV_KEYS = {
+_JAX_EVALUATION_CONTRACT_FIELDS = (
+    "court_rows",
+    "court_cols",
+    "players",
+    "shot_clock",
+    "normalize_obs",
     "enable_rebounds",
-    "rebound_table_model_dir",
-    "rebound_target_temperature",
-    "rebound_target_uniform_mix",
-    "rebound_winner_distance_weight",
-    "rebound_basket_position_weight",
-    "rebound_winner_temperature",
-    "rebound_skill_std",
-    "rebound_skill_sampling_mode",
-    "rebound_skill_high",
-    "rebound_skill_low",
-    "rebound_skill_weight",
-    "rebound_contest_mode",
-    "rebound_contest_radius",
     "rebound_obs_top_n_targets",
-    "offensive_rebound_shot_clock_reset",
-    "rebound_terminal_reward_mode",
-    "enable_rebound_reward_redistribution",
-    "offensive_rebound_reward_advance",
-    "rebound_reward_once_per_possession",
     "enable_multi_possession",
-    "multi_possession_limit",
-    "multi_possession_limit_start",
-    "multi_possession_limit_end",
-    "multi_possession_limit_ramp_updates",
-    "multi_possession_overtime_round_cap",
-    "multi_possession_reward_mode",
-    "score_potential_scale",
-    "game_winner_reward",
-    "multi_possession_aux_rewards_enabled",
+    "multi_possession_schema_version",
     "multi_possession_use_inbounds",
     "made_basket_restart_mode",
-    "multi_possession_schema_version",
-    "inbound_deadline_steps",
-    "check_deadline_steps",
-    "check_setup_steps",
     "check_clearance",
-    "random_check_location",
-}
-
-_JAX_STATIC_ONLY_ENV_DEFAULTS = {
-    "enable_rebounds": False,
-    "rebound_table_model_dir": "",
-    "rebound_target_temperature": 1.0,
-    "rebound_target_uniform_mix": 0.0,
-    "rebound_winner_distance_weight": 1.0,
-    "rebound_basket_position_weight": 0.0,
-    "rebound_winner_temperature": 1.0,
-    "rebound_skill_std": 0.0,
-    "rebound_skill_sampling_mode": "gaussian",
-    "rebound_skill_high": 1.0,
-    "rebound_skill_low": -0.25,
-    "rebound_skill_weight": 0.0,
-    "rebound_contest_mode": "global_contest",
-    "rebound_contest_radius": 1,
-    "rebound_obs_top_n_targets": 0,
-    "offensive_rebound_shot_clock_reset": 14,
-    "rebound_terminal_reward_mode": "actual_points",
-    "enable_rebound_reward_redistribution": False,
-    "offensive_rebound_reward_advance": 0.4,
-    "rebound_reward_once_per_possession": True,
-    "enable_multi_possession": False,
-    "multi_possession_limit": 25,
-    "multi_possession_limit_start": None,
-    "multi_possession_limit_end": None,
-    "multi_possession_limit_ramp_updates": 0,
-    "multi_possession_overtime_round_cap": 0,
-    "multi_possession_reward_mode": "win_loss",
-    "score_potential_scale": 1.0,
-    "game_winner_reward": 0.0,
-    "multi_possession_aux_rewards_enabled": False,
-    "multi_possession_use_inbounds": True,
-    "made_basket_restart_mode": "baseline_inbound",
-    "multi_possession_schema_version": MULTI_POSSESSION_SCHEMA_VERSION,
-    "inbound_deadline_steps": 5,
-    "check_deadline_steps": 5,
-    "check_setup_steps": 0,
-    "check_clearance": 0,
-    "random_check_location": False,
-}
-
-_JAX_STATIC_ONLY_ENV_CASTS = {
-    "enable_rebounds": "bool",
-    "rebound_table_model_dir": "str",
-    "rebound_target_temperature": "float",
-    "rebound_target_uniform_mix": "float",
-    "rebound_winner_distance_weight": "float",
-    "rebound_basket_position_weight": "float",
-    "rebound_winner_temperature": "float",
-    "rebound_skill_std": "float",
-    "rebound_skill_sampling_mode": "str",
-    "rebound_skill_high": "float",
-    "rebound_skill_low": "float",
-    "rebound_skill_weight": "float",
-    "rebound_contest_mode": "str",
-    "rebound_contest_radius": "int",
-    "rebound_obs_top_n_targets": "int",
-    "offensive_rebound_shot_clock_reset": "int",
-    "rebound_terminal_reward_mode": "str",
-    "enable_rebound_reward_redistribution": "bool",
-    "offensive_rebound_reward_advance": "float",
-    "rebound_reward_once_per_possession": "bool",
-    "enable_multi_possession": "bool",
-    "multi_possession_limit": "int",
-    "multi_possession_limit_start": "int",
-    "multi_possession_limit_end": "int",
-    "multi_possession_limit_ramp_updates": "int",
-    "multi_possession_overtime_round_cap": "int",
-    "multi_possession_reward_mode": "str",
-    "score_potential_scale": "float",
-    "game_winner_reward": "float",
-    "multi_possession_aux_rewards_enabled": "bool",
-    "multi_possession_use_inbounds": "bool",
-    "made_basket_restart_mode": "str",
-    "multi_possession_schema_version": "int",
-    "inbound_deadline_steps": "int",
-    "check_deadline_steps": "int",
-    "check_setup_steps": "int",
-    "check_clearance": "int",
-    "random_check_location": "bool",
-}
+    "episode_end_mode",
+    "game_clock_seconds",
+    "overtime_seconds",
+)
 
 
-def _coerce_runtime_static_value(key: str, value: Any) -> Any:
-    kind = _JAX_STATIC_ONLY_ENV_CASTS.get(key)
-    if kind == "bool":
-        return _coerce_bool(value)
-    if kind == "float":
-        return _coerce_float(value)
-    if kind == "int":
-        return _coerce_int(value)
-    if kind == "str":
-        return str(value)
-    return value
+def _resolve_native_environment_config(
+    *,
+    required_params: Mapping[str, Any],
+    optional_params: Mapping[str, Any] | None,
+    unified_payload: Mapping[str, Any],
+    opponent_payload: Mapping[str, Any] | None = None,
+) -> JaxEnvironmentConfig:
+    """Resolve explicit eval overrides on top of checkpoint-owned semantics.
+
+    When historical-opponent evaluation uses two checkpoints, both contracts
+    receive the same explicit overrides and must agree on observation and game
+    semantics before either policy is executed.
+    """
+    resolved = normalize_runtime_environment_config(
+        JaxEnvironmentConfig.from_evaluation_request(
+            required_params,
+            optional_params,
+            checkpoint_metadata=unified_payload,
+        )
+    )
+    if opponent_payload is None or opponent_payload is unified_payload:
+        return resolved
+    opponent = normalize_runtime_environment_config(
+        JaxEnvironmentConfig.from_evaluation_request(
+            required_params,
+            optional_params,
+            checkpoint_metadata=opponent_payload,
+        )
+    )
+    mismatches = {
+        field: (getattr(resolved, field), getattr(opponent, field))
+        for field in _JAX_EVALUATION_CONTRACT_FIELDS
+        if getattr(resolved, field) != getattr(opponent, field)
+    }
+    if mismatches:
+        details = ", ".join(
+            f"{field}={left!r}/{right!r}"
+            for field, (left, right) in sorted(mismatches.items())
+        )
+        raise ValueError(
+            "JAX checkpoint environment metadata is incompatible for historical "
+            f"opponent evaluation: {details}. Supply explicit evaluation overrides "
+            "only when both policies support the requested contract."
+        )
+    return resolved
 
 
 def _infer_attention_observation_dims(
@@ -717,67 +650,12 @@ def _apply_native_profile_rows(
     return state._replace(**updates)
 
 
-def _jax_static_env_params_from_payload(*payloads: dict[str, Any]) -> dict[str, Any]:
-    """Extract JAX kernel-only env attrs from checkpoint metadata."""
-    out: dict[str, Any] = {}
-    explicit_restart_mode = False
-    for payload in payloads:
-        if not isinstance(payload, dict):
-            continue
-        sources = (
-            payload.get("frozen_config"),
-            payload.get("env_config"),
-            payload.get("trainer_config"),
-        )
-        if any(isinstance(source, dict) for source in sources[:2]):
-            for key, value in _JAX_STATIC_ONLY_ENV_DEFAULTS.items():
-                out.setdefault(key, value)
-        for source in sources:
-            if not isinstance(source, dict):
-                continue
-            for key in _JAX_STATIC_ONLY_ENV_KEYS:
-                if key in source and source[key] not in (None, ""):
-                    out[key] = _coerce_runtime_static_value(key, source[key])
-                    if key == "made_basket_restart_mode":
-                        explicit_restart_mode = True
-                    continue
-                if key == "rebound_contest_radius":
-                    for old_key in ("rebound_contest_initial_radius",):
-                        if old_key in source and source[old_key] not in (None, ""):
-                            out[key] = _coerce_runtime_static_value(
-                                key, source[old_key]
-                            )
-                            break
-    if not explicit_restart_mode and out:
-        out["made_basket_restart_mode"] = (
-            "baseline_inbound"
-            if bool(out.get("multi_possession_use_inbounds", True))
-            else "direct_handoff"
-        )
-    return out
-
-
-def _split_native_env_params(
-    optional_params: dict[str, Any] | None,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    params = dict(optional_params or {})
-    env_kwargs = {
-        key: value
-        for key, value in params.items()
-        if key not in _JAX_STATIC_ONLY_ENV_KEYS
-    }
-    static_overrides = {
-        key: _coerce_runtime_static_value(key, value)
-        for key, value in params.items()
-        if key in _JAX_STATIC_ONLY_ENV_KEYS
-    }
-    return env_kwargs, static_overrides
-
-
 def _native_eval_horizon(
     env, training_params: dict[str, Any] | None, payload: dict[str, Any]
 ) -> int:
-    shot_clock_steps = int(getattr(env, "shot_clock_steps", 24))
+    shot_clock_steps = int(
+        getattr(env, "shot_clock_steps", getattr(env, "shot_clock", 24))
+    )
     params = dict(training_params or {})
     payload_config = (
         payload.get("trainer_config") if isinstance(payload, dict) else None
@@ -794,6 +672,8 @@ def _native_eval_horizon(
         )
         horizon = max(horizon, shot_clock_steps + 3 * reset_steps + 2)
     if bool(getattr(env, "enable_multi_possession", False)):
+        if str(getattr(env, "episode_end_mode", "possessions")) == "game_clock":
+            return max(1, int(getattr(env, "game_clock_max_total_steps", 10_000)))
         # A continuous game needs room for every possession, including a
         # dead-ball inbound. This is a completion guard, not a declaration
         # that reaching the cutoff is a tie or a valid completed game.
@@ -3036,20 +2916,14 @@ def run_native_jax_evaluation(
         intent_selection_mode=intent_selection_mode,
     )
 
-    env_kwargs, static_overrides = _split_native_env_params(optional_params)
-    static_params = _jax_static_env_params_from_payload(
-        unified_payload, opponent_payload
-    )
-    static_params.update(static_overrides)
     _emit_progress_event("environment_building")
-    env = basketworld.HexagonBasketballEnv(
-        **required_params,
-        **env_kwargs,
-        render_mode=None,
+    config = _resolve_native_environment_config(
+        required_params=required_params,
+        optional_params=optional_params,
+        unified_payload=unified_payload,
+        opponent_payload=opponent_payload,
     )
-    for key, value in static_params.items():
-        setattr(env, key, value)
-    static = build_kernel_static_from_env(env, jnp)
+    static = build_kernel_static_from_config(config, jnp)
     static_multi = bool(
         int(np.asarray(jax.device_get(static.enable_multi_possession)).reshape(-1)[0])
     )
@@ -3140,7 +3014,7 @@ def run_native_jax_evaluation(
     eval_task_reward_scale = float(
         static_task_reward_scale * scheduled_task_reward_scale
     )
-    horizon = _native_eval_horizon(env, training_params, unified_payload)
+    horizon = _native_eval_horizon(config, training_params, unified_payload)
     value_discount_gamma = max(
         0.0,
         _coerce_float(
@@ -3158,9 +3032,9 @@ def run_native_jax_evaluation(
     )
     batch_size = max(1, min(int(num_episodes), requested_batch_size))
 
-    n_players = int(getattr(env, "n_players", 0))
-    offense_ids = [int(pid) for pid in getattr(env, "offense_ids", [])]
-    defense_ids = [int(pid) for pid in getattr(env, "defense_ids", [])]
+    n_players = int(config.players) * 2
+    offense_ids = list(range(int(config.players)))
+    defense_ids = list(range(int(config.players), n_players))
     if fixed_pool_mode and (
         n_players != 10 or len(offense_ids) != 5 or len(defense_ids) != 5
     ):
@@ -3184,12 +3058,12 @@ def run_native_jax_evaluation(
     user_team_ids = offense_ids if user_team == Team.OFFENSE else defense_ids
     user_team_ids_set = set(user_team_ids)
     offense_sign = 1.0 if user_team == Team.OFFENSE else -1.0
-    pass_reward = float(getattr(env, "pass_reward", 0.0) or 0.0)
-    violation_reward = float(getattr(env, "violation_reward", 0.0) or 0.0)
-    potential_assist_pct = float(getattr(env, "potential_assist_pct", 0.0) or 0.0)
-    full_assist_bonus_pct = float(getattr(env, "full_assist_bonus_pct", 0.0) or 0.0)
-    shot_clock_steps = int(getattr(env, "shot_clock_steps", horizon))
-    three_point_distance = float(getattr(env, "three_point_distance", 4.0))
+    pass_reward = float(config.pass_reward or 0.0)
+    violation_reward = float(config.violation_reward or 0.0)
+    potential_assist_pct = float(config.potential_assist_pct or 0.0)
+    full_assist_bonus_pct = float(config.full_assist_bonus_pct or 0.0)
+    shot_clock_steps = int(config.shot_clock)
+    three_point_distance = float(config.three_point_distance)
 
     results: list[dict[str, Any]] = []
     fixed_pool_possession_events: list[dict[str, Any]] = []
@@ -3201,7 +3075,7 @@ def run_native_jax_evaluation(
         jax.device_get(static.basket_position), dtype=np.int32
     )
     eval_rebound_contest_mode = (
-        str(getattr(env, "rebound_contest_mode", "global_contest") or "global_contest")
+        str(config.rebound_contest_mode or "global_contest")
         .strip()
         .lower()
         .replace("-", "_")
@@ -3211,7 +3085,7 @@ def run_native_jax_evaluation(
         eval_rebound_contest_mode = "global_contest"
     else:
         eval_rebound_contest_mode = "local_contest"
-    eval_rebound_contest_radius = max(0, int(getattr(env, "rebound_contest_radius", 1)))
+    eval_rebound_contest_radius = max(0, int(config.rebound_contest_radius))
 
     def _static_float_for_eval(name: str, default: float) -> float:
         try:
@@ -4635,9 +4509,9 @@ def run_native_jax_evaluation(
                     rebound_diag[key_name] = (
                         rebound_diag.get(key_name, 0) or 0
                     ) + value
-            if bool(getattr(env, "enable_rebounds", False)):
+            if bool(config.enable_rebounds):
                 rebound_reward_mode = str(
-                    getattr(env, "rebound_terminal_reward_mode", "actual_points")
+                    config.rebound_terminal_reward_mode
                     or "actual_points"
                 )
                 scored_points = shot_values * shot_success_flags.astype(np.float32)
@@ -5301,7 +5175,11 @@ def run_native_jax_evaluation(
         "mode": "native_compiled",
         "num_episodes": int(num_episodes),
         "eval_seed": int(eval_seed),
-        "allow_dunks": bool(getattr(env, "allow_dunks", False)),
+        "allow_dunks": bool(config.allow_dunks),
+        "environment_contract": {
+            field: getattr(config, field)
+            for field in _JAX_EVALUATION_CONTRACT_FIELDS
+        },
         "batch_size": int(batch_size),
         "horizon": int(horizon),
         "elapsed_sec": float(elapsed),

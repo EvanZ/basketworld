@@ -170,6 +170,10 @@ def test_native_eval_horizon_includes_regulation_and_capped_paired_overtime():
     env.multi_possession_overtime_round_cap = 1
     assert _native_eval_horizon(env, {}, {}) == 2 * (3 + 1) * 33
 
+    env.episode_end_mode = "game_clock"
+    env.game_clock_max_total_steps = 41
+    assert _native_eval_horizon(env, {}, {}) == 41
+
 
 def test_native_eval_pairs_reset_rows_with_swapped_starting_teams_without_moving_players():
     static = _multi_possession_static(players=2, possession_limit=3)
@@ -296,7 +300,7 @@ def test_fixed_pool_profile_rows_and_scheduled_starters_preserve_stable_slots():
     )
 
 
-def test_native_jax_evaluation_returns_stats_tab_payload(tmp_path):
+def test_native_historical_opponent_evaluation_returns_stats_tab_payload(tmp_path):
     pytest.importorskip("jax")
 
     checkpoint_dir = tmp_path / "native_eval_ckpts"
@@ -328,7 +332,7 @@ def test_native_jax_evaluation_returns_stats_tab_payload(tmp_path):
 
     assert can_run_native_jax_evaluation(
         unified_policy_path=checkpoint_path,
-        opponent_policy_path=None,
+        opponent_policy_path=checkpoint_path,
         custom_setup=None,
         randomize_offense_permutation=False,
     )
@@ -340,7 +344,7 @@ def test_native_jax_evaluation_returns_stats_tab_payload(tmp_path):
         required_params={},
         optional_params=_native_eval_env_params(),
         unified_policy_path=checkpoint_path,
-        opponent_policy_path=None,
+        opponent_policy_path=checkpoint_path,
         user_team_name="OFFENSE",
         role_flag_offense=1.0,
         role_flag_defense=-1.0,
@@ -571,6 +575,79 @@ def test_native_multi_possession_evaluation_pairs_starters_and_separates_cutoffs
             )
         if not episode["completed"]:
             assert episode["game"]["result"] is None
+
+
+def test_native_game_clock_evaluation_uses_checkpoint_environment_contract(tmp_path):
+    checkpoint_dir = tmp_path / "native_game_clock_eval_ckpts"
+    args = parse_args(
+        [
+            "--run-train-loop",
+            "--players",
+            "1",
+            "--court-rows",
+            "9",
+            "--court-cols",
+            "8",
+            "--enable-multi-possession",
+            "--multi-possession-limit",
+            "1",
+            "--episode-end-mode",
+            "game_clock",
+            "--game-clock-seconds",
+            "3",
+            "--overtime-seconds",
+            "2",
+            "--game-clock-max-total-steps",
+            "20",
+            "--inbound-deadline-steps",
+            "2",
+            "--kernel-batch-size",
+            "1",
+            "--rollout-horizon",
+            "1",
+            "--policy-update-epochs",
+            "1",
+            "--ppo-minibatches",
+            "1",
+            "--num-updates",
+            "1",
+            "--eval-every-updates",
+            "0",
+            "--eval-deploy-every-updates",
+            "0",
+            "--eval-deploy-batches",
+            "0",
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "--checkpoint-every-updates",
+            "1",
+            "--no-progress",
+        ]
+    )
+    validate_train_args(args)
+    checkpoint_path = run_training_loop(args)["latest_checkpoint_path"]
+
+    result = run_native_jax_evaluation(
+        num_episodes=2,
+        player_deterministic=True,
+        opponent_deterministic=True,
+        required_params={},
+        optional_params={},
+        unified_policy_path=checkpoint_path,
+        opponent_policy_path=None,
+        user_team_name="OFFENSE",
+        role_flag_offense=1.0,
+        role_flag_defense=-1.0,
+        eval_seed=717,
+    )
+
+    summary = result["eval_diagnostics"]["jax_native_summary"]
+    assert len(result["results"]) == 2
+    assert summary["multi_possession_enabled"] is True
+    assert summary["horizon"] == 20
+    assert summary["environment_contract"]["episode_end_mode"] == "game_clock"
+    assert summary["environment_contract"]["game_clock_seconds"] == 3
+    assert summary["environment_contract"]["overtime_seconds"] == 2
 
 
 def test_native_fixed_pool_evaluation_uses_scheduled_profiles_and_rng_streams(tmp_path):

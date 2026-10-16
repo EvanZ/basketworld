@@ -45,9 +45,24 @@ indices, template arrays, and all rule constants without constructing a Gym
 environment.
 
 `build_kernel_static_from_env(...)` remains temporarily as a parity adapter for
-unmigrated callers. Issue #70 migrates evaluation and inference, and #71
-migrates the interactive runtime and rendering. Issue #72 removes the adapter
-and retired runtime after those migrations.
+tests and interactive callers covered by #71. Native deploy, historical
+opponent, fixed-pool, Skill Ratings, and checkpoint inference construction use
+`build_kernel_static_from_config(...)`. Issue #72 removes the adapter and
+retired runtime after the interactive migration.
+
+## Evaluation and inference
+
+Native evaluation resolves one `JaxEnvironmentConfig` from checkpoint/MLflow
+metadata plus explicit request overrides. Historical checkpoint pairs are
+cross-validated for court, player, observation, possession, check, and clock
+semantics before execution. Fixed-pool and Skill Ratings studies recover the
+same typed contract directly from checkpoint metadata.
+
+`JAXInferenceModel` builds role-specific static state from checkpoint metadata
+and can prepare directly from a JAX state snapshot mapping. Supported public
+evaluation and inference loaders accept Orbax checkpoint directories with
+`metadata.json` and `state/`; SB3/PyTorch artifacts receive an explicit
+unsupported-format error.
 
 ## Reset and training construction
 
@@ -67,6 +82,8 @@ constructor no longer accepts or validates those fields.
 
 JAX checkpoints are the only supported checkpoint format. Configuration and
 MLflow metadata names remain stable unless a versioned migration explicitly
-changes them. During the unwind, deterministic tests compare the JAX-owned
-static output against the legacy implementation; the legacy implementation is
-a temporary oracle, not a supported final runtime.
+changes them. Additive multi-possession checkpoint schemas 2, 3, and 4 are
+normalized to runtime schema 4; check-clearance schema 5 remains strict. During
+the unwind, deterministic tests compare the JAX-owned static output against the
+legacy implementation; the legacy implementation is a temporary oracle, not a
+supported final runtime.

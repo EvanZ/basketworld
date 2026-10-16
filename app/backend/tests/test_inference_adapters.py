@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 import app.backend.inference_adapters as adapters
+from basketworld_jax.inference import UnsupportedCheckpointFormatError
 from app.backend.inference_adapters import (
     InferencePolicyAdapter,
     JAXInferenceAdapter,
@@ -188,6 +191,14 @@ def test_generic_loader_detects_jax_checkpoint(tmp_path, monkeypatch):
 
     loaded = adapters.load_inference_policy(str(checkpoint_dir))
     assert loaded is sentinel
+
+
+def test_generic_loader_rejects_sb3_artifact(tmp_path):
+    artifact = tmp_path / "policy.zip"
+    artifact.write_bytes(b"sb3")
+
+    with pytest.raises(UnsupportedCheckpointFormatError, match="SB3/PyTorch"):
+        adapters.load_inference_policy(str(artifact))
 
 
 def test_get_policy_metadata_returns_adapter_metadata():

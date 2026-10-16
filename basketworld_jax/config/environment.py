@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 import math
 from os import PathLike
 from typing import Any, Mapping
@@ -405,9 +405,28 @@ def build_static_environment(config: JaxEnvironmentConfig) -> JaxStaticEnvironme
     return JaxStaticEnvironment(config)
 
 
+def normalize_runtime_environment_config(
+    config: JaxEnvironmentConfig,
+) -> JaxEnvironmentConfig:
+    """Map supported additive checkpoint schemas to the current JAX runtime."""
+    if not bool(config.enable_multi_possession):
+        return config
+    runtime_schema = 5 if int(config.check_clearance) > 0 else 4
+    saved_schema = config.multi_possession_schema_version
+    compatible = {5} if runtime_schema == 5 else {2, 3, 4}
+    if saved_schema is not None and int(saved_schema) not in compatible:
+        raise ValueError(
+            "Unsupported JAX environment observation schema "
+            f"{saved_schema}; runtime schema {runtime_schema} accepts "
+            f"{sorted(compatible)}."
+        )
+    return replace(config, multi_possession_schema_version=runtime_schema)
+
+
 __all__ = [
     "HEX_DIRECTIONS",
     "JaxEnvironmentConfig",
     "JaxStaticEnvironment",
     "build_static_environment",
+    "normalize_runtime_environment_config",
 ]

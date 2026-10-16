@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 from basketworld.domain import Team
 
 from basketworld_jax.checkpoints import load_checkpoint
+from basketworld_jax.config import (
+    JaxEnvironmentConfig,
+    normalize_runtime_environment_config,
+)
 from basketworld_jax.env.minimal import (
+    CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION,
+    MULTI_POSSESSION_SCHEMA_VERSION,
     build_action_masks_batch,
-    build_kernel_static_from_env,
+    build_kernel_static_from_config,
     build_policy_intent_context_batch,
     build_policy_observation_batch,
     build_token_observation_components_batch,
@@ -26,6 +33,10 @@ from basketworld_jax.train.cli import ensure_jax_available
 
 METADATA_FILENAME = "metadata.json"
 STATE_SUBDIR = "state"
+
+
+class UnsupportedCheckpointFormatError(ValueError):
+    """Raised when a supported JAX inference path receives another artifact."""
 
 
 def _adapt_observation_to_checkpoint(flat_obs, static, spec, jnp):
@@ -78,8 +89,25 @@ def is_checkpoint_path(path: str | Path) -> bool:
     ).exists()
 
 
+def require_checkpoint_path(path: str | Path) -> Path:
+    checkpoint_path = Path(path)
+    if not is_checkpoint_path(checkpoint_path):
+        raise UnsupportedCheckpointFormatError(
+            f"Unsupported checkpoint format at {checkpoint_path}. "
+            "JAX checkpoint directories containing metadata.json and state/ are required; "
+            "SB3/PyTorch artifacts are not supported."
+        )
+    return checkpoint_path
+
+
 class JAXInferenceModel:
-    def __init__(self, checkpoint_path: str | Path) -> None:
+    def __init__(
+        self,
+        checkpoint_path: str | Path,
+        *,
+        environment_overrides: Mapping[str, Any] | None = None,
+    ) -> None:
+        checkpoint_path = require_checkpoint_path(checkpoint_path)
         self.checkpoint_path = str(checkpoint_path)
         self.jax, self.jnp = ensure_jax_available("basketworld_jax/inference/policy.py")
         payload = load_checkpoint(checkpoint_path)
@@ -96,6 +124,47 @@ class JAXInferenceModel:
             "last_metrics": dict(payload.get("last_metrics", {}) or {}),
             "checkpoint_version": int(payload.get("checkpoint_version", 0)),
         }
+        self.environment_config = normalize_runtime_environment_config(
+            JaxEnvironmentConfig.from_evaluation_request(
+                {},
+                environment_overrides,
+                checkpoint_metadata=payload,
+            )
+        )
+        config_multi = bool(self.environment_config.enable_multi_possession)
+        spec_multi = bool(getattr(self.spec, "multi_possession_features", False))
+        if config_multi != spec_multi:
+            raise ValueError(
+                "JAX checkpoint policy_spec and environment metadata disagree on "
+                f"multi-possession observations (policy={spec_multi}, environment={config_multi})."
+            )
+        if config_multi:
+            runtime_schema = int(
+                self.environment_config.multi_possession_schema_version
+                or (
+                    CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION
+                    if int(self.environment_config.check_clearance) > 0
+                    else MULTI_POSSESSION_SCHEMA_VERSION
+                )
+            )
+            checkpoint_schema = int(
+                getattr(self.spec, "observation_schema_version", 1)
+            )
+            compatible = (
+                {int(CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION)}
+                if int(self.environment_config.check_clearance) > 0
+                else {2, 3, int(MULTI_POSSESSION_SCHEMA_VERSION)}
+            )
+            if runtime_schema != (
+                int(CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION)
+                if int(self.environment_config.check_clearance) > 0
+                else int(MULTI_POSSESSION_SCHEMA_VERSION)
+            ) or checkpoint_schema not in compatible:
+                raise ValueError(
+                    "JAX checkpoint policy_spec and environment metadata use "
+                    "incompatible observation schemas "
+                    f"(policy={checkpoint_schema}, environment={runtime_schema})."
+                )
         for key in (
             "play_name_metadata",
             "play_name_map",
@@ -107,7 +176,7 @@ class JAXInferenceModel:
         self._prepared_env = None
         self._prepared_observer_is_offense = True
         self._sample_key = self.jax.random.PRNGKey(0)
-        self._static_cache: dict[tuple[int, bool], Any] = {}
+        self._static_cache: dict[bool, Any] = {}
         self._last_team_outputs: dict[str, Any] | None = None
         self._masked_runner = self._build_masked_runner()
         self._selector_runner = self._build_selector_runner()
@@ -162,20 +231,15 @@ class JAXInferenceModel:
     def _resolve_base_env(self, env):
         return getattr(env, "unwrapped", env)
 
-    def _build_static_for_role(self, env, observer_is_offense: bool):
-        base_env = self._resolve_base_env(env)
-        cache_key = (id(base_env), bool(observer_is_offense))
+    def _build_static_for_role(self, observer_is_offense: bool):
+        cache_key = bool(observer_is_offense)
         cached = self._static_cache.get(cache_key)
         if cached is not None:
             return cached
 
         desired_team = Team.OFFENSE if bool(observer_is_offense) else Team.DEFENSE
-        original_team = getattr(base_env, "training_team", Team.OFFENSE)
-        try:
-            base_env.training_team = desired_team
-            static = build_kernel_static_from_env(base_env, self.jnp)
-        finally:
-            base_env.training_team = original_team
+        role_config = replace(self.environment_config, training_team=desired_team)
+        static = build_kernel_static_from_config(role_config, self.jnp)
 
         self._static_cache[cache_key] = static
         return static
@@ -183,8 +247,7 @@ class JAXInferenceModel:
     def _state_from_snapshot(self, snapshot):
         return stack_state_snapshots([snapshot], self.jnp)
 
-    def _snapshot_cache_key(self, env, observer_is_offense: bool, snapshot: dict[str, Any]):
-        base_env = self._resolve_base_env(env)
+    def _snapshot_cache_key(self, source, observer_is_offense: bool, snapshot: dict[str, Any]):
         array_keys = (
             "positions",
             "offense_lane_steps",
@@ -225,21 +288,36 @@ class JAXInferenceModel:
         )
         arrays = tuple(np.asarray(snapshot[key]).tobytes() for key in array_keys)
         scalars = tuple(snapshot[key] for key in scalar_keys)
-        return (id(base_env), bool(observer_is_offense), arrays, scalars)
+        return (id(source), bool(observer_is_offense), arrays, scalars)
 
-    def prepare_for_role(self, env, *, observer_is_offense: bool) -> None:
+    def _snapshot_from_source(self, source) -> dict[str, Any]:
+        if isinstance(source, Mapping):
+            return dict(source)
+        if callable(source):
+            snapshot = source()
+            if not isinstance(snapshot, Mapping):
+                raise TypeError("JAX inference state providers must return a state snapshot mapping.")
+            return dict(snapshot)
+        return snapshot_state_from_env(self._resolve_base_env(source))
+
+    def prepare_for_role(self, env=None, *, observer_is_offense: bool) -> None:
         self._prepared_env = env
         self._prepared_observer_is_offense = bool(observer_is_offense)
-        self._build_static_for_role(env, observer_is_offense)
+        self._build_static_for_role(observer_is_offense)
+
+    def prepare_for_snapshot(
+        self, snapshot: Mapping[str, Any], *, observer_is_offense: bool
+    ) -> None:
+        """Prepare inference directly from a JAX state snapshot mapping."""
+        self.prepare_for_role(dict(snapshot), observer_is_offense=observer_is_offense)
 
     def _team_outputs(self, env, observer_is_offense: bool):
-        base_env = self._resolve_base_env(env)
-        snapshot = snapshot_state_from_env(base_env)
+        snapshot = self._snapshot_from_source(env)
         cache_key = self._snapshot_cache_key(env, observer_is_offense, snapshot)
         if self._last_team_outputs is not None and self._last_team_outputs.get("key") == cache_key:
             return self._last_team_outputs["masked_out"]
 
-        static = self._build_static_for_role(env, observer_is_offense)
+        static = self._build_static_for_role(observer_is_offense)
         state = self._state_from_snapshot(snapshot)
         flat_obs = build_policy_observation_batch(
             static,
@@ -276,9 +354,8 @@ class JAXInferenceModel:
         return masked_out
 
     def observation_vector(self, env, *, observer_is_offense: bool):
-        base_env = self._resolve_base_env(env)
-        static = self._build_static_for_role(env, observer_is_offense)
-        state = self._state_from_snapshot(snapshot_state_from_env(base_env))
+        static = self._build_static_for_role(observer_is_offense)
+        state = self._state_from_snapshot(self._snapshot_from_source(env))
         flat_obs = build_policy_observation_batch(
             static,
             state,
@@ -302,9 +379,8 @@ class JAXInferenceModel:
     def observation_tokens(self, env, *, observer_is_offense: bool):
         if str(self.spec.model_type) != "attention":
             return None
-        base_env = self._resolve_base_env(env)
-        static = self._build_static_for_role(env, observer_is_offense)
-        state = self._state_from_snapshot(snapshot_state_from_env(base_env))
+        static = self._build_static_for_role(observer_is_offense)
+        state = self._state_from_snapshot(self._snapshot_from_source(env))
         players, globals_vec, _ = build_token_observation_components_batch(
             static,
             state,
@@ -414,9 +490,10 @@ class JAXInferenceModel:
     def get_intent_selector_outputs(self, obs=None):
         if not self.has_intent_selector() or self._prepared_env is None:
             return None, None
-        base_env = self._resolve_base_env(self._prepared_env)
-        static = self._build_static_for_role(base_env, observer_is_offense=True)
-        state = self._state_from_snapshot(snapshot_state_from_env(base_env))
+        static = self._build_static_for_role(observer_is_offense=True)
+        state = self._state_from_snapshot(
+            self._snapshot_from_source(self._prepared_env)
+        )
         flat_obs = build_policy_observation_batch(
             static,
             state,
@@ -451,14 +528,13 @@ class JAXInferenceModel:
         if weights.ndim != 3 or weights.shape[0] <= 0 or weights.shape[1] <= 0:
             return None
 
-        base_env = self._resolve_base_env(env)
-        static = self._build_static_for_role(env, observer_is_offense)
-        state = self._state_from_snapshot(snapshot_state_from_env(base_env))
+        static = self._build_static_for_role(observer_is_offense)
+        state = self._state_from_snapshot(self._snapshot_from_source(env))
         intent_context = build_policy_intent_context_batch(static, state, self.jnp)
         intent_index = np.asarray(self.jax.device_get(intent_context["intent_index"]), dtype=np.int32)
         intent_gate = np.asarray(self.jax.device_get(intent_context["intent_gate"]), dtype=np.float32)
-        offense_ids = set(int(pid) for pid in getattr(base_env, "offense_ids", []) or [])
-        defense_ids = set(int(pid) for pid in getattr(base_env, "defense_ids", []) or [])
+        offense_ids = set(int(pid) for pid in np.asarray(static.offense_ids).tolist())
+        defense_ids = set(int(pid) for pid in np.asarray(static.defense_ids).tolist())
         labels: list[str] = []
         for pid in range(int(self.spec.token_player_count)):
             if pid in offense_ids:
@@ -497,7 +573,10 @@ class JAXInferenceModel:
         }
 
 
-def load_inference_model(path: str | Path) -> JAXInferenceModel:
-    if not is_checkpoint_path(path):
-        raise FileNotFoundError(f"Not a JAX checkpoint directory: {path}")
-    return JAXInferenceModel(path)
+def load_inference_model(
+    path: str | Path,
+    *,
+    environment_overrides: Mapping[str, Any] | None = None,
+) -> JAXInferenceModel:
+    require_checkpoint_path(path)
+    return JAXInferenceModel(path, environment_overrides=environment_overrides)

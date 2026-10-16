@@ -8,7 +8,6 @@ to acquire fixed-pool artifacts unless the study was explicitly requested.
 from __future__ import annotations
 
 from contextlib import nullcontext
-import inspect
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,10 +15,9 @@ from threading import Lock
 from time import perf_counter
 from typing import Any, Callable, Mapping, Sequence
 
-import basketworld
-
 from basketworld.utils.mlflow_config import setup_mlflow
 from basketworld_jax.checkpoints import load_checkpoint, load_checkpoint_metadata
+from basketworld_jax.config import JaxEnvironmentConfig
 from basketworld_jax.eval.fixed_pool import (
     PlayerPool,
     generate_player_pool,
@@ -41,10 +39,8 @@ from basketworld_jax.eval.lineup_schedule import (
     load_lineup_schedule,
     write_lineup_schedule,
 )
-from basketworld_jax.eval.native import (
-    _JAX_STATIC_ONLY_ENV_KEYS,
-    run_native_jax_evaluation,
-)
+from basketworld_jax.inference import require_checkpoint_path
+from basketworld_jax.eval.native import run_native_jax_evaluation
 from basketworld_jax.eval.skills import ACTIVE_PLAYER_SKILL_REGISTRY
 
 
@@ -128,6 +124,8 @@ def _parse_checkpoint_paths(args) -> list[Path]:
         raise FixedPoolStudyRunError(
             "Checkpoint paths do not exist: " + ", ".join(missing)
         )
+    for path in deduplicated:
+        require_checkpoint_path(path)
     return deduplicated
 
 
@@ -227,26 +225,14 @@ def _checkpoint_env_params(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Recover environment options recorded with a checkpoint for native eval."""
     payload = load_checkpoint_metadata(checkpoint_path)
-    signature = inspect.signature(basketworld.HexagonBasketballEnv.__init__)
-    accepted = (set(signature.parameters) - {"self", "render_mode"}) | set(
-        _JAX_STATIC_ONLY_ENV_KEYS
-    )
-    merged: dict[str, Any] = {}
-    for source_name in ("frozen_config", "env_config", "trainer_config"):
-        source = payload.get(source_name)
-        if isinstance(source, Mapping):
-            merged.update({str(key): value for key, value in source.items()})
-    optional_params = {
-        key: value
-        for key, value in merged.items()
-        if key in accepted and value is not None
-    }
+    config = JaxEnvironmentConfig.from_checkpoint_metadata(payload)
+    optional_params = config.as_metadata()
     # These are hard study constraints, not mutable evaluation settings.
-    if int(optional_params.get("players", 5) or 5) != 5:
+    if int(config.players) != 5:
         raise FixedPoolStudyRunError(
             "Fixed-pool studies require a 5v5 checkpoint/environment."
         )
-    if not bool(optional_params.get("enable_multi_possession", False)):
+    if not bool(config.enable_multi_possession):
         raise FixedPoolStudyRunError(
             "Fixed-pool studies require a multi-possession checkpoint/environment."
         )
