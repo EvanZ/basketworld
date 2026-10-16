@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from argparse import Namespace
+import inspect
 import json
 from pathlib import Path
 import subprocess
@@ -87,13 +88,13 @@ def test_jax_owned_static_multi_possession_modes_match_legacy_builder(mode):
         court_cols=16,
         render_mode=None,
         seed=0,
-        episode_end_mode=mode,
-        game_clock_seconds=17,
-        overtime_seconds=9,
     )
     overrides = {
         "enable_multi_possession": True,
         "multi_possession_limit": 4,
+        "episode_end_mode": mode,
+        "game_clock_seconds": 17,
+        "overtime_seconds": 9,
         "multi_possession_reward_mode": "scoring_events",
         "game_winner_reward": 2.0,
         "check_clearance": 1,
@@ -150,11 +151,18 @@ def test_environment_config_adapters_share_one_contract(tmp_path):
         episode_end_mode="game_clock",
         game_clock_seconds=300,
         overtime_seconds=120,
+        gamma=0.97,
+        reward_shaping_gamma=None,
+        phi_beta_start=0.4,
+        pass_oob_turnover_prob_start=0.25,
     )
     from_args = JaxEnvironmentConfig.from_args(args)
     assert from_args.training_team == "defense"
     assert from_args.players == 3
     assert from_args.episode_end_mode == "game_clock"
+    assert from_args.reward_shaping_gamma == 0.97
+    assert from_args.phi_beta == 0.4
+    assert from_args.pass_oob_turnover_prob == 0.25
 
     template_path = (
         Path(__file__).resolve().parents[1] / "configs" / "start_templates_v2.json"
@@ -224,6 +232,17 @@ def test_domain_types_keep_legacy_values_and_identity():
     assert LegacyActionType is ActionType
     assert LegacyTeam is Team
     assert [action.value for action in ActionType] == list(range(14))
+
+
+def test_legacy_environment_constructor_does_not_own_game_clock_configuration():
+    parameters = inspect.signature(HexagonBasketballEnv.__init__).parameters
+    for name in (
+        "episode_end_mode",
+        "game_clock_seconds",
+        "overtime_seconds",
+        "game_clock_max_total_steps",
+    ):
+        assert name not in parameters
 
 
 def test_jax_config_and_static_builder_import_without_legacy_or_sb3():

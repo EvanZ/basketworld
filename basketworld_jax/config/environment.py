@@ -225,6 +225,8 @@ class JaxEnvironmentConfig:
             "players_per_side": "players",
             "shot_clock_steps": "shot_clock",
             "offensive_three_seconds": "offensive_three_seconds_enabled",
+            "phi_beta_start": "phi_beta",
+            "pass_oob_turnover_prob_start": "pass_oob_turnover_prob",
         }
         for old, new in aliases.items():
             if new not in raw and old in raw:
@@ -242,7 +244,10 @@ class JaxEnvironmentConfig:
 
     @classmethod
     def from_args(cls, args: Any) -> "JaxEnvironmentConfig":
-        return cls.from_mapping(vars(args) if hasattr(args, "__dict__") else args)
+        raw = dict(vars(args) if hasattr(args, "__dict__") else args)
+        if raw.get("reward_shaping_gamma") is None and raw.get("gamma") is not None:
+            raw["reward_shaping_gamma"] = raw["gamma"]
+        return cls.from_mapping(raw)
 
     @classmethod
     def from_checkpoint_metadata(

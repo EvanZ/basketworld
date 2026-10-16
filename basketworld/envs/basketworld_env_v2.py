@@ -200,13 +200,6 @@ class HexagonBasketballEnv(gym.Env):
         start_template_mirror_prob: float = 0.5,
         start_template_strict: bool = False,
         assist_window: int = 2,
-        # Multi-possession episode boundary. The Python environment retains
-        # these values so the JAX kernel can choose possession or timed games
-        # without requiring a separate environment type.
-        episode_end_mode: str = "possessions",
-        game_clock_seconds: int = 300,
-        overtime_seconds: int = 120,
-        game_clock_max_total_steps: int = 10_000,
         # Illegal action resolution policy (see IllegalActionPolicy)
         illegal_action_policy: str = "noop",
         # If True, raise a clear error when an illegal action is passed to step()
@@ -237,24 +230,6 @@ class HexagonBasketballEnv(gym.Env):
         self.shot_clock_steps = int(shot_clock)
         # Minimum starting value when randomly initializing the shot clock at reset
         self.min_shot_clock = int(min_shot_clock)
-        normalized_episode_end_mode = str(episode_end_mode or "possessions").strip().lower()
-        if normalized_episode_end_mode not in {"possessions", "game_clock"}:
-            raise ValueError(
-                "episode_end_mode must be 'possessions' or 'game_clock'."
-            )
-        if int(game_clock_seconds) < 1:
-            raise ValueError("game_clock_seconds must be at least 1.")
-        if int(overtime_seconds) < 1:
-            raise ValueError("overtime_seconds must be at least 1.")
-        if int(game_clock_max_total_steps) < 1:
-            raise ValueError("game_clock_max_total_steps must be at least 1.")
-        self.episode_end_mode = normalized_episode_end_mode
-        self.game_clock_seconds = int(game_clock_seconds)
-        self.overtime_seconds = int(overtime_seconds)
-        # This guard includes stopped-clock setup/inbound steps. A generous
-        # default allows many overtime periods while still terminating a
-        # pathological restart loop explicitly.
-        self.game_clock_max_total_steps = int(game_clock_max_total_steps)
         self.training_team = training_team  # Which team is currently training
         self.render_mode = render_mode
         self.defender_pressure_distance = defender_pressure_distance

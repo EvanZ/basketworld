@@ -6,7 +6,8 @@ import pytest
 jax = pytest.importorskip("jax")
 import jax.numpy as jnp
 
-from basketworld.envs.basketworld_env_v2 import ActionType, HexagonBasketballEnv
+from basketworld.domain import ActionType
+from basketworld_jax.config import JaxEnvironmentConfig
 from basketworld_jax.env.minimal import (
     EPISODE_END_GAME_CLOCK,
     EPISODE_END_POSSESSIONS,
@@ -24,7 +25,7 @@ from basketworld_jax.env.minimal import (
     TURNOVER_REASON_INBOUND_TIMEOUT,
     TURNOVER_REASON_NONE,
     build_action_masks_batch,
-    build_kernel_static_from_env,
+    build_kernel_static_from_config,
     reset_batch_minimal,
     step_batch_minimal,
 )
@@ -39,14 +40,17 @@ def _static(
     max_steps: int = 10_000,
     winner_reward: float = 0.0,
 ):
-    env = HexagonBasketballEnv(
+    config = JaxEnvironmentConfig(
         players=players,
-        render_mode=None,
         episode_end_mode=mode,
         game_clock_seconds=regulation,
         overtime_seconds=overtime,
         game_clock_max_total_steps=max_steps,
-        pass_mode="pointer_targeted",
+        enable_multi_possession=True,
+        multi_possession_limit=2,
+        game_winner_reward=winner_reward,
+        check_deadline_steps=5,
+        check_setup_steps=2,
         defender_pressure_turnover_chance=0.0,
         base_steal_rate=0.0,
         illegal_defense_enabled=False,
@@ -56,12 +60,7 @@ def _static(
         three_pt_pct=1.0,
         allow_dunks=False,
     )
-    env.enable_multi_possession = True
-    env.multi_possession_limit = 2
-    env.game_winner_reward = winner_reward
-    env.check_deadline_steps = 5
-    env.check_setup_steps = 2
-    return build_kernel_static_from_env(env, jnp)
+    return build_kernel_static_from_config(config, jnp)
 
 
 def _reset(static, seed: int = 1):
@@ -131,22 +130,19 @@ def _inbound_state(static, state, *, countdown: int = 5):
 
 
 def test_game_clock_configuration_defaults_validation_and_possession_mode_parity():
-    defaults = HexagonBasketballEnv(players=1, render_mode=None)
+    defaults = JaxEnvironmentConfig(players=1)
     assert defaults.episode_end_mode == "possessions"
     assert defaults.game_clock_seconds == 300
     assert defaults.overtime_seconds == 120
     assert defaults.game_clock_max_total_steps == 10_000
 
     with pytest.raises(ValueError, match="episode_end_mode"):
-        HexagonBasketballEnv(players=1, render_mode=None, episode_end_mode="quarters")
+        JaxEnvironmentConfig(players=1, episode_end_mode="quarters")
     with pytest.raises(ValueError, match="game_clock_seconds"):
-        HexagonBasketballEnv(players=1, render_mode=None, game_clock_seconds=0)
+        JaxEnvironmentConfig(players=1, game_clock_seconds=0)
 
-    invalid = HexagonBasketballEnv(
-        players=1, render_mode=None, episode_end_mode="game_clock"
-    )
     with pytest.raises(ValueError, match="requires enable_multi_possession"):
-        build_kernel_static_from_env(invalid, jnp)
+        JaxEnvironmentConfig(players=1, episode_end_mode="game_clock")
 
     static = _static(mode="possessions", regulation=17, overtime=9)
     assert int(np.asarray(static.episode_end_mode)) == EPISODE_END_POSSESSIONS

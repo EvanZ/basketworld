@@ -22,7 +22,7 @@ human-readable summaries.
 
 ```mermaid
 flowchart TD
-    C[CLI and Python environment config] --> K[Compile KernelStatic tables]
+    C[CLI to JaxEnvironmentConfig] --> K[Compile KernelStatic tables]
     K --> R[reset_batch_minimal]
     R --> S[KernelState batch]
     S --> O[Packed observations and action masks]
@@ -57,19 +57,17 @@ Terminal rows can be reset inside the scan and continue producing samples.
 When single-episode mode is enabled, they remain inactive and their later
 trajectory entries are masked.
 
-## Configuration seam
+## Configuration and reset
 
-The trainer initially builds the legacy Python `HexagonBasketballEnv` through
-`train/env_factory.py`. This is not the rollout engine. It is a convenient
-configuration and geometry compiler:
+The trainer converts CLI values into `JaxEnvironmentConfig`, constructs court
+geometry and rule tables with `build_kernel_static_from_config`, and creates
+the initial state batch with `reset_batch_minimal`. Possession and game-clock
+training use this same seeded path. No Gym environment, SB3 vector wrapper, or
+Python state snapshot participates in supported JAX training construction.
 
-1. validate the broad environment argument surface;
-2. construct court cells, masks, and template data;
-3. load and validate optional rebound artifacts;
-4. snapshot representative state;
-5. convert everything into `KernelStatic` and `KernelState` arrays.
-
-JAX then owns reset and step behavior for training and native evaluation.
+The configuration contract also supplies checkpoint and MLflow metadata, so a
+training run records the same canonical settings used to build its static and
+initial state.
 
 ## Rollout variants
 

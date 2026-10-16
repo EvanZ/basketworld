@@ -264,6 +264,10 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "rebound_reward_once_per_possession",
         "rebound_counterfactual_positioning_enabled",
         "enable_multi_possession",
+        "episode_end_mode",
+        "game_clock_seconds",
+        "overtime_seconds",
+        "game_clock_max_total_steps",
         "multi_possession_limit",
         "multi_possession_limit_start",
         "multi_possession_limit_end",
@@ -403,6 +407,10 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "rebound_reward_once_per_possession",
     "rebound_counterfactual_positioning_enabled",
     "enable_multi_possession",
+    "episode_end_mode",
+    "game_clock_seconds",
+    "overtime_seconds",
+    "game_clock_max_total_steps",
     "multi_possession_limit",
     "multi_possession_limit_start",
     "multi_possession_limit_end",
@@ -1190,6 +1198,36 @@ def build_train_parser():
         ),
     )
     parser.add_argument(
+        "--episode-end-mode",
+        choices=("possessions", "game_clock"),
+        default="possessions",
+        help=(
+            "End games after each team reaches its possession quota or when "
+            "the regulation game clock expires with timed overtime periods."
+        ),
+    )
+    parser.add_argument(
+        "--game-clock-seconds",
+        type=int,
+        default=300,
+        help="Regulation game-clock duration in simulation seconds.",
+    )
+    parser.add_argument(
+        "--overtime-seconds",
+        type=int,
+        default=120,
+        help="Duration of each overtime period in simulation seconds.",
+    )
+    parser.add_argument(
+        "--game-clock-max-total-steps",
+        type=int,
+        default=10_000,
+        help=(
+            "Safety cap on all simulation steps, including stopped-clock "
+            "restart phases, in a timed game."
+        ),
+    )
+    parser.add_argument(
         "--multi-possession-limit",
         type=int,
         default=25,
@@ -1763,6 +1801,20 @@ def validate_train_args(args) -> None:
         value = getattr(args, key, None)
         if value is not None and int(value) < 1:
             raise SystemExit(f"--{key.replace('_', '-')} must be >= 1.")
+    for key in (
+        "game_clock_seconds",
+        "overtime_seconds",
+        "game_clock_max_total_steps",
+    ):
+        if int(getattr(args, key, 0)) < 1:
+            raise SystemExit(f"--{key.replace('_', '-')} must be >= 1.")
+    if (
+        str(getattr(args, "episode_end_mode", "possessions")) == "game_clock"
+        and not bool(getattr(args, "enable_multi_possession", False))
+    ):
+        raise SystemExit(
+            "--episode-end-mode game_clock requires --enable-multi-possession."
+        )
     for key in ("defender_spawn_distance", "defender_guard_distance", "assist_window"):
         value = getattr(args, key, None)
         if value is not None and int(value) < 0:
@@ -2249,6 +2301,10 @@ _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
     "rebound_reward_once_per_possession": True,
     "rebound_counterfactual_positioning_enabled": False,
     "enable_multi_possession": False,
+    "episode_end_mode": "possessions",
+    "game_clock_seconds": 300,
+    "overtime_seconds": 120,
+    "game_clock_max_total_steps": 10_000,
     "multi_possession_limit": 25,
     "multi_possession_limit_start": None,
     "multi_possession_limit_end": None,

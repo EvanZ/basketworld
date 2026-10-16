@@ -16,7 +16,6 @@ from basketworld_jax.config.environment import (
     JaxEnvironmentConfig,
     build_static_environment,
 )
-from basketworld_jax.train.cli import resolve_training_team
 
 
 MOVE_ACTION_START = ActionType.MOVE_E.value
@@ -8576,82 +8575,17 @@ def reset_batch_minimal(static: KernelStatic, rng_keys, jax, jnp):
 
 
 def sample_state_batch(args, xp) -> tuple[KernelStatic, KernelState]:
-    # Kept local until #69 migrates training/reset to JAX-owned construction.
-    from train.env_factory import setup_environment
+    import jax as _jax
 
-    training_team = resolve_training_team(args.training_team)
-    wrapped_env = setup_environment(args, training_team)
-    base_env = wrapped_env.unwrapped
-    for key in (
-        "enable_rebounds",
-        "rebound_table_model_dir",
-        "rebound_target_temperature",
-        "rebound_target_uniform_mix",
-        "rebound_winner_distance_weight",
-        "rebound_basket_position_weight",
-        "rebound_winner_temperature",
-        "rebound_skill_std",
-        "rebound_skill_sampling_mode",
-        "rebound_skill_high",
-        "rebound_skill_low",
-        "rebound_skill_weight",
-        "rebound_contest_mode",
-        "rebound_contest_radius",
-        "rebound_obs_top_n_targets",
-        "offensive_rebound_shot_clock_reset",
-        "enable_rebound_reward_redistribution",
-        "offensive_rebound_reward_advance",
-        "rebound_reward_once_per_possession",
-        "rebound_counterfactual_positioning_enabled",
-        "enable_multi_possession",
-        "multi_possession_limit",
-        "multi_possession_overtime_round_cap",
-        "episode_end_mode",
-        "game_clock_seconds",
-        "overtime_seconds",
-        "game_clock_max_total_steps",
-        "multi_possession_reward_mode",
-        "score_potential_scale",
-        "game_winner_reward",
-        "multi_possession_aux_rewards_enabled",
-        "multi_possession_use_inbounds",
-        "multi_possession_schema_version",
-        "made_basket_restart_mode",
-        "inbound_deadline_steps",
-        "check_deadline_steps",
-        "check_setup_steps",
-        "check_clearance",
-        "random_check_location",
-    ):
-        if hasattr(args, key):
-            setattr(base_env, key, getattr(args, key))
-
-    try:
-        static = build_kernel_static_from_env(base_env, xp=xp)
-        if bool(getattr(args, "enable_multi_possession", False)):
-            # The Python gym environment only models one fixed initial offense.
-            # The compiled reset owns the seeded 50/50 opening-possession draw.
-            import jax as _jax
-
-            state = reset_batch_minimal(
-                static,
-                _jax.random.split(
-                    _jax.random.PRNGKey(int(args.sample_reset_seed)),
-                    int(args.kernel_batch_size),
-                ),
-                _jax,
-                xp,
-            )
-        else:
-            snapshots = []
-            for batch_idx in range(int(args.kernel_batch_size)):
-                base_env.reset(seed=int(args.sample_reset_seed) + batch_idx)
-                snapshots.append(snapshot_state_from_env(base_env))
-            state = stack_state_snapshots(snapshots, xp=xp)
-    finally:
-        try:
-            wrapped_env.close()
-        except Exception:
-            pass
-
+    config = JaxEnvironmentConfig.from_args(args)
+    static = build_kernel_static_from_config(config, xp=xp)
+    state = reset_batch_minimal(
+        static,
+        _jax.random.split(
+            _jax.random.PRNGKey(int(args.sample_reset_seed)),
+            int(args.kernel_batch_size),
+        ),
+        _jax,
+        xp,
+    )
     return static, state
