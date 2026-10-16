@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from basketworld.envs.basketworld_env_v2 import Team
+from basketworld.domain import Team
 
 from basketworld_jax.checkpoints import load_checkpoint
 from basketworld_jax.env.minimal import (

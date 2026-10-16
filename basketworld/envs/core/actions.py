@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from basketworld.envs.basketworld_env_v2 import ActionType
+from basketworld.domain import ActionType
 
 
 def build_action_masks(

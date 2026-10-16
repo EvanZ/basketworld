@@ -2,18 +2,21 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any, NamedTuple, Sequence
+from typing import Any, Mapping, NamedTuple, Sequence
 
 import numpy as np
 
-from basketworld.envs.basketworld_env_v2 import ActionType, Team
+from basketworld.domain import ActionType, Team
 from basketworld.utils.start_templates import (
     _mirror_anchor,
     _project_anchor_to_valid_cell,
     resolve_start_template,
 )
+from basketworld_jax.config.environment import (
+    JaxEnvironmentConfig,
+    build_static_environment,
+)
 from basketworld_jax.train.cli import resolve_training_team
-from train.env_factory import setup_environment
 
 
 MOVE_ACTION_START = ActionType.MOVE_E.value
@@ -1532,7 +1535,21 @@ def _compiled_start_template_arrays(env) -> dict[str, np.ndarray | float | bool]
     }
 
 
+def build_kernel_static_from_config(
+    config: JaxEnvironmentConfig | Mapping[str, Any], xp
+) -> KernelStatic:
+    """Build JAX static state without constructing the legacy Gym environment."""
+    if not isinstance(config, JaxEnvironmentConfig):
+        config = JaxEnvironmentConfig.from_mapping(config)
+    return _build_kernel_static_from_source(build_static_environment(config), xp)
+
+
 def build_kernel_static_from_env(env, xp) -> KernelStatic:
+    """Temporary compatibility adapter for parity tests and unmigrated callers."""
+    return _build_kernel_static_from_source(env, xp)
+
+
+def _build_kernel_static_from_source(env, xp) -> KernelStatic:
     episode_end_mode_name = str(
         getattr(env, "episode_end_mode", "possessions") or "possessions"
     ).strip().lower()
@@ -8556,6 +8573,9 @@ def reset_batch_minimal(static: KernelStatic, rng_keys, jax, jnp):
 
 
 def sample_state_batch(args, xp) -> tuple[KernelStatic, KernelState]:
+    # Kept local until #69 migrates training/reset to JAX-owned construction.
+    from train.env_factory import setup_environment
+
     training_team = resolve_training_team(args.training_team)
     wrapped_env = setup_environment(args, training_team)
     base_env = wrapped_env.unwrapped

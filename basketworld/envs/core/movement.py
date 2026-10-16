@@ -71,7 +71,7 @@ def update_offensive_lane_counters(env, actions, results) -> None:
                         env._turnover_to_defense(env.ball_holder)
                     break
                 elif has_ball and steps_in_lane > env.three_second_max_steps:
-                    from basketworld.envs.basketworld_env_v2 import ActionType
+                    from basketworld.domain import ActionType
 
                     action_taken = ActionType(actions[oid])
                     if action_taken != ActionType.SHOOT:
@@ -97,7 +97,7 @@ def resolve_movement(env, actions, results, current_positions):
 
     intended_moves = {}
     for player_id, action_val in enumerate(actions):
-        from basketworld.envs.basketworld_env_v2 import ActionType
+        from basketworld.domain import ActionType
 
         action = ActionType(action_val)
         if ActionType.MOVE_E.value <= action.value <= ActionType.MOVE_SE.value:

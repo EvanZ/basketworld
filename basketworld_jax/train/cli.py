@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from basketworld.envs.basketworld_env_v2 import Team
+from basketworld.domain import Team
 from train.config import get_parser
 
 

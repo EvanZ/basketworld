@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 
 import basketworld
-from basketworld.envs.basketworld_env_v2 import ActionType, Team
+from basketworld.domain import ActionType, Team
 from basketworld_jax.checkpoints import load_checkpoint
 from basketworld_jax.env.minimal import (
     MOVE_ACTION_END,

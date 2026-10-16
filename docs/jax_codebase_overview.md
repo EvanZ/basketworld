@@ -70,6 +70,13 @@ The most important architectural change is that the environment state is no long
 
 The JAX env is deliberately compact. It does not try to wrap the existing Python env. Instead it ports the rollout-critical semantics into JAX arrays.
 
+Environment construction is owned by
+[`basketworld_jax.config.environment`](/home/evanzamir/basketworld/basketworld_jax/config/environment.py).
+Its typed `JaxEnvironmentConfig` and dependency-neutral court source build
+`KernelStatic` without constructing the legacy Gym environment. The ownership
+and migration boundary are documented in
+[`jax_environment_ownership.md`](/home/evanzamir/basketworld/docs/jax_environment_ownership.md).
+
 The main split is:
 
 - static config: court constants, player counts, rule settings, skill distributions, action dimensions, template metadata, and other values that should not change during a compiled rollout
