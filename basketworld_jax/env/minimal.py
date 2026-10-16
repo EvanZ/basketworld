@@ -169,6 +169,15 @@ POSSESSION_END_TURNOVER = 3
 POSSESSION_END_DEFENSIVE_VIOLATION = 4
 POSSESSION_END_INBOUND_VIOLATION = 5
 POSSESSION_END_CHECK_VIOLATION = 6
+POSSESSION_END_PERIOD_EXPIRED = 7
+EPISODE_END_POSSESSIONS = 0
+EPISODE_END_GAME_CLOCK = 1
+EPISODE_END_MODE_IDS = {
+    "possessions": EPISODE_END_POSSESSIONS,
+    "game_clock": EPISODE_END_GAME_CLOCK,
+}
+TRUNCATION_REASON_NONE = 0
+TRUNCATION_REASON_TOTAL_STEPS = 1
 SHOT_TYPE_NONE = 0
 SHOT_TYPE_DUNK = 1
 SHOT_TYPE_TWO = 2
@@ -402,6 +411,10 @@ class KernelStatic(NamedTuple):
     multi_possession_reward_mode: Any
     score_potential_scale: Any
     game_winner_reward: Any
+    episode_end_mode: Any
+    game_clock_seconds: Any
+    overtime_seconds: Any
+    game_clock_max_total_steps: Any
     multi_possession_aux_rewards_enabled: Any
     multi_possession_schema_version: Any
     # When disabled, dead-ball restarts hand the ball directly to a uniformly
@@ -476,6 +489,16 @@ class KernelState(NamedTuple):
     overtime_round: Any
     overtime_possessions_completed: Any
     overtime_starting_team: Any
+    # Timed-game state. ``overtime_round == 0`` denotes regulation.
+    episode_end_mode: Any
+    game_clock_remaining: Any
+    elapsed_game_clock_seconds: Any
+    period_elapsed_game_clock_seconds: Any
+    possession_game_clock_seconds: Any
+    episode_overtime_seed: Any
+    overtime_pair_inversion: Any
+    episode_truncated: Any
+    truncation_reason: Any
     # Counts only LIVE action ticks in the current possession. Dead-ball
     # inbound ticks are intentionally excluded.
     live_possession_steps: Any
@@ -552,6 +575,8 @@ class StepBatchOutput(NamedTuple):
     # The finished possession's live-action duration. Zero for non-boundary
     # steps and for a possession lost during an inbound before live play.
     completed_possession_live_steps: Any
+    # Elapsed game-clock time includes check pickup and excludes setup/inbound.
+    completed_possession_game_clock_seconds: Any
     clearance_event: Any
     clearance_elapsed_steps: Any
     turnover_before_clearance: Any
@@ -566,6 +591,8 @@ class StepBatchOutput(NamedTuple):
     check_space_double_violation: Any
     check_space_random_resolution: Any
     check_pickup_steps: Any
+    truncated: Any
+    truncation_reason: Any
 
 
 class ReboundDiagnosticTotals(NamedTuple):
@@ -842,6 +869,30 @@ def snapshot_state_from_env(env) -> dict[str, np.ndarray | int]:
         "overtime_round": 0,
         "overtime_possessions_completed": 0,
         "overtime_starting_team": -1,
+        "episode_end_mode": EPISODE_END_MODE_IDS.get(
+            str(getattr(env, "episode_end_mode", "possessions") or "possessions")
+            .strip()
+            .lower(),
+            EPISODE_END_POSSESSIONS,
+        ),
+        "game_clock_remaining": int(getattr(env, "game_clock_remaining", 0)),
+        "elapsed_game_clock_seconds": int(
+            getattr(env, "elapsed_game_clock_seconds", 0)
+        ),
+        "period_elapsed_game_clock_seconds": int(
+            getattr(env, "period_elapsed_game_clock_seconds", 0)
+        ),
+        "possession_game_clock_seconds": int(
+            getattr(env, "possession_game_clock_seconds", 0)
+        ),
+        "episode_overtime_seed": np.asarray(
+            getattr(env, "episode_overtime_seed", (0, 0)), dtype=np.uint32
+        ),
+        "overtime_pair_inversion": int(
+            getattr(env, "overtime_pair_inversion", 0)
+        ),
+        "episode_truncated": int(bool(getattr(env, "episode_truncated", False))),
+        "truncation_reason": int(getattr(env, "truncation_reason", 0)),
         "live_possession_steps": 0,
         "game_phase": GAME_PHASE_LIVE,
         "team_a_score": float(getattr(env, "offense_score", 0.0)),
@@ -1105,6 +1156,87 @@ def stack_state_snapshots(
                 dtype=np.int8,
             ),
             dtype=xp.int8,
+        ),
+        episode_end_mode=xp.asarray(
+            np.asarray(
+                [
+                    int(item.get("episode_end_mode", EPISODE_END_POSSESSIONS))
+                    for item in snapshots
+                ],
+                dtype=np.int8,
+            ),
+            dtype=xp.int8,
+        ),
+        game_clock_remaining=xp.asarray(
+            np.asarray(
+                [int(item.get("game_clock_remaining", 0)) for item in snapshots],
+                dtype=np.int32,
+            ),
+            dtype=xp.int32,
+        ),
+        elapsed_game_clock_seconds=xp.asarray(
+            np.asarray(
+                [
+                    int(item.get("elapsed_game_clock_seconds", 0))
+                    for item in snapshots
+                ],
+                dtype=np.int32,
+            ),
+            dtype=xp.int32,
+        ),
+        period_elapsed_game_clock_seconds=xp.asarray(
+            np.asarray(
+                [
+                    int(item.get("period_elapsed_game_clock_seconds", 0))
+                    for item in snapshots
+                ],
+                dtype=np.int32,
+            ),
+            dtype=xp.int32,
+        ),
+        possession_game_clock_seconds=xp.asarray(
+            np.asarray(
+                [
+                    int(item.get("possession_game_clock_seconds", 0))
+                    for item in snapshots
+                ],
+                dtype=np.int32,
+            ),
+            dtype=xp.int32,
+        ),
+        episode_overtime_seed=xp.asarray(
+            np.stack(
+                [
+                    np.asarray(
+                        item.get("episode_overtime_seed", (0, 0)),
+                        dtype=np.uint32,
+                    )
+                    for item in snapshots
+                ],
+                axis=0,
+            ),
+            dtype=xp.uint32,
+        ),
+        overtime_pair_inversion=xp.asarray(
+            np.asarray(
+                [int(item.get("overtime_pair_inversion", 0)) for item in snapshots],
+                dtype=np.int8,
+            ),
+            dtype=xp.int8,
+        ),
+        episode_truncated=xp.asarray(
+            np.asarray(
+                [int(item.get("episode_truncated", 0)) for item in snapshots],
+                dtype=np.int8,
+            ),
+            dtype=xp.int8,
+        ),
+        truncation_reason=xp.asarray(
+            np.asarray(
+                [int(item.get("truncation_reason", 0)) for item in snapshots],
+                dtype=np.int32,
+            ),
+            dtype=xp.int32,
         ),
         live_possession_steps=xp.asarray(
             np.asarray([int(item.get("live_possession_steps", 0)) for item in snapshots], dtype=np.int32),
@@ -1401,6 +1533,27 @@ def _compiled_start_template_arrays(env) -> dict[str, np.ndarray | float | bool]
 
 
 def build_kernel_static_from_env(env, xp) -> KernelStatic:
+    episode_end_mode_name = str(
+        getattr(env, "episode_end_mode", "possessions") or "possessions"
+    ).strip().lower()
+    if episode_end_mode_name not in EPISODE_END_MODE_IDS:
+        raise ValueError("episode_end_mode must be 'possessions' or 'game_clock'.")
+    if (
+        episode_end_mode_name == "game_clock"
+        and not bool(getattr(env, "enable_multi_possession", False))
+    ):
+        raise ValueError("game_clock episode mode requires enable_multi_possession.")
+    game_clock_seconds = int(getattr(env, "game_clock_seconds", 300))
+    overtime_seconds = int(getattr(env, "overtime_seconds", 120))
+    game_clock_max_total_steps = int(
+        getattr(env, "game_clock_max_total_steps", 10_000)
+    )
+    if game_clock_seconds < 1:
+        raise ValueError("game_clock_seconds must be at least 1.")
+    if overtime_seconds < 1:
+        raise ValueError("overtime_seconds must be at least 1.")
+    if game_clock_max_total_steps < 1:
+        raise ValueError("game_clock_max_total_steps must be at least 1.")
     cells = sorted(env._move_mask_by_cell.keys())
     basket_position = np.asarray(env.basket_position, dtype=np.int32)
     basket_distance = np.asarray(
@@ -1864,6 +2017,14 @@ def build_kernel_static_from_env(env, xp) -> KernelStatic:
         game_winner_reward=xp.asarray(
             max(0.0, float(getattr(env, "game_winner_reward", 0.0))),
             dtype=xp.float32,
+        ),
+        episode_end_mode=xp.asarray(
+            EPISODE_END_MODE_IDS[episode_end_mode_name], dtype=xp.int8
+        ),
+        game_clock_seconds=xp.asarray(game_clock_seconds, dtype=xp.int32),
+        overtime_seconds=xp.asarray(overtime_seconds, dtype=xp.int32),
+        game_clock_max_total_steps=xp.asarray(
+            game_clock_max_total_steps, dtype=xp.int32
         ),
         multi_possession_aux_rewards_enabled=xp.asarray(
             1
@@ -3120,8 +3281,14 @@ def _finalize_step_rewards_single(
         - output.state.team_b_score.astype(jnp.float32)
         + previous_state.team_b_score.astype(jnp.float32)
     )
+    completed_terminal = (
+        multi
+        & done
+        & (~output.truncated.astype(jnp.bool_))
+        & (~previous_state.episode_ended.astype(jnp.bool_))
+    )
     terminal_game_reward = jnp.where(
-        multi & done & (~previous_state.episode_ended.astype(jnp.bool_)),
+        completed_terminal,
         _fixed_team_reward_vector_single(static, terminal_value, jnp),
         jnp.zeros_like(output.rewards),
     )
@@ -3131,7 +3298,7 @@ def _finalize_step_rewards_single(
         terminal_game_reward,
     )
     winner_reward = jnp.where(
-        multi & done & (~previous_state.episode_ended.astype(jnp.bool_)),
+        completed_terminal,
         _fixed_team_reward_vector_single(
             static,
             jnp.sign(score_diff) * static.game_winner_reward.astype(jnp.float32),
@@ -4886,12 +5053,17 @@ def _finalize_possession_single(
     )
     scores_tied = state.team_a_score == state.team_b_score
     already_overtime = state.overtime_round > 0
+    possession_end_mode = static.episode_end_mode == jnp.asarray(
+        EPISODE_END_POSSESSIONS, dtype=jnp.int8
+    )
     overtime_pair_done = (
-        already_overtime
+        possession_end_mode
+        & already_overtime
         & advance
         & (state.overtime_possessions_completed >= 1)
     )
     regulation_boundary = advance & regulation_quota_complete & (~already_overtime)
+    regulation_boundary = regulation_boundary & possession_end_mode
     start_overtime = regulation_boundary & scores_tied
     tied_overtime_cap_reached = (
         overtime_pair_done
@@ -4926,7 +5098,7 @@ def _finalize_possession_single(
         start_overtime | continue_overtime,
         jnp.asarray(0, dtype=jnp.int32),
         jnp.where(
-            already_overtime & advance,
+            possession_end_mode & already_overtime & advance,
             state.overtime_possessions_completed + jnp.asarray(1, dtype=jnp.int32),
             state.overtime_possessions_completed,
         ),
@@ -5186,6 +5358,11 @@ def _finalize_possession_single(
             advance,
             jnp.asarray(0, dtype=jnp.int32),
             state.live_possession_steps,
+        ),
+        possession_game_clock_seconds=jnp.where(
+            advance,
+            jnp.asarray(0, dtype=jnp.int32),
+            state.possession_game_clock_seconds,
         ),
         game_phase=jnp.where(
             check_restart,
@@ -5465,7 +5642,371 @@ def _restart_after_defensive_technical_single(
     )
 
 
-def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key, jax, jnp):
+def _start_timed_overtime_single(
+    static: KernelStatic,
+    state: KernelState,
+    overtime_round,
+    jax,
+    jnp,
+):
+    """Start a neutral timed overtime using episode-stable randomness.
+
+    Overtime randomness is derived from a seed stored at reset plus the
+    overtime number. It therefore does not depend on how many environment
+    steps either member of an evaluation pair needed to reach that overtime.
+    Evaluation can set ``overtime_pair_inversion`` on the partner state to
+    invert every overtime starter while retaining the same layouts/draws.
+    """
+    round_key = jax.random.fold_in(
+        state.episode_overtime_seed,
+        overtime_round.astype(jnp.uint32),
+    )
+    (
+        positions_key,
+        starter_key,
+        holder_key,
+        offense_intent_key,
+        defense_intent_key,
+        intent_visible_key,
+    ) = jax.random.split(round_key, 6)
+    positions = _sample_neutral_opening_positions_single(
+        static, positions_key, jax, jnp
+    )
+    sampled_team_b = jax.random.bernoulli(starter_key)
+    inverted_team_b = jnp.logical_xor(
+        sampled_team_b,
+        state.overtime_pair_inversion.astype(jnp.bool_),
+    )
+    offense_team = jnp.where(
+        inverted_team_b,
+        jnp.asarray(TEAM_B, dtype=jnp.int8),
+        jnp.asarray(TEAM_A, dtype=jnp.int8),
+    )
+    offense_ids = jnp.where(
+        offense_team == TEAM_A,
+        static.offense_ids,
+        static.defense_ids,
+    )
+    holder_slot = jax.random.randint(
+        holder_key,
+        shape=(),
+        minval=0,
+        maxval=offense_ids.shape[0],
+        dtype=jnp.int32,
+    )
+    ball_holder = offense_ids[holder_slot]
+    offense_intent = _sample_role_intent_single(
+        static,
+        static.enable_intent_learning,
+        static.intent_null_prob,
+        offense_intent_key,
+        jax,
+        jnp,
+    )
+    defense_intent = _sample_role_intent_single(
+        static,
+        static.enable_defense_intent_learning,
+        static.defense_intent_null_prob,
+        defense_intent_key,
+        jax,
+        jnp,
+    )
+    intent_visible = (
+        static.enable_intent_learning.astype(jnp.bool_)
+        & (
+            jax.random.uniform(intent_visible_key)
+            < static.intent_visible_to_defense_prob
+        )
+    ).astype(jnp.int8)
+    overtime_state = _replace_state(
+        state,
+        positions=positions,
+        ball_holder=ball_holder.astype(jnp.int32),
+        shot_clock=static.shot_clock_max.astype(jnp.int32),
+        episode_ended=jnp.asarray(0, dtype=jnp.int8),
+        episode_truncated=jnp.asarray(0, dtype=jnp.int8),
+        truncation_reason=jnp.asarray(TRUNCATION_REASON_NONE, dtype=jnp.int32),
+        pressure_exposure=jnp.asarray(0.0, dtype=jnp.float32),
+        offense_lane_steps=jnp.zeros_like(state.offense_lane_steps),
+        defense_lane_steps=jnp.zeros_like(state.defense_lane_steps),
+        assist_active=jnp.asarray(0, dtype=jnp.int8),
+        assist_passer=jnp.asarray(-1, dtype=jnp.int32),
+        assist_recipient=jnp.asarray(-1, dtype=jnp.int32),
+        assist_expires_at=jnp.asarray(-1, dtype=jnp.int32),
+        intent_index=offense_intent["index"],
+        intent_active=offense_intent["active"],
+        intent_age=offense_intent["age"],
+        intent_commitment_remaining=offense_intent["commitment_remaining"],
+        intent_visible_to_defense=intent_visible,
+        defense_intent_index=defense_intent["index"],
+        defense_intent_active=defense_intent["active"],
+        defense_intent_age=defense_intent["age"],
+        defense_intent_commitment_remaining=defense_intent[
+            "commitment_remaining"
+        ],
+        rebound_reward_advance_paid=jnp.asarray(0.0, dtype=jnp.float32),
+        offense_team=offense_team,
+        overtime_round=overtime_round.astype(jnp.int32),
+        overtime_possessions_completed=jnp.asarray(0, dtype=jnp.int32),
+        overtime_starting_team=offense_team,
+        game_clock_remaining=static.overtime_seconds.astype(jnp.int32),
+        period_elapsed_game_clock_seconds=jnp.asarray(0, dtype=jnp.int32),
+        possession_game_clock_seconds=jnp.asarray(0, dtype=jnp.int32),
+        live_possession_steps=jnp.asarray(0, dtype=jnp.int32),
+        game_phase=jnp.asarray(GAME_PHASE_LIVE, dtype=jnp.int8),
+        inbound_team=jnp.asarray(-1, dtype=jnp.int8),
+        inbound_player=jnp.asarray(-1, dtype=jnp.int32),
+        inbound_reason=jnp.asarray(POSSESSION_END_NONE, dtype=jnp.int32),
+        inbound_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
+        check_team=jnp.asarray(-1, dtype=jnp.int8),
+        check_ball_position=static.check_position.astype(jnp.int32),
+        check_double_violation_count=jnp.asarray(0, dtype=jnp.int32),
+        check_setup_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
+        check_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
+        check_steps_elapsed=jnp.asarray(0, dtype=jnp.int32),
+    )
+    holder_cleared = _holder_controls_three_point_single(
+        static, overtime_state, offense_team, jnp
+    )
+    return _replace_state(
+        overtime_state,
+        clearance_achieved=holder_cleared.astype(jnp.int8),
+    )
+
+
+def _apply_game_clock_single(
+    static: KernelStatic,
+    previous_state: KernelState,
+    output: StepBatchOutput,
+    jax,
+    jnp,
+):
+    """Apply timed-period boundaries after the step's actions have resolved."""
+    clock_mode = static.episode_end_mode == jnp.asarray(
+        EPISODE_END_GAME_CLOCK, dtype=jnp.int8
+    )
+    clock_phase = (previous_state.game_phase == GAME_PHASE_LIVE) | (
+        previous_state.game_phase == GAME_PHASE_AWAITING_CHECK
+    )
+    consumes_clock = (
+        clock_mode
+        & clock_phase
+        & (~previous_state.episode_ended.astype(jnp.bool_))
+    )
+    tick = consumes_clock.astype(jnp.int32)
+    remaining = jnp.maximum(
+        jnp.asarray(0, dtype=jnp.int32),
+        previous_state.game_clock_remaining.astype(jnp.int32) - tick,
+    )
+    clocked_state = _replace_state(
+        output.state,
+        game_clock_remaining=jnp.where(
+            clock_mode, remaining, output.state.game_clock_remaining
+        ),
+        elapsed_game_clock_seconds=jnp.where(
+            clock_mode,
+            previous_state.elapsed_game_clock_seconds + tick,
+            output.state.elapsed_game_clock_seconds,
+        ),
+        period_elapsed_game_clock_seconds=jnp.where(
+            clock_mode,
+            previous_state.period_elapsed_game_clock_seconds + tick,
+            output.state.period_elapsed_game_clock_seconds,
+        ),
+    )
+    output = output._replace(state=clocked_state)
+    period_expired = consumes_clock & (remaining <= 0)
+
+    def _expire_period(current_output):
+        raw_state = current_output.state
+        shot_clock_violation = current_output.turnover_reason == jnp.asarray(
+            TURNOVER_REASON_SHOT_CLOCK, dtype=jnp.int32
+        )
+        check_deadline_violation = current_output.turnover_reason == jnp.asarray(
+            TURNOVER_REASON_CHECK_TIMEOUT, dtype=jnp.int32
+        )
+        superseded_violation = shot_clock_violation | check_deadline_violation
+        action_ended_possession = (
+            current_output.possession_ended.astype(jnp.bool_)
+            & (~superseded_violation)
+        )
+        interrupted_live_steps = previous_state.live_possession_steps + (
+            previous_state.game_phase == GAME_PHASE_LIVE
+        ).astype(jnp.int32)
+        completed_game_clock_seconds = (
+            previous_state.possession_game_clock_seconds
+            + jnp.asarray(1, dtype=jnp.int32)
+        )
+        increment_team_a = (
+            (~action_ended_possession) & (previous_state.offense_team == TEAM_A)
+        ).astype(jnp.int32)
+        increment_team_b = (
+            (~action_ended_possession) & (previous_state.offense_team == TEAM_B)
+        ).astype(jnp.int32)
+        team_a_completed = jnp.where(
+            action_ended_possession,
+            raw_state.team_a_completed_possessions,
+            previous_state.team_a_completed_possessions + increment_team_a,
+        )
+        team_b_completed = jnp.where(
+            action_ended_possession,
+            raw_state.team_b_completed_possessions,
+            previous_state.team_b_completed_possessions + increment_team_b,
+        )
+        completed = jnp.where(
+            action_ended_possession,
+            raw_state.completed_possessions,
+            previous_state.completed_possessions + jnp.asarray(1, dtype=jnp.int32),
+        )
+        # A coincident check deadline is subordinate to period expiration, so
+        # remove its technical point before deciding whether overtime begins.
+        team_a_score = jnp.where(
+            check_deadline_violation,
+            previous_state.team_a_score,
+            raw_state.team_a_score,
+        )
+        team_b_score = jnp.where(
+            check_deadline_violation,
+            previous_state.team_b_score,
+            raw_state.team_b_score,
+        )
+        period_state = _replace_state(
+            raw_state,
+            offense_score=jnp.where(
+                check_deadline_violation,
+                previous_state.offense_score,
+                raw_state.offense_score,
+            ),
+            defense_score=jnp.where(
+                check_deadline_violation,
+                previous_state.defense_score,
+                raw_state.defense_score,
+            ),
+            offense_team=jnp.where(
+                action_ended_possession,
+                raw_state.offense_team,
+                previous_state.offense_team,
+            ).astype(jnp.int8),
+            team_a_score=team_a_score,
+            team_b_score=team_b_score,
+            team_a_completed_possessions=team_a_completed,
+            team_b_completed_possessions=team_b_completed,
+            completed_possessions=completed,
+            game_clock_remaining=jnp.asarray(0, dtype=jnp.int32),
+            possession_game_clock_seconds=jnp.asarray(0, dtype=jnp.int32),
+            live_possession_steps=jnp.asarray(0, dtype=jnp.int32),
+        )
+        scores_tied = team_a_score == team_b_score
+        next_overtime_round = previous_state.overtime_round + jnp.asarray(
+            1, dtype=jnp.int32
+        )
+        next_state = jax.lax.cond(
+            scores_tied,
+            lambda state: _start_timed_overtime_single(
+                static, state, next_overtime_round, jax, jnp
+            ),
+            lambda state: _replace_state(
+                state,
+                episode_ended=jnp.asarray(1, dtype=jnp.int8),
+            ),
+            period_state,
+        )
+        done = ~scores_tied
+        no_player = jnp.asarray(-1, dtype=jnp.int32)
+        zero_flag = jnp.asarray(0, dtype=jnp.int8)
+        zero_rewards = jnp.zeros_like(current_output.rewards)
+        return current_output._replace(
+            state=next_state,
+            rewards=jnp.where(
+                superseded_violation, zero_rewards, current_output.rewards
+            ),
+            done=done,
+            terminal_episode_steps=jnp.where(
+                done,
+                next_state.step_count.astype(jnp.int32),
+                jnp.asarray(0, dtype=jnp.int32),
+            ),
+            turnover=jnp.where(
+                superseded_violation, zero_flag, current_output.turnover
+            ),
+            turnover_player=jnp.where(
+                superseded_violation, no_player, current_output.turnover_player
+            ),
+            turnover_reason=jnp.where(
+                superseded_violation,
+                jnp.asarray(TURNOVER_REASON_NONE, dtype=jnp.int32),
+                current_output.turnover_reason,
+            ),
+            steal_player=jnp.where(
+                superseded_violation, no_player, current_output.steal_player
+            ),
+            possession_ended=jnp.asarray(1, dtype=jnp.int8),
+            possession_end_reason=jnp.where(
+                action_ended_possession,
+                current_output.possession_end_reason,
+                jnp.asarray(POSSESSION_END_PERIOD_EXPIRED, dtype=jnp.int32),
+            ),
+            completed_possession_live_steps=jnp.where(
+                action_ended_possession,
+                current_output.completed_possession_live_steps,
+                interrupted_live_steps,
+            ),
+            completed_possession_game_clock_seconds=(
+                completed_game_clock_seconds.astype(jnp.int32)
+            ),
+            turnover_before_clearance=jnp.where(
+                superseded_violation,
+                zero_flag,
+                current_output.turnover_before_clearance,
+            ),
+            check_violation=jnp.where(
+                check_deadline_violation,
+                zero_flag,
+                current_output.check_violation,
+            ),
+        )
+
+    output = jax.lax.cond(period_expired, _expire_period, lambda value: value, output)
+    hit_total_step_ceiling = (
+        clock_mode
+        & (~output.done.astype(jnp.bool_))
+        & (output.state.step_count >= static.game_clock_max_total_steps)
+    )
+
+    def _truncate(current_output):
+        truncated_state = _replace_state(
+            current_output.state,
+            episode_ended=jnp.asarray(1, dtype=jnp.int8),
+            episode_truncated=jnp.asarray(1, dtype=jnp.int8),
+            truncation_reason=jnp.asarray(
+                TRUNCATION_REASON_TOTAL_STEPS, dtype=jnp.int32
+            ),
+        )
+        return current_output._replace(
+            state=truncated_state,
+            done=jnp.asarray(True),
+            terminal_episode_steps=truncated_state.step_count.astype(jnp.int32),
+            truncated=jnp.asarray(1, dtype=jnp.int8),
+            truncation_reason=jnp.asarray(
+                TRUNCATION_REASON_TOTAL_STEPS, dtype=jnp.int32
+            ),
+        )
+
+    return jax.lax.cond(
+        hit_total_step_ceiling, _truncate, lambda value: value, output
+    )
+
+
+def _step_single_minimal(
+    static: KernelStatic,
+    state: KernelState,
+    actions,
+    key,
+    jax,
+    jnp,
+    *,
+    apply_game_clock: bool = True,
+):
     zero_rewards = jnp.zeros((state.positions.shape[0],), dtype=jnp.float32)
     zero_flag = jnp.asarray(0, dtype=jnp.int8)
     zero_steps = jnp.asarray(0, dtype=jnp.int32)
@@ -5527,6 +6068,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             possession_ended=zero_flag,
             possession_end_reason=jnp.asarray(POSSESSION_END_NONE, dtype=jnp.int32),
             completed_possession_live_steps=zero_steps,
+            completed_possession_game_clock_seconds=zero_steps,
             clearance_event=zero_flag,
             clearance_elapsed_steps=zero_steps,
             turnover_before_clearance=zero_flag,
@@ -5540,16 +6082,32 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
             check_space_double_violation=zero_flag,
             check_space_random_resolution=zero_flag,
             check_pickup_steps=zero_steps,
+            truncated=zero_flag,
+            truncation_reason=jnp.asarray(
+                TRUNCATION_REASON_NONE, dtype=jnp.int32
+            ),
         )
 
     def _check_phase(_):
         is_setup = state.game_phase == GAME_PHASE_CHECK_SETUP
+        timed_check_pickup = (
+            static.episode_end_mode
+            == jnp.asarray(EPISODE_END_GAME_CLOCK, dtype=jnp.int8)
+        ) & (~is_setup)
         check_move_key, next_check_key = jax.random.split(key)
         move_key = jnp.where(is_setup, key, check_move_key)
         countdown_state = _replace_state(
             state,
             step_count=state.step_count + 1,
-            shot_clock=state.shot_clock,
+            shot_clock=jnp.where(
+                timed_check_pickup,
+                state.shot_clock - jnp.asarray(1, dtype=jnp.int32),
+                state.shot_clock,
+            ),
+            possession_game_clock_seconds=(
+                state.possession_game_clock_seconds
+                + timed_check_pickup.astype(jnp.int32)
+            ),
             check_setup_steps_remaining=jnp.where(
                 is_setup,
                 jnp.maximum(
@@ -5683,7 +6241,10 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
         picked_up = jnp.any(on_check)
         pickup_slot = jnp.argmax(on_check.astype(jnp.int32))
         pickup_player = active_offense_ids[pickup_slot].astype(jnp.int32)
-        expired = (~picked_up) & (moved_state.check_steps_remaining <= 0)
+        check_deadline_expired = moved_state.check_steps_remaining <= 0
+        shot_clock_expired = timed_check_pickup & (moved_state.shot_clock <= 0)
+        pickup_completed_before_expiration = picked_up & (~shot_clock_expired)
+        expired = shot_clock_expired | ((~picked_up) & check_deadline_expired)
 
         def _pickup(_):
             next_state = _replace_state(
@@ -5704,16 +6265,22 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
         def _violation(_):
             opponent_team = (1 - moved_state.offense_team).astype(jnp.int8)
             point = jnp.asarray(1.0, dtype=jnp.float32)
+            deadline_violation = check_deadline_expired
             penalized_state = _replace_state(
                 moved_state,
                 offense_score=moved_state.offense_score
-                + jnp.where(opponent_team == TEAM_A, point, 0.0),
+                + jnp.where(deadline_violation & (opponent_team == TEAM_A), point, 0.0),
                 defense_score=moved_state.defense_score
-                + jnp.where(opponent_team == TEAM_B, point, 0.0),
+                + jnp.where(deadline_violation & (opponent_team == TEAM_B), point, 0.0),
                 team_a_score=moved_state.team_a_score
-                + jnp.where(opponent_team == TEAM_A, point, 0.0),
+                + jnp.where(deadline_violation & (opponent_team == TEAM_A), point, 0.0),
                 team_b_score=moved_state.team_b_score
-                + jnp.where(opponent_team == TEAM_B, point, 0.0),
+                + jnp.where(deadline_violation & (opponent_team == TEAM_B), point, 0.0),
+            )
+            violation_possession_reason = jnp.where(
+                deadline_violation,
+                jnp.asarray(POSSESSION_END_CHECK_VIOLATION, dtype=jnp.int32),
+                jnp.asarray(POSSESSION_END_TURNOVER, dtype=jnp.int32),
             )
             (
                 final_state,
@@ -5724,10 +6291,7 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 static,
                 penalized_state,
                 possession_ended=jnp.asarray(True),
-                possession_end_reason=jnp.asarray(
-                    POSSESSION_END_CHECK_VIOLATION,
-                    dtype=jnp.int32,
-                ),
+                possession_end_reason=violation_possession_reason,
                 next_offense_team=opponent_team,
                 requires_inbound=jnp.asarray(True),
                 inbound_selection_key=next_check_key,
@@ -5742,24 +6306,27 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                     final_state.step_count.astype(jnp.int32),
                     zero_steps,
                 ),
-                turnover_reason=jnp.asarray(
-                    TURNOVER_REASON_CHECK_TIMEOUT,
-                    dtype=jnp.int32,
+                turnover_reason=jnp.where(
+                    deadline_violation,
+                    jnp.asarray(TURNOVER_REASON_CHECK_TIMEOUT, dtype=jnp.int32),
+                    jnp.asarray(TURNOVER_REASON_SHOT_CLOCK, dtype=jnp.int32),
                 ),
                 possession_ended=possession_ended.astype(jnp.int8),
-                possession_end_reason=jnp.asarray(
-                    POSSESSION_END_CHECK_VIOLATION,
-                    dtype=jnp.int32,
-                ),
+                possession_end_reason=violation_possession_reason,
                 completed_possession_live_steps=completed_possession_live_steps,
-                check_violation=jnp.asarray(1, dtype=jnp.int8),
+                completed_possession_game_clock_seconds=jnp.where(
+                    possession_ended.astype(jnp.bool_),
+                    moved_state.possession_game_clock_seconds.astype(jnp.int32),
+                    zero_steps,
+                ),
+                check_violation=deadline_violation.astype(jnp.int8),
             )
 
         check_output = jax.lax.cond(
             (static.check_clearance > 0) & defense_inside,
             _defense_space_violation,
             lambda __: jax.lax.cond(
-                picked_up,
+                pickup_completed_before_expiration,
                 _pickup,
                 lambda ___: jax.lax.cond(
                     expired,
@@ -6110,7 +6677,19 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
         next_state = _replace_state(
             state,
             step_count=state.step_count + 1,
+            shot_clock=state.shot_clock
+            - (
+                static.episode_end_mode
+                == jnp.asarray(EPISODE_END_GAME_CLOCK, dtype=jnp.int8)
+            ).astype(jnp.int32),
             live_possession_steps=state.live_possession_steps + jnp.asarray(1, dtype=jnp.int32),
+            possession_game_clock_seconds=(
+                state.possession_game_clock_seconds
+                + (
+                    static.episode_end_mode
+                    == jnp.asarray(EPISODE_END_GAME_CLOCK, dtype=jnp.int8)
+                ).astype(jnp.int32)
+            ),
             episode_ended=jnp.asarray(0, dtype=state.episode_ended.dtype),
         )
         next_state = advance_intent_clock_single(static, next_state, jnp)
@@ -6253,6 +6832,11 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 possession_ended=pressure_possession_ended.astype(jnp.int8),
                 possession_end_reason=jnp.asarray(POSSESSION_END_TURNOVER, dtype=jnp.int32),
                 completed_possession_live_steps=pressure_completed_possession_live_steps,
+                completed_possession_game_clock_seconds=jnp.where(
+                    pressure_possession_ended.astype(jnp.bool_),
+                    next_state.possession_game_clock_seconds.astype(jnp.int32),
+                    zero_steps,
+                ),
                 clearance_event=pressure_clearance_event.astype(jnp.int8),
                 clearance_elapsed_steps=jnp.where(
                     pressure_clearance_event,
@@ -6277,10 +6861,21 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 check_space_double_violation=zero_flag,
                 check_space_random_resolution=zero_flag,
                 check_pickup_steps=zero_steps,
+                truncated=zero_flag,
+                truncation_reason=jnp.asarray(
+                    TRUNCATION_REASON_NONE, dtype=jnp.int32
+                ),
             )
 
         def _normal_step(_):
-            shot_clock_state = _replace_state(next_state, shot_clock=next_state.shot_clock - 1)
+            shot_clock_state = _replace_state(
+                next_state,
+                shot_clock=next_state.shot_clock
+                - (
+                    static.episode_end_mode
+                    == jnp.asarray(EPISODE_END_POSSESSIONS, dtype=jnp.int8)
+                ).astype(jnp.int32),
+            )
             ball_holder = shot_clock_state.ball_holder
             safe_holder = jnp.clip(ball_holder, 0, actions.shape[0] - 1)
             holder_action = actions[safe_holder]
@@ -7122,6 +7717,11 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 possession_ended=possession_ended.astype(jnp.int8),
                 possession_end_reason=possession_end_reason,
                 completed_possession_live_steps=completed_possession_live_steps,
+                completed_possession_game_clock_seconds=jnp.where(
+                    possession_ended.astype(jnp.bool_),
+                    shot_clock_state.possession_game_clock_seconds.astype(jnp.int32),
+                    zero_steps,
+                ),
                 clearance_event=clearance_event.astype(jnp.int8),
                 clearance_elapsed_steps=jnp.where(
                     clearance_event,
@@ -7147,6 +7747,10 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
                 check_space_double_violation=zero_flag,
                 check_space_random_resolution=zero_flag,
                 check_pickup_steps=zero_steps,
+                truncated=zero_flag,
+                truncation_reason=jnp.asarray(
+                    TRUNCATION_REASON_NONE, dtype=jnp.int32
+                ),
             )
 
         return jax.lax.cond(pressure_turnover, _pressure_done, _normal_step, operand=None)
@@ -7168,10 +7772,64 @@ def _step_single_minimal(static: KernelStatic, state: KernelState, actions, key,
         ),
         operand=None,
     )
-    return _finalize_step_rewards_single(static, state, raw_output, jnp)
+    clock_output = (
+        _apply_game_clock_single(static, state, raw_output, jax, jnp)
+        if apply_game_clock
+        else raw_output
+    )
+    return _finalize_step_rewards_single(static, state, clock_output, jnp)
 
 
 def step_batch_minimal(static: KernelStatic, state: KernelState, actions, rng_keys, jax, jnp):
+    # Direct environment/tests pass a concrete mode. Avoid tracing the much
+    # larger timed-period transition graph for possession games. Existing
+    # compiled rollout runners pass a tracer here and remain possession-only
+    # until #64 selects the explicit clock entry point below per run.
+    mode_is_traced = isinstance(static.episode_end_mode, jax.core.Tracer)
+    apply_game_clock = (not mode_is_traced) and (
+        int(np.asarray(static.episode_end_mode)) == EPISODE_END_GAME_CLOCK
+    )
+    return _step_batch_with_clock_mode(
+        static,
+        state,
+        actions,
+        rng_keys,
+        jax,
+        jnp,
+        apply_game_clock=apply_game_clock,
+    )
+
+
+def step_batch_game_clock(
+    static: KernelStatic,
+    state: KernelState,
+    actions,
+    rng_keys,
+    jax,
+    jnp,
+):
+    """Step a timed game inside a compiled runner specialized for clock mode."""
+    return _step_batch_with_clock_mode(
+        static,
+        state,
+        actions,
+        rng_keys,
+        jax,
+        jnp,
+        apply_game_clock=True,
+    )
+
+
+def _step_batch_with_clock_mode(
+    static: KernelStatic,
+    state: KernelState,
+    actions,
+    rng_keys,
+    jax,
+    jnp,
+    *,
+    apply_game_clock: bool,
+):
     per_state = lambda state_single, action_single, key_single: _step_single_minimal(
         static,
         state_single,
@@ -7179,6 +7837,7 @@ def step_batch_minimal(static: KernelStatic, state: KernelState, actions, rng_ke
         key_single,
         jax,
         jnp,
+        apply_game_clock=apply_game_clock,
     )
     return jax.vmap(per_state)(state, actions, rng_keys)
 
@@ -7527,6 +8186,7 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
     ball_handling_skill_key = jax.random.fold_in(key, 103)
     passing_skill_key = jax.random.fold_in(key, 104)
     shot_contest_skill_key = jax.random.fold_in(key, 105)
+    episode_overtime_seed = jax.random.fold_in(key, 106)
 
     # Folded keys add Team B skill draws for multi-possession games without
     # perturbing legacy reset sampling or its reproducibility.
@@ -7839,6 +8499,20 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         overtime_round=jnp.asarray(0, dtype=jnp.int32),
         overtime_possessions_completed=jnp.asarray(0, dtype=jnp.int32),
         overtime_starting_team=jnp.asarray(-1, dtype=jnp.int8),
+        episode_end_mode=static.episode_end_mode.astype(jnp.int8),
+        game_clock_remaining=jnp.where(
+            static.episode_end_mode
+            == jnp.asarray(EPISODE_END_GAME_CLOCK, dtype=jnp.int8),
+            static.game_clock_seconds.astype(jnp.int32),
+            jnp.asarray(0, dtype=jnp.int32),
+        ),
+        elapsed_game_clock_seconds=jnp.asarray(0, dtype=jnp.int32),
+        period_elapsed_game_clock_seconds=jnp.asarray(0, dtype=jnp.int32),
+        possession_game_clock_seconds=jnp.asarray(0, dtype=jnp.int32),
+        episode_overtime_seed=episode_overtime_seed.astype(jnp.uint32),
+        overtime_pair_inversion=jnp.asarray(0, dtype=jnp.int8),
+        episode_truncated=jnp.asarray(0, dtype=jnp.int8),
+        truncation_reason=jnp.asarray(TRUNCATION_REASON_NONE, dtype=jnp.int32),
         live_possession_steps=jnp.asarray(0, dtype=jnp.int32),
         game_phase=jnp.asarray(GAME_PHASE_LIVE, dtype=jnp.int8),
         team_a_score=jnp.asarray(0.0, dtype=jnp.float32),
@@ -7909,6 +8583,10 @@ def sample_state_batch(args, xp) -> tuple[KernelStatic, KernelState]:
         "enable_multi_possession",
         "multi_possession_limit",
         "multi_possession_overtime_round_cap",
+        "episode_end_mode",
+        "game_clock_seconds",
+        "overtime_seconds",
+        "game_clock_max_total_steps",
         "multi_possession_reward_mode",
         "score_potential_scale",
         "game_winner_reward",

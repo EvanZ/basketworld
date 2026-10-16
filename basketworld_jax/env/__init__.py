@@ -37,6 +37,7 @@ from basketworld_jax.env.minimal import (
     sample_state_batch,
     sample_uniform_legal_actions_jax,
     set_offense_intent_state_batch,
+    step_batch_game_clock,
     step_batch_minimal,
 )
 
@@ -77,5 +78,6 @@ __all__ = [
     "sample_state_batch",
     "sample_uniform_legal_actions_jax",
     "set_offense_intent_state_batch",
+    "step_batch_game_clock",
     "step_batch_minimal",
 ]
