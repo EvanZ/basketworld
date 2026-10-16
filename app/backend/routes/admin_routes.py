@@ -108,7 +108,7 @@ def _refresh_after_live_env_edit() -> None:
     jax_runtime = getattr(game_state, "jax_runtime", None)
     if jax_runtime is not None:
         try:
-            jax_runtime.apply_display_env_edits(game_state)
+            jax_runtime.apply_environment_edits(game_state)
         except Exception as err:
             raise HTTPException(
                 status_code=500,
@@ -125,9 +125,9 @@ def _refresh_after_static_env_param_edit(updated_params: dict) -> None:
         try:
             if hasattr(jax_runtime, "env_params") and isinstance(jax_runtime.env_params, dict):
                 jax_runtime.env_params.update(updated_params or {})
-            if hasattr(jax_runtime, "refresh_static_from_display_env"):
-                jax_runtime.refresh_static_from_display_env()
-            game_state.env = getattr(jax_runtime, "display_env", game_state.env)
+            if hasattr(jax_runtime, "refresh_static_from_environment"):
+                jax_runtime.refresh_static_from_environment()
+            game_state.env = getattr(jax_runtime, "environment", game_state.env)
             if hasattr(jax_runtime, "observation_dict"):
                 user_team = getattr(game_state, "user_team", Team.OFFENSE)
                 game_state.obs = jax_runtime.observation_dict(
@@ -1104,7 +1104,7 @@ def _run_jax_playbook_batch(
 
     horizon = int(max(1, max_steps))
     if bool(run_to_end):
-        horizon = int(max(horizon, int(getattr(jax_runtime.display_env, "shot_clock_steps", horizon)) + 2))
+        horizon = int(max(horizon, int(getattr(jax_runtime.environment, "shot_clock_steps", horizon)) + 2))
 
     intent_vector = np.asarray(
         [int(intent_index) for intent_index in intent_indices for _ in range(int(num_rollouts))],

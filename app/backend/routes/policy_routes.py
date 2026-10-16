@@ -70,7 +70,8 @@ def set_phi_params(req: SetPhiParamsRequest):
             if str(req.phi_aggregation_mode) in valid_modes:
                 env.phi_aggregation_mode = str(req.phi_aggregation_mode)
         if game_state.jax_runtime is not None:
-            game_state.jax_runtime.refresh_static_from_display_env()
+            game_state.jax_runtime.refresh_static_from_environment()
+            game_state.env = game_state.jax_runtime.environment
         return {"status": "success", "params": get_phi_params()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to set phi params: {e}")

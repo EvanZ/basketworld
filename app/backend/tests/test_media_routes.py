@@ -13,6 +13,7 @@ from PIL import Image, ImageSequence
 
 from app.backend.routes import media_routes
 from app.backend.episode_gif import EpisodeGifExports, quantize_gif_frame
+from basketworld_jax.config import JaxEnvironmentConfig, build_static_environment
 
 
 def png_data_url(size, color):
@@ -93,6 +94,42 @@ def export_client(tmp_path, monkeypatch):
     app = FastAPI()
     app.include_router(media_routes.router)
     return TestClient(app)
+
+
+@pytest.mark.parametrize("episode_end_mode", ["possessions", "game_clock"])
+@pytest.mark.parametrize("export_format", ["gif", "mp4"])
+def test_episode_export_uses_jax_owned_view_in_both_game_modes(
+    export_client,
+    episode_end_mode,
+    export_format,
+):
+    environment = build_static_environment(
+        JaxEnvironmentConfig(
+            players=1,
+            enable_multi_possession=episode_end_mode == "game_clock",
+            episode_end_mode=episode_end_mode,
+        )
+    )
+    environment.last_action_results = {}
+    environment.shot_clock = 24
+    media_routes.game_state.env = environment
+
+    create = export_client.post(f"/api/episode_exports?format={export_format}")
+    assert create.status_code == 200, create.text
+    export_id = create.json()["export_id"]
+    frame = (0, png_bytes((30, 50), "blue"), 0.1)
+    append = export_client.post(
+        f"/api/episode_exports/{export_id}/frame_batch",
+        content=png_batch([frame]),
+        headers={"content-type": "application/octet-stream"},
+    )
+    assert append.status_code == 200, append.text
+    finish = export_client.post(
+        f"/api/episode_exports/{export_id}/finish",
+        json={"frame_count": 1},
+    )
+    assert finish.status_code == 200, finish.text
+    assert finish.json()["file_path"].endswith(f".{export_format}")
 
 
 def test_streamed_episode_preserves_all_frames_palettes_sizes_and_hold(export_client):

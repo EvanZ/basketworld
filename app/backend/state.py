@@ -428,7 +428,9 @@ def _capture_restorable_backend_state() -> dict:
 
     jax_runtime = getattr(game_state, "jax_runtime", None)
     return {
-        "env": copy.deepcopy(game_state.env),
+        # The JAX branch is reconstructed from its canonical runtime snapshot;
+        # do not duplicate a mutable backend view as if it were an environment.
+        "env": None if jax_runtime is not None else copy.deepcopy(game_state.env),
         "jax_runtime": (
             jax_runtime.capture_snapshot()
             if jax_runtime is not None and hasattr(jax_runtime, "capture_snapshot")
@@ -463,7 +465,10 @@ def _restore_restorable_backend_state(snapshot: dict) -> None:
     if not snapshot:
         raise RuntimeError("Missing backend restore snapshot.")
 
-    game_state.env = copy.deepcopy(snapshot["env"])
+    jax_snapshot = snapshot.get("jax_runtime")
+    jax_runtime = getattr(game_state, "jax_runtime", None)
+    if jax_runtime is None or jax_snapshot is None:
+        game_state.env = copy.deepcopy(snapshot["env"])
     game_state.user_team = copy.deepcopy(snapshot["user_team"])
     game_state.obs = copy.deepcopy(snapshot["obs"])
     game_state.prev_obs = copy.deepcopy(snapshot["prev_obs"])
@@ -486,8 +491,6 @@ def _restore_restorable_backend_state(snapshot: dict) -> None:
         snapshot.get("selector_last_boundary_reason", None)
     )
 
-    jax_snapshot = snapshot.get("jax_runtime")
-    jax_runtime = getattr(game_state, "jax_runtime", None)
     if jax_runtime is not None and jax_snapshot is not None:
         jax_runtime.restore_snapshot(jax_snapshot, game_state=game_state)
     else:

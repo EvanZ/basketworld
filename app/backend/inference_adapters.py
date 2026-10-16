@@ -5,10 +5,6 @@ from pathlib import Path
 from typing import Any
 
 from basketworld.utils.action_resolution import get_policy_action_probabilities
-from basketworld.utils.intent_policy_sensitivity import (
-    sync_policy_runtime_intent_override_from_env,
-)
-from basketworld.utils.policy_loading import load_ppo_for_inference
 from basketworld_jax.inference import (
     load_inference_model,
     require_checkpoint_path,
@@ -97,6 +93,10 @@ class SB3PPOInferenceAdapter(InferencePolicyAdapter):
         return get_policy_action_probabilities(self.raw_model, obs)
 
     def prepare_for_role(self, env, *, observer_is_offense: bool) -> None:
+        from basketworld.utils.intent_policy_sensitivity import (
+            sync_policy_runtime_intent_override_from_env,
+        )
+
         sync_policy_runtime_intent_override_from_env(
             self.raw_model,
             env,
@@ -266,6 +266,8 @@ def load_sb3_policy_adapter(
     device: str = "cpu",
     custom_objects: dict[str, Any] | None = None,
 ) -> SB3PPOInferenceAdapter:
+    from basketworld.utils.policy_loading import load_ppo_for_inference
+
     model = load_ppo_for_inference(
         path,
         device=device,
@@ -305,6 +307,10 @@ def prepare_policy_for_role(policy_obj: Any, env, *, observer_is_offense: bool) 
     if hasattr(policy_obj, "prepare_for_role"):
         policy_obj.prepare_for_role(env, observer_is_offense=bool(observer_is_offense))
         return
+    from basketworld.utils.intent_policy_sensitivity import (
+        sync_policy_runtime_intent_override_from_env,
+    )
+
     raw_model = unwrap_inference_model(policy_obj)
     sync_policy_runtime_intent_override_from_env(
         raw_model,

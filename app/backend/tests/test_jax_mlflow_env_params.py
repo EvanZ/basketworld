@@ -1,12 +1,37 @@
 from __future__ import annotations
 
-from basketworld.envs.basketworld_env_v2 import Team
+from basketworld.domain import Team
 
 from app.backend.routes.lifecycle_routes import (
     _jax_local_env_config_from_metadata,
     _overlay_jax_mlflow_env_params,
     _overlay_jax_mlflow_training_params,
+    _split_jax_env_and_wrapper_params,
 )
+
+
+def test_split_jax_env_params_uses_jax_config_without_legacy_constructor():
+    env_params, wrapper_params = _split_jax_env_and_wrapper_params(
+        {
+            "episode_end_mode": "game_clock",
+            "game_clock_seconds": 300,
+            "overtime_seconds": 120,
+            "players_per_side": 3,
+            "use_set_obs": True,
+            "intent_selector_enabled": True,
+        }
+    )
+
+    assert env_params == {
+        "episode_end_mode": "game_clock",
+        "game_clock_seconds": 300,
+        "overtime_seconds": 120,
+        "players_per_side": 3,
+    }
+    assert wrapper_params == {
+        "use_set_obs": True,
+        "intent_selector_enabled": True,
+    }
 
 
 def test_overlay_jax_mlflow_env_params_applies_skill_stds():

@@ -113,9 +113,20 @@ class JaxEnvironmentConfig:
     max_spawn_distance: int | None = None
     defender_spawn_distance: int = 0
     defender_guard_distance: int = 1
+    offense_spawn_boundary_margin: int = 0
     normalize_obs: bool = True
     mask_occupied_moves: bool = False
     enable_pass_gating: bool = True
+    include_hoop_vector: bool = True
+
+    # Backend/UI metadata that is part of the live JAX environment contract.
+    # These values do not require a Gym environment, but keeping them in the
+    # JAX-owned config lets interactive serialization preserve its payload.
+    pass_arc_degrees: float = 60.0
+    pass_target_strategy: str = "nearest"
+    pass_mode: str = "directional"
+    illegal_action_policy: str = "noop"
+    intent_obs_mode: str = "private_offense"
 
     pass_reward: float = 0.0
     violation_reward: float = 1.0

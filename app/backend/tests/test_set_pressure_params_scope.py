@@ -339,12 +339,12 @@ class TestSetPressureParamsScope(unittest.TestCase):
 
 class DummyJaxRuntime:
     def __init__(self, env):
-        self.display_env = env
+        self.environment = env
         self.env_params = {}
         self.refresh_count = 0
         self.observation_calls = []
 
-    def refresh_static_from_display_env(self):
+    def refresh_static_from_environment(self):
         self.refresh_count += 1
 
     def observation_dict(self, *, observer_is_offense=True):

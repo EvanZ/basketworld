@@ -71,8 +71,7 @@ router = APIRouter()
 
 
 _JAX_RUNTIME_STATIC_ENV_KEYS = {
-    # JAX kernel-only env/static fields. The legacy Python env constructor does
-    # not accept these, but build_kernel_static_from_env reads them from attrs.
+    # Kernel and runtime fields retained in backend session metadata.
     "enable_rebounds",
     "rebound_table_model_dir",
     "rebound_target_temperature",
@@ -143,13 +142,28 @@ def _split_env_and_wrapper_params(optional_params: dict) -> tuple[dict, dict]:
     return env_kwargs, wrapper_kwargs
 
 
-def _jax_runtime_env_params(env_kwargs: dict, optional_params: dict) -> dict:
-    """Merge constructor-safe env kwargs with JAX static-only attrs."""
-    merged = dict(env_kwargs or {})
-    for key in _JAX_RUNTIME_STATIC_ENV_KEYS:
-        if key in optional_params:
-            merged[key] = optional_params[key]
-    return merged
+def _split_jax_env_and_wrapper_params(optional_params: dict) -> tuple[dict, dict]:
+    """Split JAX config from wrapper metadata without inspecting the legacy env."""
+    from basketworld_jax.config import JaxEnvironmentConfig
+
+    valid_env_keys = set(JaxEnvironmentConfig.__dataclass_fields__)
+    valid_env_keys.update(
+        {
+            "court_height",
+            "court_width",
+            "players_per_side",
+            "shot_clock_steps",
+            "offensive_three_seconds",
+            "phi_beta_start",
+            "pass_oob_turnover_prob_start",
+        }
+    )
+    valid_env_keys.update(_JAX_RUNTIME_STATIC_ENV_KEYS)
+    env_kwargs = {key: value for key, value in optional_params.items() if key in valid_env_keys}
+    wrapper_kwargs = {
+        key: value for key, value in optional_params.items() if key not in valid_env_keys
+    }
+    return env_kwargs, wrapper_kwargs
 
 
 def _str_to_bool(value) -> bool:
@@ -903,7 +917,7 @@ async def init_game(request: InitGameRequest):
     previous_unified_policy_key = getattr(game_state, "unified_policy_key", None)
     previous_opponent_policy_key = getattr(game_state, "opponent_unified_policy_key", None)
     previous_env_optional_params = copy.deepcopy(getattr(game_state, "env_optional_params", None) or {})
-    previous_runtime_env = getattr(getattr(game_state, "jax_runtime", None), "display_env", None)
+    previous_runtime_env = getattr(getattr(game_state, "jax_runtime", None), "environment", None)
     if previous_runtime_env is None:
         previous_runtime_env = getattr(game_state, "env", None)
 
@@ -1059,7 +1073,14 @@ async def init_game(request: InitGameRequest):
         game_state.unified_policy_capabilities = get_policy_capabilities(game_state.unified_policy)
         game_state.defense_policy_capabilities = get_policy_capabilities(game_state.defense_policy)
 
-        env_optional_params, wrapper_only_params = _split_env_and_wrapper_params(optional_params)
+        if game_state.unified_policy_backend == "jax":
+            env_optional_params, wrapper_only_params = _split_jax_env_and_wrapper_params(
+                optional_params
+            )
+        else:
+            env_optional_params, wrapper_only_params = _split_env_and_wrapper_params(
+                optional_params
+            )
         use_set_obs = bool(wrapper_only_params.get("use_set_obs", False))
         resolved_user_team = Team[request.user_team_name.upper()]
         game_state.user_team = resolved_user_team
@@ -1069,7 +1090,7 @@ async def init_game(request: InitGameRequest):
 
             game_state.jax_runtime = JaxDevRuntime(
                 required_params=required_params,
-                env_params=_jax_runtime_env_params(env_optional_params, optional_params),
+                env_params=env_optional_params,
                 unified_policy=game_state.unified_policy,
                 opponent_policy=game_state.defense_policy,
                 user_team=resolved_user_team,
@@ -1083,7 +1104,7 @@ async def init_game(request: InitGameRequest):
             resolved_user_team = game_state.jax_runtime.user_team
             game_state.user_team = resolved_user_team
             game_state.jax_runtime.reset()
-            game_state.env = game_state.jax_runtime.display_env
+            game_state.env = game_state.jax_runtime.environment
             game_state.obs = game_state.jax_runtime.observation_dict(
                 observer_is_offense=resolved_user_team != Team.DEFENSE
             )
@@ -2015,7 +2036,7 @@ def set_multi_possession_limit(request: SetMultiPossessionLimitRequest):
                 ),
             )
         runtime.reset()
-        game_state.env = runtime.display_env
+        game_state.env = runtime.environment
         game_state.user_team = runtime.user_team
         game_state.obs = runtime.observation_dict(observer_is_offense=runtime.user_team_is_a)
         game_state.prev_obs = None

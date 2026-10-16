@@ -22,7 +22,8 @@ from app.backend.schemas import (
     UpdatePositionRequest,
 )
 from app.backend.state import GameState
-from basketworld.envs.basketworld_env_v2 import Team
+from basketworld.domain import Team
+from basketworld_jax.config import JaxStaticEnvironment
 from basketworld_jax.env.minimal import (
     GAME_PHASE_AWAITING_INBOUND,
     GAME_PHASE_AWAITING_CHECK,
@@ -181,12 +182,94 @@ def _make_runtime(
     return runtime
 
 
+def test_jax_dev_runtime_owns_jax_config_geometry_and_state_view():
+    runtime = _make_runtime()
+
+    assert isinstance(runtime.environment, JaxStaticEnvironment)
+    assert runtime.environment.config is runtime.environment_config
+    assert not hasattr(runtime, "display_env")
+    assert not hasattr(runtime.environment, "step")
+    assert not hasattr(runtime.environment, "reset")
+    assert runtime.environment.positions == runtime.positions
+
+
+def test_jax_render_snapshot_contract_covers_live_restart_rebound_terminal_and_overtime():
+    runtime = _make_runtime(
+        env_params={
+            "enable_multi_possession": True,
+            "made_basket_restart_mode": "check",
+            "check_setup_steps": 2,
+        }
+    )
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.environment
+    game_state.unified_policy = runtime.unified_policy
+    game_state.defense_policy = runtime.opponent_policy
+    game_state.user_team = runtime.user_team
+    game_state.obs = runtime.observation_dict()
+
+    cases = (
+        ("live", GAME_PHASE_LIVE, False, 0, False),
+        ("check_setup", GAME_PHASE_CHECK_SETUP, False, 0, False),
+        ("awaiting_check", GAME_PHASE_AWAITING_CHECK, False, 0, False),
+        ("awaiting_inbound", GAME_PHASE_AWAITING_INBOUND, False, 0, False),
+        ("rebound", GAME_PHASE_LIVE, False, 0, True),
+        ("terminal", GAME_PHASE_LIVE, True, 0, False),
+        ("overtime", GAME_PHASE_LIVE, False, 1, False),
+    )
+    snapshots = []
+    for label, phase, done, overtime_round, rebound in cases:
+        runtime.state = runtime.state._replace(
+            game_phase=jnp.asarray([phase], dtype=runtime.state.game_phase.dtype),
+            episode_ended=jnp.asarray(
+                [1 if done else 0], dtype=runtime.state.episode_ended.dtype
+            ),
+            overtime_round=jnp.asarray(
+                [overtime_round], dtype=runtime.state.overtime_round.dtype
+            ),
+            overtime_starting_team=jnp.asarray(
+                [TEAM_B if overtime_round else -1],
+                dtype=runtime.state.overtime_starting_team.dtype,
+            ),
+        )
+        runtime.last_action_results = runtime._empty_action_results()
+        if rebound:
+            runtime.last_action_results["rebounds"] = [
+                {"winner": 0, "offensive": True, "target": [1, 1]}
+            ]
+        runtime._sync_environment()
+        payload = runtime._fast_game_state(game_state)
+        snapshots.append(
+            {
+                "label": label,
+                "phase": payload["game_phase"],
+                "done": payload["done"],
+                "in_overtime": payload["in_overtime"],
+                "overtime_round": payload["overtime_round"],
+                "has_rebound": bool(payload["last_action_results"]["rebounds"]),
+                "positions": len(payload["positions"]),
+                "court": [payload["court_width"], payload["court_height"]],
+            }
+        )
+
+    assert snapshots == [
+        {"label": "live", "phase": "live", "done": False, "in_overtime": False, "overtime_round": 0, "has_rebound": False, "positions": 6, "court": [16, 16]},
+        {"label": "check_setup", "phase": "check_setup", "done": False, "in_overtime": False, "overtime_round": 0, "has_rebound": False, "positions": 6, "court": [16, 16]},
+        {"label": "awaiting_check", "phase": "awaiting_check", "done": False, "in_overtime": False, "overtime_round": 0, "has_rebound": False, "positions": 6, "court": [16, 16]},
+        {"label": "awaiting_inbound", "phase": "awaiting_inbound", "done": False, "in_overtime": False, "overtime_round": 0, "has_rebound": False, "positions": 6, "court": [16, 16]},
+        {"label": "rebound", "phase": "live", "done": False, "in_overtime": False, "overtime_round": 0, "has_rebound": True, "positions": 6, "court": [16, 16]},
+        {"label": "terminal", "phase": "live", "done": True, "in_overtime": False, "overtime_round": 0, "has_rebound": False, "positions": 6, "court": [16, 16]},
+        {"label": "overtime", "phase": "live", "done": False, "in_overtime": True, "overtime_round": 1, "has_rebound": False, "positions": 6, "court": [16, 16]},
+    ]
+
+
 def test_jax_dev_runtime_labels_rebound_win_probability_observation_features():
     runtime = _make_runtime()
     runtime.raw_model.spec = _FakeSpec(rebound_win_prob_features=True)
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
@@ -273,13 +356,13 @@ def test_jax_dev_runtime_step_does_not_call_python_env_step(monkeypatch):
     runtime = _make_runtime()
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
     game_state.obs = runtime.observation_dict()
 
-    runtime.display_env.step = _ExplodingPythonEnv().step
+    runtime.environment.step = _ExplodingPythonEnv().step
     choose_calls = 0
     original_choose = runtime._choose_joint_policy_actions
 
@@ -320,7 +403,7 @@ def test_jax_dev_runtime_replace_policies_refreshes_policy_outputs():
     runtime = _make_runtime()
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
@@ -348,7 +431,7 @@ def test_jax_dev_runtime_replace_policies_refreshes_policy_outputs():
     assert runtime._last_attention_payload is None
     assert runtime._last_selector_transition is None
     assert runtime._playbook_batch_runner_cache is None
-    assert game_state.env is runtime.display_env
+    assert game_state.env is runtime.environment
     assert game_state.obs is not None
 
     _, new_probs = runtime._choose_joint_policy_actions(
@@ -369,7 +452,7 @@ def test_jax_dev_runtime_replace_policies_refreshes_jax_static_env_from_metadata
     )
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
@@ -394,7 +477,7 @@ def test_jax_dev_runtime_replace_policies_refreshes_jax_static_env_from_metadata
     )
 
     assert runtime.env_params["enable_rebounds"] is False
-    assert runtime.display_env.enable_rebounds is False
+    assert runtime.environment.enable_rebounds is False
     assert float(np.asarray(runtime.static.rebound_target_temperature)) == pytest.approx(0.75)
     assert float(np.asarray(runtime.static.rebound_winner_temperature)) == pytest.approx(0.5)
     assert int(np.asarray(runtime.static.offensive_rebound_shot_clock_reset)) == 13
@@ -402,7 +485,7 @@ def test_jax_dev_runtime_replace_policies_refreshes_jax_static_env_from_metadata
     assert int(np.asarray(runtime.static.multi_possession_use_inbounds)) == 0
 
     runtime.env_params["enable_rebounds"] = True
-    runtime.display_env.enable_rebounds = True
+    runtime.environment.enable_rebounds = True
     non_rebound_policy = _FakeRawJaxModel(
         metadata={
             "policy_spec": {"model_type": "mlp"},
@@ -416,7 +499,7 @@ def test_jax_dev_runtime_replace_policies_refreshes_jax_static_env_from_metadata
     )
 
     assert runtime.env_params["enable_rebounds"] is False
-    assert runtime.display_env.enable_rebounds is False
+    assert runtime.environment.enable_rebounds is False
     assert int(np.asarray(runtime.static.enable_rebounds)) == 0
 
 
@@ -424,7 +507,7 @@ def test_jax_dev_runtime_self_play_respects_requested_template_seed():
     runtime = _make_runtime()
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
@@ -443,15 +526,15 @@ def test_jax_dev_runtime_self_play_without_template_preserves_current_board():
     runtime = _make_runtime()
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
 
     cells = [
         tuple(int(v) for v in cell)
-        for cell in sorted(runtime.display_env._move_mask_by_cell.keys())
-        if tuple(cell) != tuple(runtime.display_env.basket_position)
+        for cell in sorted(runtime.environment._move_mask_by_cell.keys())
+        if tuple(cell) != tuple(runtime.environment.basket_position)
     ][: runtime.n_players]
     runtime.apply_resolved_start_template(
         {
@@ -478,7 +561,7 @@ def test_jax_dev_runtime_rejects_stale_self_play_steps_without_recording_them():
     runtime = _make_runtime()
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
@@ -522,7 +605,7 @@ def test_jax_dev_runtime_fast_self_play_returns_board_state_with_value_overlay_o
     runtime = _make_runtime()
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
@@ -655,7 +738,7 @@ def _make_selector_runtime_and_state():
     runtime.raw_model.spec = _FakeSpec(intent_selector_enabled=True, num_intents=8)
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
@@ -701,7 +784,7 @@ def _make_multi_possession_selector_runtime_and_state():
     runtime.reset(seed=17)
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
@@ -727,7 +810,7 @@ def _install_jax_runtime_session(monkeypatch, runtime: JaxDevRuntime | None = No
     )
     fresh = GameState()
     fresh.jax_runtime = runtime
-    fresh.env = runtime.display_env
+    fresh.env = runtime.environment
     fresh.unified_policy = runtime.unified_policy
     fresh.defense_policy = runtime.opponent_policy
     fresh.user_team = Team.OFFENSE
@@ -758,7 +841,7 @@ def test_counterfactual_snapshot_restores_jax_runtime_state(monkeypatch):
     baseline_positions = list(runtime.positions)
     baseline_ball_holder = runtime.ball_holder
     baseline_shot_clock = runtime.shot_clock
-    baseline_intent = int(runtime.display_env.intent_index)
+    baseline_intent = int(runtime.environment.intent_index)
 
     capture_body = admin_routes.capture_counterfactual_snapshot_route()
 
@@ -768,6 +851,12 @@ def test_counterfactual_snapshot_restores_jax_runtime_state(monkeypatch):
     assert capture_body["state"]["counterfactual_snapshot_shot_clock"] == baseline_shot_clock
     assert capture_body["state"]["counterfactual_snapshot_ball_holder"] == baseline_ball_holder
     assert capture_body["state"]["counterfactual_snapshot_intent_index"] == baseline_intent
+    assert game_state.counterfactual_snapshot["env"] is None
+    assert "environment" not in game_state.counterfactual_snapshot["jax_runtime"]
+    assert isinstance(
+        game_state.counterfactual_snapshot["jax_runtime"]["environment_config"],
+        type(runtime.environment_config),
+    )
 
     runtime.set_offense_intent_state(
         active=True,
@@ -781,17 +870,17 @@ def test_counterfactual_snapshot_restores_jax_runtime_state(monkeypatch):
         ball_holder=jnp.asarray([1], dtype=jnp.int32),
         shot_clock=jnp.asarray([3], dtype=jnp.int32),
     )
-    runtime._sync_display_env()
-    game_state.env = runtime.display_env
+    runtime._sync_environment()
+    game_state.env = runtime.environment
     game_state.obs = runtime.observation_dict()
 
     backend_state.restore_counterfactual_snapshot()
 
-    assert game_state.env is runtime.display_env
+    assert game_state.env is runtime.environment
     assert runtime.positions == baseline_positions
     assert runtime.ball_holder == baseline_ball_holder
     assert runtime.shot_clock == baseline_shot_clock
-    assert int(runtime.display_env.intent_index) == baseline_intent
+    assert int(runtime.environment.intent_index) == baseline_intent
     assert game_state.obs is not None
 
 
@@ -850,7 +939,7 @@ def test_playbook_analysis_route_forces_jax_runtime_intent(monkeypatch):
     assert body["used_parallel"] is False
     assert calls == [1]
     assert body["panels"][0]["intent_index"] == 1
-    assert game_state.env is runtime.display_env
+    assert game_state.env is runtime.environment
 
 
 def test_jax_dev_runtime_self_play_reselects_after_commitment_timeout(monkeypatch):
@@ -983,7 +1072,7 @@ def test_jax_dev_runtime_selector_multiselect_prefers_checkpoint_metadata():
     }
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.user_team = Team.OFFENSE
     game_state.mlflow_training_params = {
@@ -1308,15 +1397,15 @@ def test_jax_dev_runtime_apply_resolved_template_updates_kernel_state():
     runtime = _make_runtime()
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
 
     cells = [
         tuple(int(v) for v in cell)
-        for cell in sorted(runtime.display_env._move_mask_by_cell.keys())
-        if tuple(cell) != tuple(runtime.display_env.basket_position)
+        for cell in sorted(runtime.environment._move_mask_by_cell.keys())
+        if tuple(cell) != tuple(runtime.environment.basket_position)
     ][: runtime.n_players]
     resolved = {
         "initial_positions": cells,
@@ -1335,28 +1424,28 @@ def test_jax_dev_runtime_apply_resolved_template_updates_kernel_state():
     assert isinstance(game_state.obs, dict)
 
 
-def test_jax_dev_runtime_apply_display_env_edits_updates_kernel_state():
+def test_jax_dev_runtime_apply_environment_edits_updates_kernel_state():
     runtime = _make_runtime()
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
 
     cells = [
         tuple(int(v) for v in cell)
-        for cell in sorted(runtime.display_env._move_mask_by_cell.keys())
-        if tuple(cell) != tuple(runtime.display_env.basket_position)
+        for cell in sorted(runtime.environment._move_mask_by_cell.keys())
+        if tuple(cell) != tuple(runtime.environment.basket_position)
     ][: runtime.n_players]
-    runtime.display_env.positions = cells
-    runtime.display_env.ball_holder = 1
-    runtime.display_env.shot_clock = 17
-    runtime.display_env.offense_layup_pct_by_player = [0.11, 0.22, 0.33]
-    runtime.display_env.offense_three_pt_pct_by_player = [0.44, 0.55, 0.66]
-    runtime.display_env.offense_dunk_pct_by_player = [0.77, 0.88, 0.99]
+    runtime.environment.positions = cells
+    runtime.environment.ball_holder = 1
+    runtime.environment.shot_clock = 17
+    runtime.environment.offense_layup_pct_by_player = [0.11, 0.22, 0.33]
+    runtime.environment.offense_three_pt_pct_by_player = [0.44, 0.55, 0.66]
+    runtime.environment.offense_dunk_pct_by_player = [0.77, 0.88, 0.99]
 
-    runtime.apply_display_env_edits(game_state)
+    runtime.apply_environment_edits(game_state)
 
     assert runtime.positions == cells
     assert runtime.ball_holder == 1
@@ -1433,7 +1522,7 @@ def test_update_player_position_route_syncs_jax_runtime(monkeypatch):
         def __init__(self):
             self.synced = False
 
-        def apply_display_env_edits(self, game_state):
+        def apply_environment_edits(self, game_state):
             self.synced = True
             game_state.obs = {"action_mask": []}
 
@@ -1471,7 +1560,7 @@ def test_set_offense_skills_route_syncs_jax_runtime(monkeypatch):
         def __init__(self):
             self.synced = False
 
-        def apply_display_env_edits(self, game_state):
+        def apply_environment_edits(self, game_state):
             self.synced = True
             game_state.obs = {"action_mask": []}
 
@@ -1521,7 +1610,7 @@ def test_jax_dev_runtime_set_offense_intent_state_updates_kernel_state():
     runtime = _make_runtime()
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
@@ -1539,7 +1628,7 @@ def test_jax_dev_runtime_set_offense_intent_state_updates_kernel_state():
     assert state["intent_index_current"] == 5
     assert state["intent_age"] == 1
     assert state["intent_commitment_remaining"] == 3
-    assert runtime.display_env.intent_index == 5
+    assert runtime.environment.intent_index == 5
 
 
 def test_set_intent_state_route_updates_jax_runtime(monkeypatch):
@@ -1619,7 +1708,7 @@ def test_jax_dev_runtime_exposes_dynamic_multi_possession_game_context():
     )
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
@@ -1795,7 +1884,7 @@ def test_jax_dev_runtime_box_score_is_present_in_full_and_fast_state():
     )
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
@@ -1855,7 +1944,7 @@ def test_jax_dev_runtime_serializes_check_restart_in_full_and_fast_modes():
     )
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
@@ -1941,7 +2030,7 @@ def test_jax_dev_runtime_tracks_and_serializes_check_pickup_rates_by_team():
 
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
@@ -1975,7 +2064,7 @@ def test_out_of_bounds_inbounder_does_not_satisfy_defensive_lane_guarding():
     far_cells = [
         tuple(int(v) for v in cell)
         for cell in np.asarray(runtime.static.cell_coords)
-        if runtime.display_env._hex_distance(tuple(int(v) for v in cell), basket) > 1
+        if runtime.environment._hex_distance(tuple(int(v) for v in cell), basket) > 1
     ]
     for player_id, cell in zip(runtime.offense_ids[1:], far_cells):
         positions[player_id] = cell
@@ -1996,7 +2085,7 @@ def test_out_of_bounds_inbounder_does_not_satisfy_defensive_lane_guarding():
     reentered = next(
         tuple(int(v) for v in cell)
         for cell in np.asarray(runtime.static.cell_coords)
-        if runtime.display_env._hex_distance(tuple(int(v) for v in cell), basket) == 1
+        if runtime.environment._hex_distance(tuple(int(v) for v in cell), basket) == 1
     )
     reentered_positions = positions.copy()
     reentered_positions[inbounder] = reentered
@@ -2033,7 +2122,7 @@ def test_jax_dev_runtime_changes_possession_limit_without_discarding_fast_kernel
     assert runtime.fast_kernel_status()["ready"] is True
     assert runtime._fast_kernel_generation == 7
     assert int(np.asarray(runtime.static.multi_possession_limit)) == 11
-    assert runtime.display_env.multi_possession_limit == 11
+    assert runtime.environment.multi_possession_limit == 11
 
 
 def test_jax_dev_runtime_changes_check_restart_without_discarding_fast_kernel():
@@ -2056,9 +2145,9 @@ def test_jax_dev_runtime_changes_check_restart_without_discarding_fast_kernel():
     assert runtime.env_params["made_basket_restart_mode"] == "check"
     assert runtime.env_params["check_deadline_steps"] == 4
     assert runtime.env_params["check_setup_steps"] == 2
-    assert runtime.display_env.made_basket_restart_mode == "check"
-    assert runtime.display_env.check_deadline_steps == 4
-    assert runtime.display_env.check_setup_steps == 2
+    assert runtime.environment.made_basket_restart_mode == "check"
+    assert runtime.environment.check_deadline_steps == 4
+    assert runtime.environment.check_setup_steps == 2
 
 
 def test_limit_restart_reuses_fast_kernel_and_returns_fresh_game(monkeypatch):
@@ -2074,7 +2163,7 @@ def test_limit_restart_reuses_fast_kernel_and_returns_fresh_game(monkeypatch):
     runtime._fast_kernel_ready = True
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
@@ -2114,7 +2203,7 @@ def test_current_limit_restart_reuses_fast_kernel_and_returns_fresh_game(monkeyp
     )
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE
@@ -2152,7 +2241,7 @@ def test_jax_dev_runtime_keeps_blue_team_as_user_when_red_wins_opening_jump_ball
     )
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.user_team = Team.DEFENSE
 
     state = runtime.get_full_game_state(game_state, include_policy_probs=False)
@@ -2182,7 +2271,7 @@ def test_jax_dev_runtime_matches_native_kernel_for_seeded_multi_possession_actio
     )
     game_state = GameState()
     game_state.jax_runtime = runtime
-    game_state.env = runtime.display_env
+    game_state.env = runtime.environment
     game_state.unified_policy = runtime.unified_policy
     game_state.defense_policy = runtime.opponent_policy
     game_state.user_team = Team.OFFENSE

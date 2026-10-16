@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 import threading
 from typing import Any
 import uuid
 
 import numpy as np
 
-from basketworld.envs.basketworld_env_v2 import ActionType, HexagonBasketballEnv, Team
+from basketworld.domain import ActionType, Team
 from basketworld.utils.play_names import lookup_play_name
 from basketworld.utils.start_templates import resolve_start_template
+from basketworld_jax.config import (
+    JaxEnvironmentConfig,
+    JaxStaticEnvironment,
+    build_static_environment,
+    normalize_runtime_environment_config,
+)
 from basketworld_jax.env.minimal import (
     ACTION_COUNT,
     MULTI_POSSESSION_SCHEMA_VERSION,
@@ -45,7 +51,7 @@ from basketworld_jax.env.minimal import (
     TURNOVER_REASON_PASS_OUT_OF_BOUNDS,
     TURNOVER_REASON_SHOT_CLOCK,
     build_action_masks_batch,
-    build_kernel_static_from_env,
+    build_kernel_static_from_config,
     build_pass_steal_probabilities_batch,
     build_policy_intent_context_batch_with_role_flag,
     build_policy_observation_batch_with_role_flag,
@@ -526,11 +532,7 @@ class _TeamPolicyOutput:
 
 
 class JaxDevRuntime:
-    """Interactive backend runtime that steps the JAX environment state directly.
-
-    A Python HexagonBasketballEnv is still used as a static/config/display template,
-    but action transitions go through basketworld_jax.env.minimal.
-    """
+    """Interactive backend runtime backed only by JAX state and shared geometry."""
 
     def __init__(
         self,
@@ -551,17 +553,8 @@ class JaxDevRuntime:
         self.role_flag_defense = float(role_flag_defense)
         self.required_params = copy.deepcopy(required_params)
         self.env_params = copy.deepcopy(env_params)
-        display_env_params = {
-            key: value
-            for key, value in self.env_params.items()
-            if key not in _JAX_STATIC_ONLY_ENV_KEYS
-        }
-        self.display_env = HexagonBasketballEnv(
-            **self.required_params,
-            **display_env_params,
-            render_mode="rgb_array",
-        )
-        self._apply_jax_static_env_attrs()
+        self.environment_config = self._build_environment_config()
+        self.environment = self._build_environment_view()
 
         raw_model = unwrap_inference_model(unified_policy)
         if raw_model is None or not hasattr(raw_model, "jax"):
@@ -569,7 +562,7 @@ class JaxDevRuntime:
         self.raw_model = raw_model
         self.jax = raw_model.jax
         self.jnp = raw_model.jnp
-        self.static = build_kernel_static_from_env(self.display_env, self.jnp)
+        self.static = build_kernel_static_from_config(self.environment_config, self.jnp)
         self._clearance_zone_cells_cache: tuple[tuple[int, int], ...] | None = None
         self._step_batch_runner = None
         self._fast_action_mask = None
@@ -607,10 +600,29 @@ class JaxDevRuntime:
         self._last_offensive_rebound_boundary = False
         self._last_selector_transition: dict[str, Any] | None = None
 
-    def _apply_jax_static_env_attrs(self) -> None:
-        for key in _JAX_STATIC_ONLY_ENV_KEYS:
-            if key in self.env_params:
-                setattr(self.display_env, key, self.env_params[key])
+    def _build_environment_config(self) -> JaxEnvironmentConfig:
+        config = JaxEnvironmentConfig.from_dev_game_params(
+            self.required_params,
+            self.env_params,
+        )
+        return normalize_runtime_environment_config(config)
+
+    def _build_environment_view(self) -> JaxStaticEnvironment:
+        """Create the mutable backend view from JAX-owned config and geometry."""
+        environment = build_static_environment(self.environment_config)
+        config_fields = {field.name for field in fields(JaxEnvironmentConfig)}
+        # Preserve optional metadata that is intentionally outside kernel state.
+        # The active UI reads this object but never steps or resets it.
+        for key, value in {**self.required_params, **self.env_params}.items():
+            if key.startswith("_") or key in config_fields:
+                continue
+            try:
+                setattr(environment, key, copy.deepcopy(value))
+            except (AttributeError, TypeError):
+                pass
+        environment.render_mode = "jax_state"
+        environment.shot_probs = {}
+        return environment
 
     def _invalidate_compiled_kernels(self) -> None:
         """Discard interactive JIT kernels after a static/config runtime change."""
@@ -767,7 +779,9 @@ class JaxDevRuntime:
                 ),
             )
             self.env_params["multi_possession_limit"] = normalized
-            self.display_env.multi_possession_limit = normalized
+            self.environment_config = self._build_environment_config()
+            self.environment.config = self.environment_config
+            self.environment.multi_possession_limit = normalized
             self._fast_action_mask = None
 
     def set_made_basket_restart(
@@ -813,9 +827,11 @@ class JaxDevRuntime:
             self.env_params["made_basket_restart_mode"] = normalized_mode
             self.env_params["check_deadline_steps"] = normalized_deadline
             self.env_params["check_setup_steps"] = normalized_setup
-            self.display_env.made_basket_restart_mode = normalized_mode
-            self.display_env.check_deadline_steps = normalized_deadline
-            self.display_env.check_setup_steps = normalized_setup
+            self.environment_config = self._build_environment_config()
+            self.environment.config = self.environment_config
+            self.environment.made_basket_restart_mode = normalized_mode
+            self.environment.check_deadline_steps = normalized_deadline
+            self.environment.check_setup_steps = normalized_setup
             self._fast_action_mask = None
 
     def _team_ids(self, team_is_a: bool) -> list[int]:
@@ -863,7 +879,7 @@ class JaxDevRuntime:
             getattr(self.raw_model.spec, "multi_possession_features", False)
         ):
             self.user_team = Team.OFFENSE
-            self.display_env.training_team = Team.OFFENSE
+            self.environment.training_team = Team.OFFENSE
 
     def _next_key(self):
         self._rng_key, key = self.jax.random.split(self._rng_key)
@@ -899,7 +915,8 @@ class JaxDevRuntime:
                 if opponent_raw is not None and opponent_raw is not self.raw_model
                 else None
             ),
-            "display_env": copy.deepcopy(self.display_env),
+            "environment_config": copy.deepcopy(self.environment_config),
+            "env_params": copy.deepcopy(self.env_params),
             "last_step_output": self._clone_jax_tree(self.last_step_output),
             "last_action_results": copy.deepcopy(self.last_action_results),
             "episode_rebounds": copy.deepcopy(self.episode_rebounds),
@@ -936,8 +953,17 @@ class JaxDevRuntime:
             and hasattr(opponent_raw, "_sample_key")
         ):
             opponent_raw._sample_key = self._clone_jax_tree(snapshot["opponent_model_sample_key"])
-        if snapshot.get("display_env") is not None:
-            self.display_env = copy.deepcopy(snapshot["display_env"])
+        if snapshot.get("environment_config") is not None:
+            self.environment_config = copy.deepcopy(snapshot["environment_config"])
+        if snapshot.get("env_params") is not None:
+            self.env_params = copy.deepcopy(snapshot["env_params"])
+        self.environment = self._build_environment_view()
+        self.static = build_kernel_static_from_config(self.environment_config, self.jnp)
+        self._clearance_zone_cells_cache = None
+        self._fast_episode_metadata_cache = None
+        self._invalidate_compiled_kernels()
+        if hasattr(self, "_playbook_batch_runner_cache"):
+            self._playbook_batch_runner_cache = None
         self.last_step_output = self._clone_jax_tree(snapshot.get("last_step_output"))
         self.last_action_results = copy.deepcopy(
             snapshot.get("last_action_results") or self._empty_action_results()
@@ -973,9 +999,9 @@ class JaxDevRuntime:
             snapshot.get("last_offensive_rebound_boundary", False)
         )
         self._last_selector_transition = copy.deepcopy(snapshot.get("last_selector_transition"))
-        self._sync_display_env()
+        self._sync_environment()
         if game_state is not None:
-            game_state.env = self.display_env
+            game_state.env = self.environment
             game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
             game_state.prev_obs = None
             self._capture_turn_start(game_state)
@@ -1024,9 +1050,9 @@ class JaxDevRuntime:
         self._fast_episode_metadata_cache = None
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
-        self._sync_display_env()
+        self._sync_environment()
         if game_state is not None:
-            game_state.env = self.display_env
+            game_state.env = self.environment
             game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
             game_state.prev_obs = None
         return {
@@ -1034,10 +1060,19 @@ class JaxDevRuntime:
             "rebound_skill_specialists": [bool(v > 0.0) for v in specialist_values.tolist()],
         }
 
-    def refresh_static_from_display_env(self) -> None:
-        """Refresh immutable JAX kernel config after live display-env edits."""
-        self._apply_jax_static_env_attrs()
-        self.static = build_kernel_static_from_env(self.display_env, self.jnp)
+    def refresh_static_from_environment(self) -> None:
+        """Refresh immutable JAX kernel config after live runtime-view edits."""
+        current_view = self.environment
+        for field in fields(JaxEnvironmentConfig):
+            if hasattr(current_view, field.name):
+                self.env_params[field.name] = copy.deepcopy(
+                    getattr(current_view, field.name)
+                )
+        self.environment_config = self._build_environment_config()
+        self.environment = self._build_environment_view()
+        self.static = build_kernel_static_from_config(self.environment_config, self.jnp)
+        if self.state is not None:
+            self._sync_environment()
         self._clearance_zone_cells_cache = None
         self._fast_episode_metadata_cache = None
         self._invalidate_compiled_kernels()
@@ -1069,7 +1104,9 @@ class JaxDevRuntime:
         checkpoint_static_params = _jax_static_env_params_from_policy(unified_policy)
         if checkpoint_static_params:
             self.env_params.update(checkpoint_static_params)
-            self.refresh_static_from_display_env()
+            for key, value in checkpoint_static_params.items():
+                setattr(self.environment, key, copy.deepcopy(value))
+            self.refresh_static_from_environment()
 
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
@@ -1078,7 +1115,7 @@ class JaxDevRuntime:
             self._playbook_batch_runner_cache = None
 
         if game_state is not None:
-            game_state.env = self.display_env
+            game_state.env = self.environment
             if self.state is not None:
                 game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
             game_state.prev_obs = None
@@ -1131,7 +1168,7 @@ class JaxDevRuntime:
         self._last_completed_pass_boundary = False
         self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
-        self._sync_display_env()
+        self._sync_environment()
         return {"start_template": template_metadata} if template_metadata else {}
 
     @staticmethod
@@ -1334,17 +1371,17 @@ class JaxDevRuntime:
         self._last_completed_pass_boundary = False
         self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
-        self._sync_display_env()
-        self.display_env.training_team = self.user_team
-        self.display_env.shot_clock_steps = int(shot_clock)
-        self.display_env.min_shot_clock = int(shot_clock)
+        self._sync_environment()
+        self.environment.training_team = self.user_team
+        self.environment.shot_clock_steps = int(shot_clock)
+        self.environment.min_shot_clock = int(shot_clock)
 
         game_state.user_team = self.user_team
-        game_state.env = self.display_env
+        game_state.env = self.environment
         game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
         game_state.prev_obs = None
         self._apply_selector_episode_start(game_state)
-        self._sync_display_env()
+        self._sync_environment()
         game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
         self._capture_turn_start(game_state)
         return self.get_full_game_state(
@@ -1382,19 +1419,19 @@ class JaxDevRuntime:
         if template is None:
             raise ValueError(f"Unknown start template: {template_id}")
 
-        original_rng = getattr(self.display_env, "_rng", None)
+        original_rng = getattr(self.environment, "_rng", None)
         if seed is not None:
-            self.display_env._rng = np.random.default_rng(int(seed))
+            self.environment._rng = np.random.default_rng(int(seed))
         try:
             resolved = resolve_start_template(
-                self.display_env,
+                self.environment,
                 template,
                 jitter_scale=float(self.env_params.get("start_template_jitter_scale", 1.0)),
                 mirror=bool(template_mirrored) and bool(template.get("mirrorable", False)),
             )
         finally:
             if seed is not None:
-                self.display_env._rng = original_rng
+                self.environment._rng = original_rng
 
         positions = np.asarray(resolved["initial_positions"], dtype=np.int32).reshape(self.n_players, 2)
         ball_holder = int(resolved["ball_holder"]) if resolved.get("ball_holder") is not None else -1
@@ -1746,7 +1783,7 @@ class JaxDevRuntime:
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
         if not fast_mode:
-            self._sync_display_env()
+            self._sync_environment()
             game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
         game_state.prev_obs = None
         game_state.actions_log.append([int(v) for v in full_actions.tolist()])
@@ -1879,7 +1916,7 @@ class JaxDevRuntime:
             ).get("start_template")
         else:
             meta = None
-            self._sync_display_env()
+            self._sync_environment()
         if meta is not None and "source" not in meta:
             meta["source"] = getattr(game_state, "start_template_library_source", None)
         self._last_completed_pass_boundary = False
@@ -1957,7 +1994,7 @@ class JaxDevRuntime:
         self._last_completed_pass_boundary = False
         self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
-        self._sync_display_env()
+        self._sync_environment()
         game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
         game_state.prev_obs = None
         return {"status": "success", "state": self.get_full_game_state(game_state, include_policy_probs=True, include_state_values=True)}
@@ -1997,16 +2034,16 @@ class JaxDevRuntime:
         self._last_completed_pass_boundary = False
         self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
-        self._sync_display_env()
+        self._sync_environment()
         game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
         game_state.prev_obs = None
         self._capture_turn_start(game_state)
 
-    def apply_display_env_edits(self, game_state: Any) -> None:
-        """Import live board edits from the display env into the JAX kernel state."""
+    def apply_environment_edits(self, game_state: Any) -> None:
+        """Import live board edits from the JAX runtime view into kernel state."""
         if self.state is None:
             raise RuntimeError("JAX runtime is not initialized.")
-        env = self.display_env
+        env = self.environment
         positions = np.asarray(getattr(env, "positions", []), dtype=np.int32).reshape(
             self.n_players,
             2,
@@ -2045,7 +2082,7 @@ class JaxDevRuntime:
         self._fast_episode_metadata_cache = None
         self._last_policy_probs = None
         self._clear_attention_payload_cache()
-        self._sync_display_env()
+        self._sync_environment()
         game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
         game_state.prev_obs = None
 
@@ -2074,7 +2111,7 @@ class JaxDevRuntime:
         self._last_completed_pass_boundary = False
         self._last_offensive_rebound_boundary = False
         self._last_selector_transition = None
-        self._sync_display_env()
+        self._sync_environment()
         game_state.obs = self.observation_dict(observer_is_offense=self.user_team_is_a)
         game_state.prev_obs = None
 
@@ -2092,8 +2129,8 @@ class JaxDevRuntime:
     def shot_clock(self) -> int:
         return _as_int(_field0(self.state, "shot_clock"))
 
-    def _sync_display_env(self) -> None:
-        env = self.display_env
+    def _sync_environment(self) -> None:
+        env = self.environment
         env.positions = self.positions
         env.ball_holder = self.ball_holder
         env.shot_clock = self.shot_clock
@@ -3379,31 +3416,31 @@ class JaxDevRuntime:
             }
 
         shot_params = {
-            "layup_pct": float(self.display_env.layup_pct or 0.0),
-            "three_pt_pct": float(self.display_env.three_pt_pct or 0.0),
+            "layup_pct": float(self.environment.layup_pct or 0.0),
+            "three_pt_pct": float(self.environment.three_pt_pct or 0.0),
             "three_pt_extra_hex_decay": float(
-                self.display_env.three_pt_extra_hex_decay or 0.05
+                self.environment.three_pt_extra_hex_decay or 0.05
             ),
-            "dunk_pct": float(self.display_env.dunk_pct or 0.0),
-            "layup_std": float(self.display_env.layup_std or 0.0),
-            "three_pt_std": float(self.display_env.three_pt_std or 0.0),
-            "dunk_std": float(self.display_env.dunk_std or 0.0),
-            "allow_dunks": bool(self.display_env.allow_dunks),
+            "dunk_pct": float(self.environment.dunk_pct or 0.0),
+            "layup_std": float(self.environment.layup_std or 0.0),
+            "three_pt_std": float(self.environment.three_pt_std or 0.0),
+            "dunk_std": float(self.environment.dunk_std or 0.0),
+            "allow_dunks": bool(self.environment.allow_dunks),
         }
         rebound_runtime = {
-            "enabled": bool(getattr(self.display_env, "enable_rebounds", False)),
+            "enabled": bool(getattr(self.environment, "enable_rebounds", False)),
             "kernel_enabled": _as_bool(self.static.enable_rebounds),
             "table_model_dir": str(
-                getattr(self.display_env, "rebound_table_model_dir", "") or ""
+                getattr(self.environment, "rebound_table_model_dir", "") or ""
             ),
             "target_temperature": float(
-                getattr(self.display_env, "rebound_target_temperature", 1.0)
+                getattr(self.environment, "rebound_target_temperature", 1.0)
             ),
             "target_uniform_mix": float(
-                getattr(self.display_env, "rebound_target_uniform_mix", 0.0)
+                getattr(self.environment, "rebound_target_uniform_mix", 0.0)
             ),
             "winner_distance_weight": float(
-                getattr(self.display_env, "rebound_winner_distance_weight", 1.0)
+                getattr(self.environment, "rebound_winner_distance_weight", 1.0)
             ),
             "basket_position_weight": _float_from_static_field(
                 self.static,
@@ -3411,10 +3448,10 @@ class JaxDevRuntime:
                 0.0,
             ),
             "winner_temperature": float(
-                getattr(self.display_env, "rebound_winner_temperature", 1.0)
+                getattr(self.environment, "rebound_winner_temperature", 1.0)
             ),
             "skill_std": float(
-                getattr(self.display_env, "rebound_skill_std", 0.0)
+                getattr(self.environment, "rebound_skill_std", 0.0)
             ),
             "skill_sampling_mode": _rebound_skill_sampling_mode_from_static(
                 self.static
@@ -3430,7 +3467,7 @@ class JaxDevRuntime:
                 -0.25,
             ),
             "skill_weight": float(
-                getattr(self.display_env, "rebound_skill_weight", 0.0)
+                getattr(self.environment, "rebound_skill_weight", 0.0)
             ),
             "contest_mode": _rebound_contest_mode_from_static(self.static),
             "contest_radius": _int_from_static_field(
@@ -3444,11 +3481,11 @@ class JaxDevRuntime:
                 0,
             ),
             "offensive_rebound_shot_clock_reset": int(
-                getattr(self.display_env, "offensive_rebound_shot_clock_reset", 14)
+                getattr(self.environment, "offensive_rebound_shot_clock_reset", 14)
             ),
             "terminal_reward_mode": str(
                 getattr(
-                    self.display_env,
+                    self.environment,
                     "rebound_terminal_reward_mode",
                     "actual_points",
                 )
@@ -3573,10 +3610,8 @@ class JaxDevRuntime:
         estimates are an intentional exception when requested for the board
         overlay.
         """
-        # Do not synchronize the legacy Python environment here.  That path
-        # performs many individual device-to-host reads and exists only for
-        # interactive inspector compatibility.  A compact Fast Mode payload
-        # can be built from a single JAX state snapshot instead.
+        # A compact Fast Mode payload comes from one JAX state snapshot instead
+        # of the individual device-to-host reads used by the inspector view.
         device_values: dict[str, Any] = {
             "positions": _field0(self.state, "positions"),
             "ball_holder": _field0(self.state, "ball_holder"),
@@ -3731,14 +3766,14 @@ class JaxDevRuntime:
 
         state = {
             "fast_mode": True,
-            "players_per_side": int(self.display_env.players_per_side or 3),
-            "players": int(self.display_env.players_per_side or 3),
+            "players_per_side": int(self.environment.players_per_side or 3),
+            "players": int(self.environment.players_per_side or 3),
             "positions": positions,
             "ball_holder": ball_holder,
             "action_mask": action_mask.tolist(),
             "shot_clock": int(np.asarray(host["shot_clock"]).reshape(-1)[0]),
-            "min_shot_clock": int(self.display_env.min_shot_clock or 10),
-            "shot_clock_steps": int(self.display_env.shot_clock_steps or 24),
+            "min_shot_clock": int(self.environment.min_shot_clock or 10),
+            "shot_clock_steps": int(self.environment.shot_clock_steps or 24),
             "user_team_name": self.user_team.name,
             "done": bool(np.asarray(host["episode_ended"]).reshape(-1)[0]),
             "enable_multi_possession": bool(self.multi_possession_enabled),
@@ -3862,8 +3897,8 @@ class JaxDevRuntime:
                 and game_phase == GAME_PHASE_LIVE
             ),
             "clearance_zone_cells": clearance_zone_cells,
-            "enable_intent_learning": bool(self.display_env.enable_intent_learning),
-            "num_intents": int(self.display_env.num_intents or 0),
+            "enable_intent_learning": bool(self.environment.enable_intent_learning),
+            "num_intents": int(self.environment.num_intents or 0),
             "play_name_map": play_map,
             "intent_active_current": intent_active,
             "intent_index_current": intent_index,
@@ -3881,25 +3916,25 @@ class JaxDevRuntime:
             "last_action_results": copy.deepcopy(self.last_action_results),
             "episode_check_stats": copy.deepcopy(self.episode_check_stats),
             "basket_position": tuple(int(v) for v in np.asarray(self.static.basket_position).tolist()),
-            "court_width": int(self.display_env.court_width),
-            "court_height": int(self.display_env.court_height),
-            "three_point_distance": float(self.display_env.three_point_distance or 4.0),
+            "court_width": int(self.environment.court_width),
+            "court_height": int(self.environment.court_height),
+            "three_point_distance": float(self.environment.three_point_distance or 4.0),
             "three_point_short_distance": (
-                float(self.display_env.three_point_short_distance)
-                if self.display_env.three_point_short_distance is not None
+                float(self.environment.three_point_short_distance)
+                if self.environment.three_point_short_distance is not None
                 else None
             ),
             "three_point_hexes": [
-                (int(q), int(r)) for q, r in getattr(self.display_env, "_three_point_hexes", set())
+                (int(q), int(r)) for q, r in getattr(self.environment, "_three_point_hexes", set())
             ],
             "offensive_lane_hexes": [
-                (int(q), int(r)) for q, r in (self.display_env.offensive_lane_hexes or set())
+                (int(q), int(r)) for q, r in (self.environment.offensive_lane_hexes or set())
             ],
             "defensive_lane_hexes": [
-                (int(q), int(r)) for q, r in (self.display_env.defensive_lane_hexes or set())
+                (int(q), int(r)) for q, r in (self.environment.defensive_lane_hexes or set())
             ],
-            "offensive_three_seconds_enabled": bool(self.display_env.offensive_three_seconds_enabled),
-            "three_second_max_steps": int(self.display_env.three_second_max_steps or 3),
+            "offensive_three_seconds_enabled": bool(self.environment.offensive_three_seconds_enabled),
+            "three_second_max_steps": int(self.environment.three_second_max_steps or 3),
             "offensive_lane_steps": {
                 int(pid): int(v)
                 for pid, v in enumerate(np.asarray(host["offense_lane_steps"]).reshape(-1).tolist())
@@ -3915,7 +3950,7 @@ class JaxDevRuntime:
                     dtype=np.float32,
                 ).reshape(-1).tolist()
             ],
-            "pass_mode": self.display_env.pass_mode or "directional",
+            "pass_mode": self.environment.pass_mode or "directional",
         }
         episode_metadata = self._fast_episode_metadata(game_state)
         state["offense_shooting_pct_by_player"] = copy.deepcopy(
@@ -3950,7 +3985,7 @@ class JaxDevRuntime:
                 include_state_values=include_state_values,
                 include_episode_metadata=include_episode_metadata,
             )
-        self._sync_display_env()
+        self._sync_environment()
         observer_is_offense = game_state.user_team != Team.DEFENSE
         obs_dict = self.observation_dict(observer_is_offense=observer_is_offense)
         game_state.obs = obs_dict
@@ -4086,15 +4121,15 @@ class JaxDevRuntime:
                     legal_inbound_entry_positions.append([int(origin[0] + dq), int(origin[1] + dr)])
 
         state = {
-            "players_per_side": int(self.display_env.players_per_side or 3),
-            "players": int(self.display_env.players_per_side or 3),
+            "players_per_side": int(self.environment.players_per_side or 3),
+            "players": int(self.environment.players_per_side or 3),
             "positions": positions,
             "ball_holder": ball_holder,
             "ball_handler_shot_probability": float(shot_prob[ball_holder]) if ball_holder is not None else None,
             "pass_steal_probabilities": self.pass_steal_probabilities(),
             "shot_clock": self.shot_clock,
-            "min_shot_clock": int(self.display_env.min_shot_clock or 10),
-            "shot_clock_steps": int(self.display_env.shot_clock_steps or 24),
+            "min_shot_clock": int(self.environment.min_shot_clock or 10),
+            "shot_clock_steps": int(self.environment.shot_clock_steps or 24),
             "user_team_name": self.user_team.name,
             "done": _as_bool(_field0(self.state, "episode_ended")),
             "enable_multi_possession": bool(self.multi_possession_enabled),
@@ -4261,7 +4296,7 @@ class JaxDevRuntime:
                 if self.multi_possession_enabled
                 else None
             ),
-            "training_team": getattr(self.display_env.training_team, "name", None),
+            "training_team": getattr(self.environment.training_team, "name", None),
             "counterfactual_snapshot_available": bool(counterfactual_snapshot["available"]),
             "counterfactual_snapshot_step": counterfactual_snapshot["captured_step"],
             "counterfactual_snapshot_shot_clock": counterfactual_snapshot["shot_clock"],
@@ -4294,112 +4329,112 @@ class JaxDevRuntime:
             "offense_ids": active_offense_ids,
             "defense_ids": active_defense_ids,
             "basket_position": tuple(int(v) for v in np.asarray(self.static.basket_position).tolist()),
-            "court_width": int(self.display_env.court_width),
-            "court_height": int(self.display_env.court_height),
-            "three_point_distance": float(self.display_env.three_point_distance or 4.0),
+            "court_width": int(self.environment.court_width),
+            "court_height": int(self.environment.court_height),
+            "three_point_distance": float(self.environment.three_point_distance or 4.0),
             "three_point_short_distance": (
-                float(self.display_env.three_point_short_distance)
-                if self.display_env.three_point_short_distance is not None
+                float(self.environment.three_point_short_distance)
+                if self.environment.three_point_short_distance is not None
                 else None
             ),
             "three_point_hexes": [
-                (int(q), int(r)) for q, r in getattr(self.display_env, "_three_point_hexes", set())
+                (int(q), int(r)) for q, r in getattr(self.environment, "_three_point_hexes", set())
             ],
             "three_point_line_hexes": [
-                (int(q), int(r)) for q, r in getattr(self.display_env, "_three_point_line_hexes", set())
+                (int(q), int(r)) for q, r in getattr(self.environment, "_three_point_line_hexes", set())
             ],
             "three_point_outline": [
-                (float(x), float(y)) for x, y in getattr(self.display_env, "_three_point_outline_points", [])
+                (float(x), float(y)) for x, y in getattr(self.environment, "_three_point_outline_points", [])
             ],
-            "shot_probs": getattr(self.display_env, "shot_probs", {}),
+            "shot_probs": getattr(self.environment, "shot_probs", {}),
             "shot_params": {
-                "layup_pct": float(self.display_env.layup_pct or 0.0),
-                "three_pt_pct": float(self.display_env.three_pt_pct or 0.0),
-                "three_pt_extra_hex_decay": float(self.display_env.three_pt_extra_hex_decay or 0.05),
-                "dunk_pct": float(self.display_env.dunk_pct or 0.0),
-                "layup_std": float(self.display_env.layup_std or 0.0),
-                "three_pt_std": float(self.display_env.three_pt_std or 0.0),
-                "dunk_std": float(self.display_env.dunk_std or 0.0),
-                "allow_dunks": bool(self.display_env.allow_dunks),
+                "layup_pct": float(self.environment.layup_pct or 0.0),
+                "three_pt_pct": float(self.environment.three_pt_pct or 0.0),
+                "three_pt_extra_hex_decay": float(self.environment.three_pt_extra_hex_decay or 0.05),
+                "dunk_pct": float(self.environment.dunk_pct or 0.0),
+                "layup_std": float(self.environment.layup_std or 0.0),
+                "three_pt_std": float(self.environment.three_pt_std or 0.0),
+                "dunk_std": float(self.environment.dunk_std or 0.0),
+                "allow_dunks": bool(self.environment.allow_dunks),
             },
             "rebound_runtime": {
-                "enabled": bool(getattr(self.display_env, "enable_rebounds", False)),
+                "enabled": bool(getattr(self.environment, "enable_rebounds", False)),
                 "kernel_enabled": _as_bool(self.static.enable_rebounds),
-                "table_model_dir": str(getattr(self.display_env, "rebound_table_model_dir", "") or ""),
-                "target_temperature": float(getattr(self.display_env, "rebound_target_temperature", 1.0)),
-                "target_uniform_mix": float(getattr(self.display_env, "rebound_target_uniform_mix", 0.0)),
-                "winner_distance_weight": float(getattr(self.display_env, "rebound_winner_distance_weight", 1.0)),
+                "table_model_dir": str(getattr(self.environment, "rebound_table_model_dir", "") or ""),
+                "target_temperature": float(getattr(self.environment, "rebound_target_temperature", 1.0)),
+                "target_uniform_mix": float(getattr(self.environment, "rebound_target_uniform_mix", 0.0)),
+                "winner_distance_weight": float(getattr(self.environment, "rebound_winner_distance_weight", 1.0)),
                 "basket_position_weight": _float_from_static_field(self.static, "rebound_basket_position_weight", 0.0),
-                "winner_temperature": float(getattr(self.display_env, "rebound_winner_temperature", 1.0)),
-                "skill_std": float(getattr(self.display_env, "rebound_skill_std", 0.0)),
+                "winner_temperature": float(getattr(self.environment, "rebound_winner_temperature", 1.0)),
+                "skill_std": float(getattr(self.environment, "rebound_skill_std", 0.0)),
                 "skill_sampling_mode": _rebound_skill_sampling_mode_from_static(self.static),
                 "skill_high": _float_from_static_field(self.static, "rebound_skill_high", 1.0),
                 "skill_low": _float_from_static_field(self.static, "rebound_skill_low", -0.25),
-                "skill_weight": float(getattr(self.display_env, "rebound_skill_weight", 0.0)),
+                "skill_weight": float(getattr(self.environment, "rebound_skill_weight", 0.0)),
                 "contest_mode": _rebound_contest_mode_from_static(self.static),
                 "contest_radius": _int_from_static_field(self.static, "rebound_contest_radius", 1),
                 "obs_top_n_targets": _int_from_static_field(self.static, "rebound_obs_top_n_targets", 0),
-                "offensive_rebound_shot_clock_reset": int(getattr(self.display_env, "offensive_rebound_shot_clock_reset", 14)),
-                "terminal_reward_mode": str(getattr(self.display_env, "rebound_terminal_reward_mode", "actual_points") or "actual_points"),
+                "offensive_rebound_shot_clock_reset": int(getattr(self.environment, "offensive_rebound_shot_clock_reset", 14)),
+                "terminal_reward_mode": str(getattr(self.environment, "rebound_terminal_reward_mode", "actual_points") or "actual_points"),
                 "reward_redistribution_enabled": _as_bool(self.static.enable_rebound_reward_redistribution),
                 "offensive_rebound_reward_advance": _float_from_static_field(self.static, "offensive_rebound_reward_advance", 0.4),
                 "reward_once_per_possession": _as_bool(self.static.rebound_reward_once_per_possession),
                 "target_table_shape": [int(v) for v in self.static.rebound_target_probs.shape],
             },
-            "defender_pressure_distance": int(self.display_env.defender_pressure_distance or 1),
-            "defender_pressure_turnover_chance": float(self.display_env.defender_pressure_turnover_chance or 0.05),
-            "defender_pressure_decay_lambda": float(self.display_env.defender_pressure_decay_lambda or 1.0),
-            "base_steal_rate": float(self.display_env.base_steal_rate or 0.35),
-            "steal_perp_decay": float(self.display_env.steal_perp_decay or 1.5),
-            "steal_distance_factor": float(self.display_env.steal_distance_factor or 0.08),
-            "steal_position_weight_min": float(self.display_env.steal_position_weight_min or 0.3),
-            "pass_interception_model": str(getattr(self.display_env, "pass_interception_model", "line") or "line"),
-            "pass_passer_pressure_weight": float(getattr(self.display_env, "pass_passer_pressure_weight", 0.0)),
-            "pass_receiver_pressure_weight": float(getattr(self.display_env, "pass_receiver_pressure_weight", 0.0)),
-            "pass_lob_lane_multiplier": float(getattr(self.display_env, "pass_lob_lane_multiplier", 0.35)),
-            "pass_lob_receiver_distance": float(getattr(self.display_env, "pass_lob_receiver_distance", 1.0)),
-            "pass_speed": float(getattr(self.display_env, "pass_speed", 3.5)),
-            "defender_reaction_time": float(getattr(self.display_env, "defender_reaction_time", 0.35)),
-            "defender_speed": float(getattr(self.display_env, "defender_speed", 1.25)),
-            "defender_reach_radius": float(getattr(self.display_env, "defender_reach_radius", 0.65)),
-            "reaction_softness": float(getattr(self.display_env, "reaction_softness", 0.55)),
-            "base_passer_risk": float(getattr(self.display_env, "base_passer_risk", 0.06)),
-            "passer_pressure_decay": float(getattr(self.display_env, "passer_pressure_decay", 1.35)),
-            "base_receiver_risk": float(getattr(self.display_env, "base_receiver_risk", 0.35)),
-            "receiver_alignment_min": float(getattr(self.display_env, "receiver_alignment_min", 0.35)),
-            "receiver_alignment_width": float(getattr(self.display_env, "receiver_alignment_width", 2.0)),
-            "max_receiver_hazard": float(getattr(self.display_env, "max_receiver_hazard", 0.85)),
-            "lane_weight": float(getattr(self.display_env, "lane_weight", 0.0)),
-            "spawn_distance": int(self.display_env.spawn_distance or 3),
+            "defender_pressure_distance": int(self.environment.defender_pressure_distance or 1),
+            "defender_pressure_turnover_chance": float(self.environment.defender_pressure_turnover_chance or 0.05),
+            "defender_pressure_decay_lambda": float(self.environment.defender_pressure_decay_lambda or 1.0),
+            "base_steal_rate": float(self.environment.base_steal_rate or 0.35),
+            "steal_perp_decay": float(self.environment.steal_perp_decay or 1.5),
+            "steal_distance_factor": float(self.environment.steal_distance_factor or 0.08),
+            "steal_position_weight_min": float(self.environment.steal_position_weight_min or 0.3),
+            "pass_interception_model": str(getattr(self.environment, "pass_interception_model", "line") or "line"),
+            "pass_passer_pressure_weight": float(getattr(self.environment, "pass_passer_pressure_weight", 0.0)),
+            "pass_receiver_pressure_weight": float(getattr(self.environment, "pass_receiver_pressure_weight", 0.0)),
+            "pass_lob_lane_multiplier": float(getattr(self.environment, "pass_lob_lane_multiplier", 0.35)),
+            "pass_lob_receiver_distance": float(getattr(self.environment, "pass_lob_receiver_distance", 1.0)),
+            "pass_speed": float(getattr(self.environment, "pass_speed", 3.5)),
+            "defender_reaction_time": float(getattr(self.environment, "defender_reaction_time", 0.35)),
+            "defender_speed": float(getattr(self.environment, "defender_speed", 1.25)),
+            "defender_reach_radius": float(getattr(self.environment, "defender_reach_radius", 0.65)),
+            "reaction_softness": float(getattr(self.environment, "reaction_softness", 0.55)),
+            "base_passer_risk": float(getattr(self.environment, "base_passer_risk", 0.06)),
+            "passer_pressure_decay": float(getattr(self.environment, "passer_pressure_decay", 1.35)),
+            "base_receiver_risk": float(getattr(self.environment, "base_receiver_risk", 0.35)),
+            "receiver_alignment_min": float(getattr(self.environment, "receiver_alignment_min", 0.35)),
+            "receiver_alignment_width": float(getattr(self.environment, "receiver_alignment_width", 2.0)),
+            "max_receiver_hazard": float(getattr(self.environment, "max_receiver_hazard", 0.85)),
+            "lane_weight": float(getattr(self.environment, "lane_weight", 0.0)),
+            "spawn_distance": int(self.environment.spawn_distance or 3),
             "max_spawn_distance": (
-                int(self.display_env.max_spawn_distance)
-                if self.display_env.max_spawn_distance is not None
+                int(self.environment.max_spawn_distance)
+                if self.environment.max_spawn_distance is not None
                 else None
             ),
-            "defender_spawn_distance": int(self.display_env.defender_spawn_distance or 0),
-            "defender_guard_distance": int(self.display_env.defender_guard_distance or 1),
-            "offense_spawn_boundary_margin": int(self.display_env.offense_spawn_boundary_margin or 0),
-            "shot_pressure_enabled": bool(self.display_env.shot_pressure_enabled),
-            "shot_pressure_max": float(self.display_env.shot_pressure_max or 0.5),
-            "shot_pressure_lambda": float(self.display_env.shot_pressure_lambda or 1.0),
-            "shot_pressure_arc_degrees": float(self.display_env.shot_pressure_arc_degrees or 60.0),
-            "three_pt_extra_hex_decay": float(self.display_env.three_pt_extra_hex_decay or 0.05),
-            "mask_occupied_moves": bool(self.display_env.mask_occupied_moves),
-            "three_second_lane_width": int(self.display_env.three_second_lane_width or 1),
-            "three_second_lane_height": int(self.display_env.three_second_lane_height or 3),
-            "three_second_max_steps": int(self.display_env.three_second_max_steps or 3),
-            "illegal_defense_enabled": bool(self.display_env.illegal_defense_enabled),
-            "offensive_three_seconds_enabled": bool(self.display_env.offensive_three_seconds_enabled),
-            "enable_intent_learning": bool(self.display_env.enable_intent_learning),
-            "num_intents": int(self.display_env.num_intents or 0),
-            "intent_commitment_steps": int(self.display_env.intent_commitment_steps or 0),
-            "intent_null_prob": float(self.display_env.intent_null_prob or 0.0),
-            "intent_visible_to_defense_prob": float(self.display_env.intent_visible_to_defense_prob or 0.0),
-            "enable_defense_intent_learning": bool(self.display_env.enable_defense_intent_learning),
-            "defense_intent_null_prob": float(self.display_env.defense_intent_null_prob or 1.0),
+            "defender_spawn_distance": int(self.environment.defender_spawn_distance or 0),
+            "defender_guard_distance": int(self.environment.defender_guard_distance or 1),
+            "offense_spawn_boundary_margin": int(self.environment.offense_spawn_boundary_margin or 0),
+            "shot_pressure_enabled": bool(self.environment.shot_pressure_enabled),
+            "shot_pressure_max": float(self.environment.shot_pressure_max or 0.5),
+            "shot_pressure_lambda": float(self.environment.shot_pressure_lambda or 1.0),
+            "shot_pressure_arc_degrees": float(self.environment.shot_pressure_arc_degrees or 60.0),
+            "three_pt_extra_hex_decay": float(self.environment.three_pt_extra_hex_decay or 0.05),
+            "mask_occupied_moves": bool(self.environment.mask_occupied_moves),
+            "three_second_lane_width": int(self.environment.three_second_lane_width or 1),
+            "three_second_lane_height": int(self.environment.three_second_lane_height or 3),
+            "three_second_max_steps": int(self.environment.three_second_max_steps or 3),
+            "illegal_defense_enabled": bool(self.environment.illegal_defense_enabled),
+            "offensive_three_seconds_enabled": bool(self.environment.offensive_three_seconds_enabled),
+            "enable_intent_learning": bool(self.environment.enable_intent_learning),
+            "num_intents": int(self.environment.num_intents or 0),
+            "intent_commitment_steps": int(self.environment.intent_commitment_steps or 0),
+            "intent_null_prob": float(self.environment.intent_null_prob or 0.0),
+            "intent_visible_to_defense_prob": float(self.environment.intent_visible_to_defense_prob or 0.0),
+            "enable_defense_intent_learning": bool(self.environment.enable_defense_intent_learning),
+            "defense_intent_null_prob": float(self.environment.defense_intent_null_prob or 1.0),
             "play_name_map": play_map,
             "intent_diversity_enabled": bool((getattr(game_state, "mlflow_training_params", None) or {}).get("intent_diversity_enabled", False)),
-            "intent_obs_mode": str(getattr(self.display_env, "intent_obs_mode", "private_offense") or "private_offense"),
+            "intent_obs_mode": str(getattr(self.environment, "intent_obs_mode", "private_offense") or "private_offense"),
             "intent_active_current": _as_bool(_field0(self.state, "intent_active")),
             "intent_index_current": _as_int(_field0(self.state, "intent_index")),
             "current_play_name": lookup_play_name(play_map, _as_int(_field0(self.state, "intent_index"))),
@@ -4413,12 +4448,12 @@ class JaxDevRuntime:
             "current_defense_play_name": lookup_play_name(play_map, _as_int(_field0(self.state, "defense_intent_index"))),
             "defense_intent_age": _as_int(_field0(self.state, "defense_intent_age")),
             "defense_intent_commitment_remaining": _as_int(_field0(self.state, "defense_intent_commitment_remaining")),
-            "include_hoop_vector": bool(self.display_env.include_hoop_vector),
+            "include_hoop_vector": bool(self.environment.include_hoop_vector),
             "offensive_lane_hexes": [
-                (int(q), int(r)) for q, r in (self.display_env.offensive_lane_hexes or set())
+                (int(q), int(r)) for q, r in (self.environment.offensive_lane_hexes or set())
             ],
             "defensive_lane_hexes": [
-                (int(q), int(r)) for q, r in (self.display_env.defensive_lane_hexes or set())
+                (int(q), int(r)) for q, r in (self.environment.defensive_lane_hexes or set())
             ],
             "offensive_lane_steps": {
                 int(pid): int(v)
@@ -4428,14 +4463,17 @@ class JaxDevRuntime:
                 int(pid): int(v)
                 for pid, v in enumerate(np.asarray(_field0(self.state, "defense_lane_steps")).tolist())
             },
-            "pass_arc_degrees": float(self.display_env.pass_arc_degrees or 60.0),
-            "pass_oob_turnover_prob": float(self.display_env.pass_oob_turnover_prob or 1.0),
-            "pass_target_strategy": self.display_env.pass_target_strategy or "nearest",
-            "pass_mode": self.display_env.pass_mode or "directional",
+            "pass_arc_degrees": float(self.environment.pass_arc_degrees or 60.0),
+            "pass_oob_turnover_prob": float(self.environment.pass_oob_turnover_prob or 1.0),
+            "pass_target_strategy": self.environment.pass_target_strategy or "nearest",
+            "pass_mode": self.environment.pass_mode or "directional",
             "illegal_action_policy": (
-                self.display_env.illegal_action_policy.value
-                if self.display_env.illegal_action_policy
-                else "noop"
+                getattr(
+                    self.environment.illegal_action_policy,
+                    "value",
+                    self.environment.illegal_action_policy,
+                )
+                or "noop"
             ),
             "pass_logit_bias": 0.0,
             "model_backend": get_policy_backend_kind(getattr(game_state, "unified_policy", None)),
