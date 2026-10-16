@@ -203,11 +203,12 @@ The individual issues contain detailed scope, primary code areas, and acceptance
 ### 7. [randomized check location and check clearance (#62)](https://github.com/EvanZ/basketworld/issues/62)
 
 Status: the initial implementation landed on 2026-10-12 in
-`f10805b` (`Implement configurable check clearance`). All identified rule
-decisions are agreed, including defense-only setup clearance and pickup-zone
-entry rules. The unchecked acceptance items below remain
-the release-validation and learning-study work; they are intentionally not
-claimed by the implementation commit.
+`f10805b` (`Implement configurable check clearance`). Final release validation
+completed on 2026-10-15. The rule is defense-only during setup and pickup,
+with a deterministic safe anchor by default and random locations as an
+explicit opt-in. The unchecked historical acceptance list below predates those
+settled scope changes; it is retained as decision history rather than an open
+task list.
 
 #### Completion review (2026-10-12)
 
@@ -486,9 +487,14 @@ the historical implementation decisions above.
 
 #### Decision status
 
-No identified rule decisions remain open. The implementation work listed in
-the completion review is complete; the unchecked acceptance checks above are
-still pending.
+No identified rule decisions remain open. The implementation and final
+validation are complete: focused mechanics checks, native evaluation
+diagnostics, trainer/runtime checks, both frontend builds, and the strict
+documentation build passed on 2026-10-15. A fresh nonzero-clearance policy
+also reached an 88% deterministic deploy-evaluation pickup rate; interactive
+self-play recorded 17/19 pickups (89.5%) while the protected zone eliminated
+the observed check-location clustering. The historical unchecked list above
+is superseded by the final defense-only and deterministic-default design.
 
 ## Validation strategy
 
