@@ -39,6 +39,8 @@ from basketworld_jax.provenance import (
 )
 from basketworld_jax.env import (
     CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION,
+    GAME_CLOCK_SCORE_DIFFERENCE_NORMALIZATION,
+    GAME_CLOCK_TIME_NORMALIZATION_SECONDS,
     MULTI_POSSESSION_SCHEMA_VERSION,
     PASS_ACTION_END,
     PASS_ACTION_START,
@@ -1203,8 +1205,7 @@ def build_train_parser():
         default="possessions",
         help=(
             "End games after each team reaches its possession quota or when "
-            "the regulation game clock expires with timed overtime periods. "
-            "Game-clock training is unavailable pending compiled integration (#64)."
+            "the regulation game clock expires with timed overtime periods."
         ),
     )
     parser.add_argument(
@@ -1671,9 +1672,7 @@ def build_train_config_schema(args) -> list[dict[str, Any]]:
                 "default": to_builtin(action.default),
                 "effective_value": to_builtin(effective_value),
                 "choices": (
-                    ["possessions"]
-                    if action.dest == "episode_end_mode"
-                    else to_builtin(list(action.choices))
+                    to_builtin(list(action.choices))
                     if action.choices is not None
                     else None
                 ),
@@ -1817,11 +1816,6 @@ def validate_train_args(args) -> None:
     ):
         raise SystemExit(
             "--episode-end-mode game_clock requires --enable-multi-possession."
-        )
-    if str(getattr(args, "episode_end_mode", "possessions")) == "game_clock":
-        raise SystemExit(
-            "Game-clock training and evaluation are unavailable until issue #64 "
-            "integrates the compiled clock transitions. Use --episode-end-mode possessions."
         )
     for key in ("defender_spawn_distance", "defender_guard_distance", "assist_window"):
         value = getattr(args, key, None)
@@ -2375,6 +2369,54 @@ def _compatible_env_config_for_resume(
     return out
 
 
+def _validate_checkpoint_episode_semantics(
+    payload: dict[str, Any], *, args, context: str
+) -> None:
+    """Reject silent reuse across same-width possession/clock observations."""
+    effective = dict(payload.get("effective_env_config", {}) or {})
+    recorded = dict(payload.get("env_config", {}) or {})
+    actual_mode = str(
+        effective.get(
+            "episode_end_mode",
+            recorded.get("episode_end_mode", "possessions"),
+        )
+        or "possessions"
+    )
+    expected_mode = str(getattr(args, "episode_end_mode", "possessions") or "possessions")
+    if actual_mode != expected_mode:
+        raise SystemExit(
+            f"{context} uses episode_end_mode={actual_mode!r}, but the current run "
+            f"uses {expected_mode!r}. These modes have different observation "
+            "semantics even when tensor dimensions match; cross-mode policy reuse "
+            "requires an explicit adaptation workflow."
+        )
+
+    observation = dict(payload.get("observation_metadata", {}) or {})
+    metadata_mode = observation.get("episode_end_mode")
+    if metadata_mode is not None and str(metadata_mode) != actual_mode:
+        raise SystemExit(
+            f"{context} has inconsistent episode-mode metadata "
+            f"(environment={actual_mode!r}, observation={metadata_mode!r})."
+        )
+    if actual_mode != "game_clock":
+        return
+
+    budget = dict(observation.get("episode_budget_feature", {}) or {})
+    score = dict(observation.get("relative_score_feature", {}) or {})
+    if (
+        budget.get("semantic") != "game_clock_seconds_remaining"
+        or budget.get("normalization")
+        != float(GAME_CLOCK_TIME_NORMALIZATION_SECONDS)
+        or score.get("semantic") != "observing_team_score_difference"
+        or score.get("normalization")
+        != float(GAME_CLOCK_SCORE_DIFFERENCE_NORMALIZATION)
+    ):
+        raise SystemExit(
+            f"{context} does not record the required game-clock observation "
+            "semantics (seconds/720 and score difference/30); refusing silent reuse."
+        )
+
+
 def build_trainer_config(args) -> TrainerConfig:
     return TrainerConfig(
         kernel_batch_size=int(args.kernel_batch_size),
@@ -2849,7 +2891,9 @@ def _migrate_v2_frozen_opponent_params(
     return migrated, True
 
 
-def _checkpoint_observation_metadata(spec: ActorCriticSpec) -> dict[str, Any]:
+def _checkpoint_observation_metadata(
+    spec: ActorCriticSpec, *, args=None
+) -> dict[str, Any]:
     player_labels, global_labels = token_observation_labels(
         rebound_win_prob_features=bool(spec.rebound_win_prob_features),
         rebound_target_observation_features=bool(
@@ -2861,7 +2905,7 @@ def _checkpoint_observation_metadata(spec: ActorCriticSpec) -> dict[str, Any]:
             >= CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION
         ),
     )
-    return {
+    metadata = {
         "schema_version": int(spec.observation_schema_version),
         "player_labels": list(player_labels),
         "global_labels": list(global_labels),
@@ -2869,6 +2913,33 @@ def _checkpoint_observation_metadata(spec: ActorCriticSpec) -> dict[str, Any]:
         "global_dim": len(global_labels),
         "flat_observation_dim": int(spec.flat_obs_dim),
     }
+    if bool(spec.multi_possession_features):
+        mode = str(getattr(args, "episode_end_mode", "possessions"))
+        metadata["episode_end_mode"] = mode
+        metadata["episode_budget_feature"] = {
+            "slot": "possessions_remaining_norm",
+            "semantic": (
+                "game_clock_seconds_remaining"
+                if mode == "game_clock"
+                else "team_possessions_remaining"
+            ),
+            "normalization": (
+                float(GAME_CLOCK_TIME_NORMALIZATION_SECONDS)
+                if mode == "game_clock"
+                else "episode_possession_limit"
+            ),
+            "clipped": False if mode == "game_clock" else True,
+        }
+        metadata["relative_score_feature"] = {
+            "semantic": "observing_team_score_difference",
+            "normalization": (
+                float(GAME_CLOCK_SCORE_DIFFERENCE_NORMALIZATION)
+                if mode == "game_clock"
+                else "3 * episode_possession_limit"
+            ),
+            "clipped": False,
+        }
+    return metadata
 
 
 def _uses_grouped_opponent_sampling(args) -> bool:
@@ -2951,6 +3022,11 @@ def _validate_resume_checkpoint_payload(
     spec: ActorCriticSpec,
     args,
 ) -> None:
+    _validate_checkpoint_episode_semantics(
+        payload,
+        args=args,
+        context="Resume checkpoint",
+    )
     expected_trainer_config = asdict(trainer_config)
     actual_trainer_config = dict(payload.get("trainer_config", {}))
     compatible_keys = [
@@ -3083,7 +3159,7 @@ def _save_training_checkpoint(
         opponent_pool_state=opponent_pool_state,
         intent_discriminator_state=intent_discriminator_state,
         play_name_metadata=play_name_metadata,
-        observation_metadata=_checkpoint_observation_metadata(spec),
+        observation_metadata=_checkpoint_observation_metadata(spec, args=args),
         source_provenance=checkpoint_source_provenance,
         resolved_training_config=_checkpoint_resolved_training_config(args),
         effective_env_config=_effective_env_config_from_args(args),
@@ -3377,6 +3453,11 @@ def _load_continuation_opponent_candidates(
             cache_dir=str(getattr(args, "continue_cache_dir", "") or ""),
         )
         payload = load_checkpoint(local_path)
+        _validate_checkpoint_episode_semantics(
+            payload,
+            args=args,
+            context=f"Continuation opponent checkpoint {artifact_path!r}",
+        )
         if _normalize_policy_spec_dict(payload.get("policy_spec", {})) != expected_spec:
             raise SystemExit(
                 f"Continuation opponent checkpoint {artifact_path!r} policy_spec does not match the current run."
@@ -3716,6 +3797,14 @@ def _log_mlflow_params(
                 f"metadata/continuations/target_{int(args.num_updates):07d}_effective_env.json"
                 if continuation_run_id
                 else "metadata/effective_env_config.json"
+            ),
+        )
+        mlflow.log_dict(
+            _checkpoint_observation_metadata(spec, args=args),
+            (
+                f"metadata/continuations/target_{int(args.num_updates):07d}_observation.json"
+                if continuation_run_id
+                else "metadata/observation.json"
             ),
         )
     # MLflow parameters are immutable within a run.  A continuation deliberately
@@ -4119,6 +4208,13 @@ def _log_mlflow_params(
     }
     for key, value in _effective_env_config_from_args(args).items():
         params[f"jax/env/{key}"] = value
+    if str(getattr(args, "episode_end_mode", "possessions")) == "game_clock":
+        params["jax/observation/game_clock_time_normalization_seconds"] = float(
+            GAME_CLOCK_TIME_NORMALIZATION_SECONDS
+        )
+        params["jax/observation/score_difference_normalization"] = float(
+            GAME_CLOCK_SCORE_DIFFERENCE_NORMALIZATION
+        )
     mlflow.log_params(params)
 
 
@@ -4166,6 +4262,8 @@ _CORE_TRAIN_METRICS = frozenset(
         "value_rmse",
         # Episode and possession outcomes.
         "completed_episode_count",
+        "truncated_episode_count",
+        "truncation_rate",
         "completed_possession_count",
         "mean_completed_episode_length",
         "mean_live_steps_per_completed_possession",
@@ -4192,6 +4290,46 @@ _CORE_TRAIN_METRICS = frozenset(
         "offense_opponent_points_per_completed_episode",
         "defense_learner_points_per_completed_episode",
         "defense_opponent_points_per_completed_episode",
+        "offense_truncated_episode_count",
+        "defense_truncated_episode_count",
+        "offense_learner_offensive_efficiency",
+        "offense_opponent_offensive_efficiency",
+        "defense_learner_offensive_efficiency",
+        "defense_opponent_offensive_efficiency",
+        "offense_learner_pace_possessions_per_game_minute",
+        "offense_opponent_pace_possessions_per_game_minute",
+        "defense_learner_pace_possessions_per_game_minute",
+        "defense_opponent_pace_possessions_per_game_minute",
+        "offense_mean_completed_possession_game_clock_seconds",
+        "defense_mean_completed_possession_game_clock_seconds",
+        "offense_elapsed_game_clock_seconds",
+        "defense_elapsed_game_clock_seconds",
+        "offense_completed_possessions_per_completed_game",
+        "defense_completed_possessions_per_completed_game",
+        "offense_regulation_completion_count",
+        "defense_regulation_completion_count",
+        "offense_overtime_game_count",
+        "defense_overtime_game_count",
+        "offense_mean_overtime_periods",
+        "defense_mean_overtime_periods",
+        "offense_mean_terminal_game_clock_seconds_remaining",
+        "defense_mean_terminal_game_clock_seconds_remaining",
+        "offense_overtime_team_a_points",
+        "offense_overtime_team_b_points",
+        "offense_overtime_point_differential",
+        "defense_overtime_team_a_points",
+        "defense_overtime_team_b_points",
+        "defense_overtime_point_differential",
+        *(
+            f"{role}_regulation_segment_{segment}_{metric}"
+            for role in ("offense", "defense")
+            for segment in range(1, 5)
+            for metric in (
+                "team_a_points",
+                "team_b_points",
+                "point_differential",
+            )
+        ),
         "offense_learner_mean_reward",
         "offense_opponent_mean_reward",
         "defense_learner_mean_reward",
@@ -4326,6 +4464,8 @@ _CORE_DEPLOY_METRICS = frozenset(
         "same_policy_both_sides",
         "episode_count",
         "completed_episode_count",
+        "safety_truncated_episode_count",
+        "horizon_truncated_episode_count",
         "completion_rate",
         "mean_completed_episode_length",
         "completed_possession_count",
@@ -5077,6 +5217,7 @@ def _restore_historical_milestone_params(
     continuation_run_id: str,
     continue_cache_dir: str,
     spec: ActorCriticSpec,
+    args,
     jax,
 ) -> tuple[dict[int, Any], dict[int, dict[str, Any]]]:
     """Load every reached milestone policy so later matches remain comparable."""
@@ -5122,6 +5263,11 @@ def _restore_historical_milestone_params(
                     f"update {update} from MLflow artifact {artifact_path!r}."
                 ) from exc
         payload = load_checkpoint(checkpoint_path)
+        _validate_checkpoint_episode_semantics(
+            payload,
+            args=args,
+            context=f"Historical-evaluation milestone checkpoint {update}",
+        )
         if _normalize_policy_spec_dict(payload.get("policy_spec", {})) != asdict(spec):
             raise SystemExit(
                 "Historical-evaluation milestone policy_spec does not match "
@@ -6106,6 +6252,7 @@ def _summarize_role_rollout_metrics(
 ) -> dict[str, Any]:
     rewards = np.asarray(rollout.trajectory.rewards, dtype=np.float32)
     dones = np.asarray(rollout.trajectory.dones, dtype=np.float32)
+    truncated = np.asarray(rollout.trajectory.truncated, dtype=np.float32) > 0.5
     terminal_steps = np.asarray(
         rollout.trajectory.terminal_episode_steps, dtype=np.int32
     )
@@ -6132,8 +6279,10 @@ def _summarize_role_rollout_metrics(
             (np.asarray(values, dtype=np.float32) * active_mask).sum() / active_count
         )
 
-    terminal_mask = (terminal_steps > 0) & active_bool
+    terminal_mask = (terminal_steps > 0) & active_bool & (~truncated)
+    truncation_mask = truncated & active_bool
     completed_episodes = int(terminal_mask.sum())
+    truncated_episodes = int(truncation_mask.sum())
     completed_episode_steps = int(
         (terminal_steps * terminal_mask.astype(np.int32)).sum()
     )
@@ -6157,6 +6306,62 @@ def _summarize_role_rollout_metrics(
     else:
         learner_points_total = defense_points_total
         opponent_points_total = offense_points_total
+
+    possession_ended = (
+        np.asarray(rollout.trajectory.possession_ended, dtype=np.float32) > 0.5
+    ) & active_bool
+    learner_completed_possessions = int(
+        (possession_ended & (training_role > 0.0)).sum()
+    )
+    opponent_completed_possessions = int(
+        (possession_ended & (training_role < 0.0)).sum()
+    )
+    elapsed_game_clock_seconds = _active_sum(
+        rollout.trajectory.elapsed_game_clock_seconds
+    )
+    completed_possession_clock_seconds = _active_sum(
+        rollout.trajectory.completed_possession_game_clock_seconds
+    )
+    elapsed_game_clock_minutes = elapsed_game_clock_seconds / 60.0
+    total_completed_possessions = (
+        learner_completed_possessions + opponent_completed_possessions
+    )
+    terminal_overtime_periods = np.asarray(
+        rollout.trajectory.terminal_overtime_periods,
+        dtype=np.int32,
+    )
+    overtime_game_mask = (terminal_overtime_periods > 0) & active_bool
+    overtime_game_count = int(overtime_game_mask.sum())
+    regulation_completion_count = int(
+        (
+            np.asarray(rollout.trajectory.regulation_completed, dtype=np.int32)
+            * active_bool.astype(np.int32)
+        ).sum()
+    )
+    terminal_clock_seconds = np.asarray(
+        rollout.trajectory.terminal_game_clock_seconds_remaining,
+        dtype=np.float32,
+    )
+    terminal_completed_possessions = np.asarray(
+        rollout.trajectory.terminal_completed_possessions,
+        dtype=np.int32,
+    )
+    clock_period_index = np.asarray(
+        rollout.trajectory.clock_period_index,
+        dtype=np.int32,
+    )
+    regulation_segment = np.asarray(
+        rollout.trajectory.regulation_clock_segment,
+        dtype=np.int32,
+    )
+    team_a_score_delta = np.asarray(
+        rollout.trajectory.team_a_score_delta,
+        dtype=np.float32,
+    )
+    team_b_score_delta = np.asarray(
+        rollout.trajectory.team_b_score_delta,
+        dtype=np.float32,
+    )
 
     metrics = {
         f"{role}_mean_reward": learner_reward_mean,
@@ -6193,6 +6398,7 @@ def _summarize_role_rollout_metrics(
         ),
         f"{role}_completed_episodes": int(completed_episodes),
         f"{role}_completed_episode_count": int(completed_episodes),
+        f"{role}_truncated_episode_count": int(truncated_episodes),
         f"{role}_completed_active_step_count": int(completed_episode_steps),
         f"{role}_offense_points_total": offense_points_total,
         f"{role}_defense_points_total": defense_points_total,
@@ -6206,6 +6412,48 @@ def _summarize_role_rollout_metrics(
         ),
         f"{role}_learner_points_total": learner_points_total,
         f"{role}_opponent_points_total": opponent_points_total,
+        f"{role}_learner_completed_possessions": learner_completed_possessions,
+        f"{role}_opponent_completed_possessions": opponent_completed_possessions,
+        f"{role}_learner_offensive_efficiency": _safe_metric_ratio(
+            learner_points_total,
+            learner_completed_possessions,
+        ),
+        f"{role}_opponent_offensive_efficiency": _safe_metric_ratio(
+            opponent_points_total,
+            opponent_completed_possessions,
+        ),
+        f"{role}_elapsed_game_clock_seconds": elapsed_game_clock_seconds,
+        f"{role}_learner_pace_possessions_per_game_minute": _safe_metric_ratio(
+            learner_completed_possessions,
+            elapsed_game_clock_minutes,
+        ),
+        f"{role}_opponent_pace_possessions_per_game_minute": _safe_metric_ratio(
+            opponent_completed_possessions,
+            elapsed_game_clock_minutes,
+        ),
+        f"{role}_mean_completed_possession_game_clock_seconds": _safe_metric_ratio(
+            completed_possession_clock_seconds,
+            total_completed_possessions,
+        ),
+        f"{role}_completed_possessions_per_completed_game": _safe_metric_ratio(
+            int(
+                (
+                    terminal_completed_possessions
+                    * terminal_mask.astype(np.int32)
+                ).sum()
+            ),
+            completed_episodes,
+        ),
+        f"{role}_regulation_completion_count": regulation_completion_count,
+        f"{role}_overtime_game_count": overtime_game_count,
+        f"{role}_mean_overtime_periods": _safe_metric_ratio(
+            int((terminal_overtime_periods * overtime_game_mask.astype(np.int32)).sum()),
+            overtime_game_count,
+        ),
+        f"{role}_mean_terminal_game_clock_seconds_remaining": _safe_metric_ratio(
+            float((terminal_clock_seconds * terminal_mask.astype(np.float32)).sum()),
+            completed_episodes,
+        ),
         f"{role}_rebound_reward_advance_count": int(
             _active_sum(rebound_reward_advances > 0.0)
         ),
@@ -6230,6 +6478,32 @@ def _summarize_role_rollout_metrics(
         f"{role}_phi_next_mean": _active_mean(rollout.trajectory.phi_next),
         f"{role}_phi_beta_mean": _active_mean(rollout.trajectory.phi_beta),
     }
+    for segment_index in range(4):
+        segment_mask = active_bool & (regulation_segment == segment_index)
+        team_a_points = float(
+            (team_a_score_delta * segment_mask.astype(np.float32)).sum()
+        )
+        team_b_points = float(
+            (team_b_score_delta * segment_mask.astype(np.float32)).sum()
+        )
+        segment_prefix = f"{role}_regulation_segment_{segment_index + 1}"
+        metrics[f"{segment_prefix}_team_a_points"] = team_a_points
+        metrics[f"{segment_prefix}_team_b_points"] = team_b_points
+        metrics[f"{segment_prefix}_point_differential"] = (
+            team_a_points - team_b_points
+        )
+    overtime_mask = active_bool & (clock_period_index > 0)
+    overtime_team_a_points = float(
+        (team_a_score_delta * overtime_mask.astype(np.float32)).sum()
+    )
+    overtime_team_b_points = float(
+        (team_b_score_delta * overtime_mask.astype(np.float32)).sum()
+    )
+    metrics[f"{role}_overtime_team_a_points"] = overtime_team_a_points
+    metrics[f"{role}_overtime_team_b_points"] = overtime_team_b_points
+    metrics[f"{role}_overtime_point_differential"] = (
+        overtime_team_a_points - overtime_team_b_points
+    )
     metrics.update(
         summarize_shot_type_metrics(
             f"{role}_all",
@@ -6757,19 +7031,32 @@ def run_training_loop(args) -> dict[str, Any]:
     action_masks_np = np.asarray(jax.device_get(action_masks), dtype=np.int8)
     spec = _build_policy_spec(args, static, flat_obs_np, action_masks_np)
     trainer_config = build_trainer_config(args)
-    rollout_runner = build_compiled_rollout_runner(jax, jnp, spec)
-    deploy_eval_runner = build_compiled_deploy_eval_runner(jax, jnp, spec)
-    eval_runner = build_compiled_eval_runner(jax, jnp, spec)
+    game_clock_mode = str(getattr(args, "episode_end_mode", "possessions")) == "game_clock"
+    rollout_runner = build_compiled_rollout_runner(
+        jax, jnp, spec, game_clock_mode=game_clock_mode
+    )
+    deploy_eval_runner = build_compiled_deploy_eval_runner(
+        jax, jnp, spec, game_clock_mode=game_clock_mode
+    )
+    eval_runner = build_compiled_eval_runner(
+        jax, jnp, spec, game_clock_mode=game_clock_mode
+    )
     frozen_rollout_runner = build_compiled_frozen_opponent_rollout_runner(
-        jax, jnp, spec
+        jax, jnp, spec, game_clock_mode=game_clock_mode
     )
-    frozen_eval_runner = build_compiled_frozen_opponent_eval_runner(jax, jnp, spec)
+    frozen_eval_runner = build_compiled_frozen_opponent_eval_runner(
+        jax, jnp, spec, game_clock_mode=game_clock_mode
+    )
     grouped_rollout_runner = build_compiled_grouped_opponent_rollout_runner(
-        jax, jnp, spec
+        jax, jnp, spec, game_clock_mode=game_clock_mode
     )
-    grouped_eval_runner = build_compiled_grouped_opponent_eval_runner(jax, jnp, spec)
+    grouped_eval_runner = build_compiled_grouped_opponent_eval_runner(
+        jax, jnp, spec, game_clock_mode=game_clock_mode
+    )
     historical_match_eval_runner = (
-        build_compiled_historical_match_eval_runner(jax, jnp, spec)
+        build_compiled_historical_match_eval_runner(
+            jax, jnp, spec, game_clock_mode=game_clock_mode
+        )
         if historical_milestone_updates
         else None
     )
@@ -6862,6 +7149,11 @@ def run_training_loop(args) -> dict[str, Any]:
         opponent_pool_enabled and _uses_grouped_opponent_sampling(args)
     )
     if frozen_opponent_payload is not None:
+        _validate_checkpoint_episode_semantics(
+            frozen_opponent_payload,
+            args=args,
+            context="Frozen opponent checkpoint",
+        )
         frozen_params, frozen_schema_migrated = _migrate_v2_frozen_opponent_params(
             frozen_opponent_payload,
             spec,
@@ -7176,6 +7468,7 @@ def run_training_loop(args) -> dict[str, Any]:
         continuation_run_id=str(getattr(args, "continue_run_id", "") or "").strip(),
         continue_cache_dir=str(getattr(args, "continue_cache_dir", "") or ""),
         spec=spec,
+        args=args,
         jax=jax,
     )
     historical_eval_artifact_path = (
@@ -8258,9 +8551,20 @@ def run_training_loop(args) -> dict[str, Any]:
                 if mlflow is not None:
                     for role in TRAINING_ROLES:
                         final_eval_state, eval_trace = eval_outputs[role]
+                        eval_truncated = np.asarray(
+                            eval_trace.truncated, dtype=bool
+                        )
+                        eval_completed_dones = np.asarray(
+                            eval_trace.dones, dtype=bool
+                        ) & (~eval_truncated)
+                        eval_completed_terminal_steps = np.where(
+                            eval_completed_dones,
+                            np.asarray(eval_trace.terminal_episode_steps),
+                            0,
+                        )
                         eval_episode_metrics = summarize_episode_events(
-                            eval_trace.dones,
-                            eval_trace.terminal_episode_steps,
+                            eval_completed_dones,
+                            eval_completed_terminal_steps,
                             eval_trace.pass_attempts,
                             eval_trace.completed_passes,
                             eval_trace.assists,
@@ -8295,14 +8599,16 @@ def run_training_loop(args) -> dict[str, Any]:
                                 ).mean()
                             ),
                             "mean_done_rate": float(
-                                np.asarray(eval_trace.dones).mean()
+                                eval_completed_dones.mean()
                             ),
+                            "truncated_episode_count": int(eval_truncated.sum()),
+                            "truncation_rate": float(eval_truncated.mean()),
                             "mean_reward": float(np.asarray(eval_trace.rewards).mean()),
                         }
                         eval_metrics.update(eval_episode_metrics)
                         eval_metrics.update(
                             summarize_lane_violation_metrics(
-                                terminal_episode_steps=eval_trace.terminal_episode_steps,
+                                terminal_episode_steps=eval_completed_terminal_steps,
                                 offensive_three_seconds=eval_trace.offensive_three_seconds,
                                 defensive_lane_violations=eval_trace.defensive_lane_violations,
                             )
@@ -9058,7 +9364,14 @@ def run_train_scaffold(args) -> dict[str, Any]:
     )
     opt_state = init_optimizer_state(optimizer_transform, params)
     runner = build_jitted_actor_critic_runner(jax, jnp, spec)
-    rollout_runner = build_compiled_rollout_runner(jax, jnp, spec)
+    rollout_runner = build_compiled_rollout_runner(
+        jax,
+        jnp,
+        spec,
+        game_clock_mode=(
+            str(getattr(args, "episode_end_mode", "possessions")) == "game_clock"
+        ),
+    )
 
     total_iters = 3 * (int(args.warmup_iters) + int(args.benchmark_iters))
     progress = build_progress(

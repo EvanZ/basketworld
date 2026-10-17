@@ -46,6 +46,9 @@ class TrajectoryBatch(NamedTuple):
     rebound_counterfactual_mask: Any
     rewards: Any
     dones: Any
+    truncated: Any
+    truncation_reason: Any
+    truncation_bootstrap_values: Any
     game_rewards: Any
     winner_rewards: Any
     auxiliary_rewards: Any
@@ -99,6 +102,16 @@ class TrajectoryBatch(NamedTuple):
     check_pickup_steps: Any
     possession_ended: Any
     completed_possession_live_steps: Any
+    completed_possession_game_clock_seconds: Any
+    elapsed_game_clock_seconds: Any
+    game_clock_seconds_remaining: Any
+    clock_period_index: Any
+    regulation_clock_segment: Any
+    regulation_completed: Any
+    overtime_period_started: Any
+    terminal_overtime_periods: Any
+    terminal_game_clock_seconds_remaining: Any
+    terminal_completed_possessions: Any
     shot_attempts: Any
     shot_makes: Any
     shot_dunks: Any
@@ -209,6 +222,8 @@ class EvalTrace(NamedTuple):
     full_actions: Any
     rewards: Any
     dones: Any
+    truncated: Any
+    truncation_reason: Any
     game_rewards: Any
     winner_rewards: Any
     auxiliary_rewards: Any
@@ -350,12 +365,31 @@ class DeployEvalOutput(NamedTuple):
     rebound_diagnostic_totals: Any
 
 
-def compute_gae_and_returns(rewards, values, dones, bootstrap_values, *, gamma: float, gae_lambda: float, jax, jnp):
+def compute_gae_and_returns(
+    rewards,
+    values,
+    dones,
+    bootstrap_values,
+    *,
+    gamma: float,
+    gae_lambda: float,
+    jax,
+    jnp,
+    truncation_bootstrap_values=None,
+):
     gamma_t = jnp.asarray(gamma, dtype=jnp.float32)
     gae_lambda_t = jnp.asarray(gae_lambda, dtype=jnp.float32)
     next_values = jnp.concatenate([values[1:], bootstrap_values[None, :]], axis=0)
     not_done = 1.0 - dones.astype(jnp.float32)
-    deltas = rewards + (gamma_t * next_values * not_done) - values
+    if truncation_bootstrap_values is None:
+        truncation_bootstrap_values = jnp.zeros_like(values, dtype=jnp.float32)
+    deltas = rewards + (
+        gamma_t
+        * (
+            (next_values * not_done)
+            + truncation_bootstrap_values.astype(jnp.float32)
+        )
+    ) - values
 
     def _scan_step(carry, scan_inputs):
         delta_t, not_done_t = scan_inputs
@@ -500,6 +534,7 @@ def build_ppo_batch(
         gae_lambda=float(trainer_config.gae_lambda),
         jax=jax,
         jnp=jnp,
+        truncation_bootstrap_values=rollout.trajectory.truncation_bootstrap_values,
     )
     active_mask, loss_weights, loss_denominator = build_trajectory_training_masks(
         rollout.trajectory,

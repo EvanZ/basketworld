@@ -37,6 +37,7 @@ from basketworld_jax.train.types import (
     TrainerConfig,
     TrajectoryBatch,
     build_ppo_batch,
+    compute_gae_and_returns,
     compute_intent_segment_advantages,
     limit_selector_batch_samples,
 )
@@ -67,6 +68,7 @@ from basketworld_jax.train.main import (
     _selector_learning_rate_for_args,
     _selector_active_for_update,
     _summarize_intent_intrinsic_advantages,
+    _summarize_role_rollout_metrics,
     _task_reward_scale_for_update,
     build_trainer_config,
     parse_args,
@@ -86,6 +88,93 @@ from basketworld_jax.train.runtime import (
     summarize_ppo_eligible_episode_metrics,
     summarize_reward_by_intent_metrics,
 )
+
+
+def test_time_limit_truncation_bootstraps_from_final_observation_value():
+    jax = pytest.importorskip("jax")
+    jnp = jax.numpy
+    advantages, returns = compute_gae_and_returns(
+        jnp.asarray([[0.0]], dtype=jnp.float32),
+        jnp.asarray([[1.0]], dtype=jnp.float32),
+        jnp.asarray([[1]], dtype=jnp.int8),
+        jnp.asarray([99.0], dtype=jnp.float32),
+        gamma=0.9,
+        gae_lambda=0.95,
+        jax=jax,
+        jnp=jnp,
+        truncation_bootstrap_values=jnp.asarray([[5.0]], dtype=jnp.float32),
+    )
+    assert float(np.asarray(advantages)[0, 0]) == pytest.approx(3.5)
+    assert float(np.asarray(returns)[0, 0]) == pytest.approx(4.5)
+
+
+def test_clock_training_diagnostics_use_completed_possessions_and_elapsed_clock():
+    jnp = pytest.importorskip("jax.numpy")
+    zeros = jnp.zeros((4, 1), dtype=jnp.float32)
+    trajectory_data = {field: zeros for field in TrajectoryBatch._fields}
+    trajectory_data.update(
+        {
+            "active_mask": jnp.ones((4, 1), dtype=jnp.float32),
+            "training_role": jnp.asarray([[1], [-1], [1], [-1]], dtype=jnp.float32),
+            "possession_ended": jnp.ones((4, 1), dtype=jnp.int8),
+            "completed_possession_game_clock_seconds": jnp.ones(
+                (4, 1), dtype=jnp.int32
+            ),
+            "elapsed_game_clock_seconds": jnp.ones((4, 1), dtype=jnp.int32),
+            "dones": jnp.asarray([[0], [0], [0], [1]], dtype=jnp.int8),
+            "terminal_episode_steps": jnp.asarray(
+                [[0], [0], [0], [4]], dtype=jnp.int32
+            ),
+            "offense_score_delta": jnp.asarray(
+                [[2], [0], [3], [0]], dtype=jnp.float32
+            ),
+            "defense_score_delta": jnp.asarray(
+                [[0], [2], [0], [3]], dtype=jnp.float32
+            ),
+            "team_a_score_delta": jnp.asarray(
+                [[2], [0], [3], [0]], dtype=jnp.float32
+            ),
+            "team_b_score_delta": jnp.asarray(
+                [[0], [2], [0], [3]], dtype=jnp.float32
+            ),
+            "clock_period_index": jnp.asarray([[0], [0], [0], [1]], dtype=jnp.int32),
+            "regulation_clock_segment": jnp.asarray(
+                [[0], [1], [3], [-1]], dtype=jnp.int32
+            ),
+            "regulation_completed": jnp.asarray([[0], [0], [1], [0]], dtype=jnp.int8),
+            "terminal_overtime_periods": jnp.asarray(
+                [[0], [0], [0], [1]], dtype=jnp.int32
+            ),
+            "terminal_completed_possessions": jnp.asarray(
+                [[0], [0], [0], [4]], dtype=jnp.int32
+            ),
+        }
+    )
+    rollout = RolloutOutput(
+        trajectory=TrajectoryBatch(**trajectory_data),
+        final_state=None,
+        bootstrap_values=zeros[0],
+        final_selector_values=zeros[0],
+        final_flat_obs=None,
+        final_action_mask=None,
+    )
+
+    metrics = _summarize_role_rollout_metrics(
+        "offense",
+        rollout,
+        num_intents=1,
+    )
+
+    assert metrics["offense_learner_offensive_efficiency"] == pytest.approx(2.5)
+    assert metrics["offense_opponent_offensive_efficiency"] == pytest.approx(2.5)
+    assert metrics["offense_learner_pace_possessions_per_game_minute"] == pytest.approx(30.0)
+    assert metrics["offense_completed_possessions_per_completed_game"] == pytest.approx(4.0)
+    assert metrics["offense_regulation_completion_count"] == 1
+    assert metrics["offense_overtime_game_count"] == 1
+    assert metrics["offense_mean_overtime_periods"] == pytest.approx(1.0)
+    assert metrics["offense_regulation_segment_1_team_a_points"] == pytest.approx(2.0)
+    assert metrics["offense_regulation_segment_2_team_b_points"] == pytest.approx(2.0)
+    assert metrics["offense_overtime_team_b_points"] == pytest.approx(3.0)
 
 
 def test_trainer_parser_defaults_match_frozen_scope():

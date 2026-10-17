@@ -69,6 +69,19 @@ The configuration contract also supplies checkpoint and MLflow metadata, so a
 training run records the same canonical settings used to build its static and
 initial state.
 
+Timed training specializes its compiled runners on `game_clock` and carries a
+game across fixed PPO rollout boundaries. Its budget observation is seconds
+remaining divided by 720, and its relative-score observation is the observing
+team's score difference divided by 30; neither value is clipped. A total-step
+safety truncation is reported separately and bootstraps from the final state
+before the environment resets. Native timed evaluation is tracked separately
+in issue #65.
+
+Training metrics preserve raw period and clock coordinates and report completed
+possessions per game, per-team offensive efficiency and pace, mean clock time per
+possession, regulation/overtime counts, terminal clock values, regulation
+quarter-segment scoring, overtime scoring, and safety truncations separately.
+
 ## Rollout variants
 
 The runtime builds distinct compiled runners for:

@@ -132,6 +132,64 @@ def test_preview_compiles_typed_overrides(tmp_path):
     assert "--single-episode-rollouts" in preview.argv
 
 
+def test_preview_persists_and_launches_game_clock_configuration(tmp_path):
+    config = TrainingRunConfig(
+        possession_limit_end=17,
+        overrides={
+            "episode_end_mode": "game_clock",
+            "game_clock_seconds": 300,
+            "overtime_seconds": 120,
+            "game_clock_max_total_steps": 9000,
+        }
+    )
+    saved = TrainingRunConfig.model_validate_json(config.model_dump_json())
+    assert saved.overrides == config.overrides
+
+    preview = build_halfcourt_multi_possession_preview(
+        config=saved,
+        run_id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        repo_root=tmp_path,
+        data_dir=tmp_path / "data",
+    )
+    for option, expected in (
+        ("--episode-end-mode", "game_clock"),
+        ("--game-clock-seconds", "300"),
+        ("--overtime-seconds", "120"),
+        ("--game-clock-max-total-steps", "9000"),
+        ("--multi-possession-limit", "17"),
+    ):
+        index = max(i for i, value in enumerate(preview.argv) if value == option)
+        assert preview.argv[index + 1] == expected
+
+    possession_config = saved.model_copy(
+        update={
+            "overrides": {
+                **saved.overrides,
+                "episode_end_mode": "possessions",
+            }
+        }
+    )
+    possession_preview = build_halfcourt_multi_possession_preview(
+        config=possession_config,
+        run_id="ffffffff-ffff-4fff-8fff-ffffffffffff",
+        repo_root=tmp_path,
+        data_dir=tmp_path / "data",
+    )
+    mode_index = max(
+        i
+        for i, value in enumerate(possession_preview.argv)
+        if value == "--episode-end-mode"
+    )
+    assert possession_preview.argv[mode_index + 1] == "possessions"
+    for option, expected in (
+        ("--game-clock-seconds", "300"),
+        ("--overtime-seconds", "120"),
+        ("--multi-possession-limit", "17"),
+    ):
+        index = max(i for i, value in enumerate(possession_preview.argv) if value == option)
+        assert possession_preview.argv[index + 1] == expected
+
+
 def test_preview_compiles_shot_contest_overrides(tmp_path):
     preview = build_halfcourt_multi_possession_preview(
         config=TrainingRunConfig(

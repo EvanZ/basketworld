@@ -35,6 +35,8 @@ TOKEN_OBS_MULTI_POSSESSION_PLAYER_DIM = 7
 TOKEN_OBS_MULTI_POSSESSION_GLOBAL_DIM = 5
 TOKEN_OBS_CHECK_CLEARANCE_PLAYER_DIM = 1
 TOKEN_OBS_CHECK_CLEARANCE_GLOBAL_DIM = 5
+GAME_CLOCK_TIME_NORMALIZATION_SECONDS = 720.0
+GAME_CLOCK_SCORE_DIFFERENCE_NORMALIZATION = 30.0
 
 
 def token_observation_dims(
@@ -3775,11 +3777,21 @@ def build_multi_possession_observation_features_batch(
         state.team_a_score.astype(jnp.float32)
         - state.team_b_score.astype(jnp.float32)
     )
-    score_norm = jnp.maximum(
+    possession_score_norm = jnp.maximum(
         3.0 * state.episode_possession_limit.astype(jnp.float32),
         1.0,
     )
-    relative_score = jnp.where(viewer_is_team_a, score_diff_a, -score_diff_a) / score_norm
+    clock_mode = state.episode_end_mode == jnp.asarray(
+        EPISODE_END_GAME_CLOCK, dtype=state.episode_end_mode.dtype
+    )
+    score_norm = jnp.where(
+        clock_mode,
+        jnp.asarray(GAME_CLOCK_SCORE_DIFFERENCE_NORMALIZATION, dtype=jnp.float32),
+        possession_score_norm,
+    )
+    relative_score = (
+        jnp.where(viewer_is_team_a, score_diff_a, -score_diff_a) / score_norm
+    )
     possession_limit = jnp.maximum(
         state.episode_possession_limit.astype(jnp.float32),
         1.0,
@@ -3793,6 +3805,12 @@ def build_multi_possession_observation_features_batch(
         0.0,
         possession_limit - viewer_completed_possessions,
     ) / possession_limit
+    episode_budget_remaining = jnp.where(
+        clock_mode,
+        state.game_clock_remaining.astype(jnp.float32)
+        / jnp.asarray(GAME_CLOCK_TIME_NORMALIZATION_SECONDS, dtype=jnp.float32),
+        possessions_remaining,
+    )
     # Clearance only constrains a live possession. During a dead-ball inbound
     # the receiving side has not yet established possession to clear, so keep
     # this feature aligned with the rule and the UI indicator.
@@ -3838,7 +3856,7 @@ def build_multi_possession_observation_features_batch(
     globals_vec = jnp.stack(
         [
             relative_score,
-            possessions_remaining,
+            episode_budget_remaining,
             clearance_required,
             restart_phase,
             restart_countdown,

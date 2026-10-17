@@ -2889,8 +2889,9 @@ def run_native_jax_evaluation(
     )
     if config.episode_end_mode == "game_clock":
         raise ValueError(
-            "Game-clock evaluation is unavailable until issue #64 integrates "
-            "the compiled clock transitions. Use episode_end_mode='possessions'."
+            "Game-clock native evaluation is unavailable until issue #65 adds "
+            "timed horizons, paired overtime starts, and clock diagnostics. "
+            "Use episode_end_mode='possessions'."
         )
     _emit_progress_event("jax_initializing")
     jax, jnp = ensure_jax_available("basketworld_jax/eval/native.py")

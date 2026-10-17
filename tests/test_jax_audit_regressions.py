@@ -1,6 +1,6 @@
 """Lightweight regression checks for the baseline functional audit."""
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 
 import numpy as np
@@ -18,9 +18,11 @@ from basketworld_jax.models import ActorCriticSpec
 from basketworld_jax.train.main import (
     TRAIN_FROZEN_VALUES,
     _effective_env_config_from_args,
+    _checkpoint_observation_metadata,
     _jax_env_config_from_args,
     _log_mlflow_params,
     _validate_resume_checkpoint_payload,
+    _validate_checkpoint_episode_semantics,
     build_trainer_config,
     parse_args,
     validate_train_args,
@@ -211,10 +213,9 @@ def test_resume_preserves_effective_gamma(recorded_effective):
         )
 
 
-def test_game_clock_training_is_rejected_before_compilation():
+def test_game_clock_training_configuration_is_accepted():
     args = parse_args(["--enable-multi-possession", "--episode-end-mode", "game_clock"])
-    with pytest.raises(SystemExit, match="issue #64"):
-        validate_train_args(args)
+    validate_train_args(args)
 
 
 def test_native_game_clock_evaluation_is_rejected_before_jax_initialization(
@@ -238,7 +239,7 @@ def test_native_game_clock_evaluation_is_rejected_before_jax_initialization(
         )
 
     monkeypatch.setattr(native, "ensure_jax_available", unexpected)
-    with pytest.raises(ValueError, match="issue #64"):
+    with pytest.raises(ValueError, match="issue #65"):
         native.run_native_jax_evaluation(
             num_episodes=1,
             player_deterministic=True,
@@ -253,12 +254,80 @@ def test_native_game_clock_evaluation_is_rejected_before_jax_initialization(
         )
 
 
-def test_trainer_schema_exposes_only_supported_episode_mode():
+def test_trainer_schema_exposes_both_episode_modes():
     fields = {
         field["name"]: field for field in build_train_config_schema(parse_args([]))
     }
-    assert fields["episode_end_mode"]["choices"] == ["possessions"]
-    assert "#64" in fields["episode_end_mode"]["help"]
+    assert fields["episode_end_mode"]["choices"] == ["possessions", "game_clock"]
+
+
+def test_checkpoint_semantics_reject_silent_cross_mode_reuse():
+    clock_args = parse_args(
+        ["--enable-multi-possession", "--episode-end-mode", "game_clock"]
+    )
+    with pytest.raises(SystemExit, match="different observation semantics"):
+        _validate_checkpoint_episode_semantics(
+            {"env_config": {"episode_end_mode": "possessions"}},
+            args=clock_args,
+            context="Frozen opponent checkpoint",
+        )
+
+    clock_spec = replace(
+        _spec(),
+        multi_possession_features=True,
+        observation_schema_version=4,
+    )
+    observation_metadata = _checkpoint_observation_metadata(
+        clock_spec,
+        args=clock_args,
+    )
+    assert observation_metadata["episode_budget_feature"]["normalization"] == 720.0
+    assert observation_metadata["relative_score_feature"]["normalization"] == 30.0
+    _validate_checkpoint_episode_semantics(
+        {
+            "env_config": {"episode_end_mode": "game_clock"},
+            "observation_metadata": observation_metadata,
+        },
+        args=clock_args,
+        context="Resume checkpoint",
+    )
+
+    possession_args = parse_args(["--enable-multi-possession"])
+    _validate_checkpoint_episode_semantics(
+        {"env_config": {}},
+        args=possession_args,
+        context="Legacy possession checkpoint",
+    )
+
+
+def test_game_clock_mlflow_metadata_records_mode_durations_and_observation_scales():
+    args = parse_args(
+        [
+            "--enable-multi-possession",
+            "--episode-end-mode",
+            "game_clock",
+            "--game-clock-seconds",
+            "300",
+            "--overtime-seconds",
+            "120",
+        ]
+    )
+    spec = replace(
+        _spec(),
+        multi_possession_features=True,
+        observation_schema_version=4,
+    )
+    recorder = Recorder()
+    _log_mlflow_params(recorder, args, build_trainer_config(args), spec)
+
+    assert recorder.params["jax/env/episode_end_mode"] == "game_clock"
+    assert recorder.params["jax/env/game_clock_seconds"] == 300
+    assert recorder.params["jax/env/overtime_seconds"] == 120
+    assert recorder.params["jax/observation/game_clock_time_normalization_seconds"] == 720.0
+    assert recorder.params["jax/observation/score_difference_normalization"] == 30.0
+    observation = recorder.artifacts["metadata/observation.json"]
+    assert observation["episode_budget_feature"]["normalization"] == 720.0
+    assert observation["relative_score_feature"]["normalization"] == 30.0
 
 
 def test_native_resolver_respects_alias_overrides_on_both_checkpoints():

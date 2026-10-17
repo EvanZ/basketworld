@@ -16,12 +16,22 @@ from basketworld_jax.env.minimal import (
     EPISODE_END_GAME_CLOCK,
     EPISODE_END_POSSESSIONS,
     GAME_PHASE_LIVE,
+    TRUNCATION_REASON_TOTAL_STEPS,
     build_action_masks_batch,
     build_policy_observation_batch,
     sample_state_batch,
     step_batch_minimal,
 )
-from basketworld_jax.train.main import parse_args, validate_train_args
+from basketworld_jax.models import init_actor_critic_params
+from basketworld_jax.train.main import (
+    _build_policy_spec,
+    parse_args,
+    validate_train_args,
+)
+from basketworld_jax.train.runtime import (
+    build_compiled_rollout_runner,
+    training_player_ids_from_static,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -157,6 +167,74 @@ def test_single_possession_reset_builds_observations_masks_and_terminal_transiti
         jnp,
     )
     np.testing.assert_array_equal(np.asarray(output.done), np.ones((2,), dtype=bool))
+
+
+def test_compiled_training_runner_uses_clock_stepper_and_reports_truncation_bootstrap():
+    args = _reset_args("game_clock", batch_size=1, seed=41)
+    static, state = sample_state_batch(args, jnp)
+    observations = build_policy_observation_batch(
+        static,
+        state,
+        jnp,
+        model_type="mlp",
+        multi_possession_features=True,
+    )
+    training_ids = training_player_ids_from_static(static)
+    masks = build_action_masks_batch(static, state, jnp)[:, training_ids, :]
+    spec = _build_policy_spec(
+        args,
+        static,
+        np.asarray(observations, dtype=np.float32),
+        np.asarray(masks, dtype=np.int8),
+    )
+    params = init_actor_critic_params(jax, jnp, spec, seed=43)
+    runner = build_compiled_rollout_runner(
+        jax,
+        jnp,
+        spec,
+        game_clock_mode=True,
+    )
+    first_rollout = runner(
+        static,
+        state,
+        params,
+        jax.random.PRNGKey(44),
+        1,
+    )
+    second_rollout = runner(
+        static,
+        first_rollout.final_state,
+        params,
+        jax.random.PRNGKey(45),
+        1,
+    )
+    jax.block_until_ready(second_rollout.final_state.step_count)
+
+    assert int(np.asarray(first_rollout.final_state.step_count)[0]) == 1
+    assert int(np.asarray(second_rollout.final_state.step_count)[0]) == 2
+    assert int(np.asarray(first_rollout.final_state.game_clock_remaining)[0]) == 299
+    assert int(np.asarray(second_rollout.final_state.game_clock_remaining)[0]) == 298
+
+    truncated_static = static._replace(game_clock_max_total_steps=jnp.asarray(1))
+    rollout = runner(
+        truncated_static,
+        state,
+        params,
+        jax.random.PRNGKey(46),
+        1,
+    )
+    jax.block_until_ready(rollout.trajectory.truncated)
+
+    assert int(np.asarray(rollout.trajectory.truncated)[0, 0]) == 1
+    assert (
+        int(np.asarray(rollout.trajectory.truncation_reason)[0, 0])
+        == TRUNCATION_REASON_TOTAL_STEPS
+    )
+    assert np.isfinite(
+        float(np.asarray(rollout.trajectory.truncation_bootstrap_values)[0, 0])
+    )
+    assert int(np.asarray(rollout.final_state.step_count)[0]) == 0
+    assert int(np.asarray(rollout.final_state.game_clock_remaining)[0]) == 300
 
 
 def test_jax_training_source_has_no_retired_runtime_imports():

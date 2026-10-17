@@ -7,6 +7,11 @@ jax = pytest.importorskip("jax")
 import jax.numpy as jnp
 
 from basketworld.domain import ActionType
+from basketworld_jax.checkpoints import (
+    build_checkpoint_payload,
+    load_checkpoint,
+    save_checkpoint,
+)
 from basketworld_jax.config import JaxEnvironmentConfig
 from basketworld_jax.env.minimal import (
     EPISODE_END_GAME_CLOCK,
@@ -26,9 +31,11 @@ from basketworld_jax.env.minimal import (
     TURNOVER_REASON_NONE,
     build_action_masks_batch,
     build_kernel_static_from_config,
+    build_multi_possession_observation_features_batch,
     reset_batch_minimal,
     step_batch_minimal,
 )
+from basketworld_jax.train.main import _restore_like_template
 
 
 def _static(
@@ -162,6 +169,101 @@ def test_game_clock_configuration_defaults_validation_and_possession_mode_parity
         for seed in range(8)
     }
     assert starters == {TEAM_A, TEAM_B}
+
+
+def test_clock_observation_uses_fixed_unclipped_time_and_score_scales():
+    static = _static(regulation=900)
+    state = _reset(static)._replace(
+        offense_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
+        game_clock_remaining=jnp.asarray([900], dtype=jnp.int32),
+        team_a_score=jnp.asarray([50.0], dtype=jnp.float32),
+        team_b_score=jnp.asarray([5.0], dtype=jnp.float32),
+    )
+    _, globals_vec = build_multi_possession_observation_features_batch(
+        static,
+        state,
+        jnp.asarray(1.0, dtype=jnp.float32),
+        jnp,
+    )
+    assert float(np.asarray(globals_vec)[0, 0]) == pytest.approx(1.5)
+    assert float(np.asarray(globals_vec)[0, 1]) == pytest.approx(1.25)
+
+    possession_static = _static(mode="possessions")
+    possession_state = _reset(possession_static)._replace(
+        offense_team=jnp.asarray([TEAM_A], dtype=jnp.int8),
+        team_a_score=jnp.asarray([3.0], dtype=jnp.float32),
+        team_b_score=jnp.asarray([0.0], dtype=jnp.float32),
+        team_a_completed_possessions=jnp.asarray([1], dtype=jnp.int32),
+        episode_possession_limit=jnp.asarray([2], dtype=jnp.int32),
+    )
+    _, possession_globals = build_multi_possession_observation_features_batch(
+        possession_static,
+        possession_state,
+        jnp.asarray(1.0, dtype=jnp.float32),
+        jnp,
+    )
+    assert float(np.asarray(possession_globals)[0, 0]) == pytest.approx(0.5)
+    assert float(np.asarray(possession_globals)[0, 1]) == pytest.approx(0.5)
+
+
+def test_mid_game_clock_state_survives_checkpoint_round_trip(tmp_path):
+    static = _static(regulation=10)
+    live = _step(static, _reset(static, seed=51), seed=52).state
+    live = live._replace(
+        overtime_round=jnp.asarray([2], dtype=jnp.int32),
+        game_clock_remaining=jnp.asarray([7], dtype=jnp.int32),
+    )
+    payload = build_checkpoint_payload(
+        update_index=4,
+        trainer_config={},
+        policy_spec={},
+        frozen_config={},
+        env_config={
+            "enable_multi_possession": True,
+            "episode_end_mode": "game_clock",
+            "game_clock_seconds": 10,
+            "overtime_seconds": 2,
+        },
+        params={},
+        opt_state={},
+        current_state={"offense": live},
+        eval_initial_state={},
+        base_key=jax.random.PRNGKey(53),
+        eval_trajectories=[],
+        last_metrics=None,
+        observation_metadata={
+            "episode_end_mode": "game_clock",
+            "episode_budget_feature": {
+                "semantic": "game_clock_seconds_remaining",
+                "normalization": 720.0,
+            },
+            "relative_score_feature": {
+                "semantic": "observing_team_score_difference",
+                "normalization": 30.0,
+            },
+        },
+    )
+    checkpoint = tmp_path / "clock-checkpoint"
+    save_checkpoint(checkpoint, payload)
+    restored = _restore_like_template(
+        load_checkpoint(checkpoint)["current_state"]["offense"],
+        live,
+    )
+
+    np.testing.assert_array_equal(
+        np.asarray(restored.game_clock_remaining), np.asarray([7], dtype=np.int32)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(restored.elapsed_game_clock_seconds),
+        np.asarray(live.elapsed_game_clock_seconds),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(restored.overtime_round), np.asarray([2], dtype=np.int32)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(restored.episode_end_mode),
+        np.asarray([EPISODE_END_GAME_CLOCK], dtype=np.int8),
+    )
 
 
 def test_clock_runs_live_and_during_pickup_but_stops_for_setup_and_inbound():

@@ -25,6 +25,7 @@ from basketworld_jax.env import (
     resolve_team_player_ids,
     sample_uniform_legal_actions_jax,
     set_offense_intent_state_batch,
+    step_batch_game_clock,
     step_batch_minimal,
 )
 from basketworld_jax.env.minimal import (
@@ -1281,7 +1282,149 @@ def update_pinned_opponent_episode_state(
     )
 
 
-def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
+def _truncation_bootstrap_values(
+    static,
+    final_state,
+    truncated,
+    params,
+    spec,
+    *,
+    game_clock_mode: bool,
+    jnp,
+):
+    """Value the final pre-reset state only for time-limit truncations."""
+    if not game_clock_mode:
+        return jnp.zeros_like(truncated, dtype=jnp.float32)
+    final_obs = build_policy_observation_batch(
+        static,
+        final_state,
+        jnp,
+        model_type=spec.model_type,
+        rebound_win_prob_features=bool(spec.rebound_win_prob_features),
+        rebound_target_observation_features=bool(
+            getattr(spec, "rebound_target_observation_features", True)
+        ),
+        multi_possession_features=bool(
+            getattr(spec, "multi_possession_features", False)
+        ),
+        check_clearance_features=(
+            int(getattr(spec, "observation_schema_version", 1)) >= 5
+        ),
+    )
+    final_values = actor_critic_forward(
+        params,
+        final_obs,
+        spec,
+        jnp,
+        intent_context=build_policy_intent_context_batch(static, final_state, jnp),
+    )["values"]
+    return jnp.where(
+        truncated.astype(jnp.bool_),
+        final_values.astype(jnp.float32),
+        jnp.zeros_like(final_values, dtype=jnp.float32),
+    )
+
+
+def _game_clock_transition_metrics(
+    static,
+    policy_state,
+    env_out,
+    active_step,
+    *,
+    game_clock_mode: bool,
+    jnp,
+):
+    zero = jnp.zeros_like(active_step, dtype=jnp.int32)
+    inactive_period = jnp.full_like(zero, -1, dtype=jnp.int32)
+    if not game_clock_mode:
+        return {
+            "game_clock_seconds_remaining": zero,
+            "clock_period_index": inactive_period,
+            "regulation_clock_segment": inactive_period,
+            "regulation_completed": zero,
+            "overtime_period_started": zero,
+            "terminal_overtime_periods": zero,
+            "terminal_game_clock_seconds_remaining": zero,
+            "terminal_completed_possessions": zero,
+        }
+
+    completed_game = env_out.done.astype(jnp.bool_) & (
+        ~env_out.truncated.astype(jnp.bool_)
+    )
+    regulation_completed = (policy_state.overtime_round == 0) & (
+        (env_out.state.overtime_round > 0) | completed_game
+    )
+    overtime_started = env_out.state.overtime_round > policy_state.overtime_round
+    regulation_seconds = jnp.maximum(
+        static.game_clock_seconds.astype(jnp.int32),
+        jnp.asarray(1, dtype=jnp.int32),
+    )
+    regulation_elapsed = jnp.maximum(
+        regulation_seconds - policy_state.game_clock_remaining.astype(jnp.int32),
+        0,
+    )
+    regulation_segment = jnp.minimum(
+        (regulation_elapsed * jnp.asarray(4, dtype=jnp.int32))
+        // regulation_seconds,
+        jnp.asarray(3, dtype=jnp.int32),
+    )
+    regulation_segment = jnp.where(
+        policy_state.overtime_round == 0,
+        regulation_segment,
+        inactive_period,
+    )
+    return {
+        "game_clock_seconds_remaining": jnp.where(
+            active_step,
+            policy_state.game_clock_remaining.astype(jnp.int32),
+            0,
+        ),
+        "clock_period_index": jnp.where(
+            active_step,
+            policy_state.overtime_round.astype(jnp.int32),
+            -1,
+        ),
+        "regulation_clock_segment": jnp.where(
+            active_step,
+            regulation_segment,
+            -1,
+        ),
+        "regulation_completed": jnp.where(
+            active_step,
+            regulation_completed.astype(jnp.int32),
+            0,
+        ),
+        "overtime_period_started": jnp.where(
+            active_step,
+            overtime_started.astype(jnp.int32),
+            0,
+        ),
+        "terminal_overtime_periods": jnp.where(
+            active_step & completed_game,
+            env_out.state.overtime_round.astype(jnp.int32),
+            0,
+        ),
+        "terminal_game_clock_seconds_remaining": jnp.where(
+            active_step & completed_game,
+            env_out.state.game_clock_remaining.astype(jnp.int32),
+            0,
+        ),
+        "terminal_completed_possessions": jnp.where(
+            active_step & completed_game,
+            (
+                env_out.state.team_a_completed_possessions
+                + env_out.state.team_b_completed_possessions
+            ).astype(jnp.int32),
+            0,
+        ),
+    }
+
+
+def build_compiled_rollout_runner(
+    jax, jnp, spec: ActorCriticSpec, *, game_clock_mode: bool = False
+):
+    step_batch = step_batch_game_clock if game_clock_mode else step_batch_minimal
+
     def _runner(
         static,
         initial_state,
@@ -1362,13 +1505,30 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 jnp,
             )
             env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
-            env_out = step_batch_minimal(
+            env_out = step_batch(
                 static,
                 policy_state,
                 full_actions,
                 env_keys,
                 jax,
                 jnp,
+            )
+            truncation_bootstrap_values = _truncation_bootstrap_values(
+                static,
+                env_out.state,
+                env_out.truncated,
+                params,
+                spec,
+                game_clock_mode=game_clock_mode,
+                jnp=jnp,
+            )
+            game_clock_metrics = _game_clock_transition_metrics(
+                static,
+                policy_state,
+                env_out,
+                active_step,
+                game_clock_mode=game_clock_mode,
+                jnp=jnp,
             )
             reset_keys = jax.random.split(reset_key, initial_state.positions.shape[0])
             reset_state = reset_batch_minimal(static, reset_keys, jax, jnp)
@@ -1436,6 +1596,15 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                 **rebound_counterfactual,
                 rewards=masked_reward,
                 dones=masked_done,
+                truncated=jnp.where(
+                    active_step, env_out.truncated.astype(jnp.int8), 0
+                ),
+                truncation_reason=jnp.where(
+                    active_step, env_out.truncation_reason.astype(jnp.int32), 0
+                ),
+                truncation_bootstrap_values=jnp.where(
+                    active_step, truncation_bootstrap_values, 0.0
+                ),
                 game_rewards=jnp.where(
                     active_step,
                     jnp.sum(
@@ -1503,6 +1672,20 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
                     env_out.completed_possession_live_steps.astype(jnp.int32),
                     0,
                 ),
+                completed_possession_game_clock_seconds=jnp.where(
+                    active_step,
+                    env_out.completed_possession_game_clock_seconds.astype(jnp.int32),
+                    0,
+                ),
+                elapsed_game_clock_seconds=jnp.where(
+                    active_step,
+                    (
+                        env_out.state.elapsed_game_clock_seconds
+                        - policy_state.elapsed_game_clock_seconds
+                    ).astype(jnp.int32),
+                    0,
+                ),
+                **game_clock_metrics,
                 **turnover_metrics,
                 **shot_metrics,
                 **rebound_metrics,
@@ -1632,7 +1815,11 @@ def build_compiled_rollout_runner(jax, jnp, spec: ActorCriticSpec):
     return jax.jit(_runner, static_argnums=(4,))
 
 
-def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpec):
+def build_compiled_frozen_opponent_rollout_runner(
+    jax, jnp, spec: ActorCriticSpec, *, game_clock_mode: bool = False
+):
+    step_batch = step_batch_game_clock if game_clock_mode else step_batch_minimal
+
     def _runner(
         static,
         initial_state,
@@ -1826,13 +2013,30 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 jnp,
             )
             env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
-            env_out = step_batch_minimal(
+            env_out = step_batch(
                 static,
                 policy_state,
                 full_actions,
                 env_keys,
                 jax,
                 jnp,
+            )
+            truncation_bootstrap_values = _truncation_bootstrap_values(
+                static,
+                env_out.state,
+                env_out.truncated,
+                params,
+                spec,
+                game_clock_mode=game_clock_mode,
+                jnp=jnp,
+            )
+            game_clock_metrics = _game_clock_transition_metrics(
+                static,
+                policy_state,
+                env_out,
+                active_step,
+                game_clock_mode=game_clock_mode,
+                jnp=jnp,
             )
             reset_keys = jax.random.split(reset_key, initial_state.positions.shape[0])
             reset_state = reset_batch_minimal(static, reset_keys, jax, jnp)
@@ -1928,6 +2132,15 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                 values=policy_out["values"],
                 rewards=masked_reward,
                 dones=masked_done,
+                truncated=jnp.where(
+                    active_step, env_out.truncated.astype(jnp.int8), 0
+                ),
+                truncation_reason=jnp.where(
+                    active_step, env_out.truncation_reason.astype(jnp.int32), 0
+                ),
+                truncation_bootstrap_values=jnp.where(
+                    active_step, truncation_bootstrap_values, 0.0
+                ),
                 game_rewards=jnp.where(
                     active_step,
                     jnp.sum(
@@ -1995,6 +2208,20 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
                     env_out.completed_possession_live_steps.astype(jnp.int32),
                     0,
                 ),
+                completed_possession_game_clock_seconds=jnp.where(
+                    active_step,
+                    env_out.completed_possession_game_clock_seconds.astype(jnp.int32),
+                    0,
+                ),
+                elapsed_game_clock_seconds=jnp.where(
+                    active_step,
+                    (
+                        env_out.state.elapsed_game_clock_seconds
+                        - policy_state.elapsed_game_clock_seconds
+                    ).astype(jnp.int32),
+                    0,
+                ),
+                **game_clock_metrics,
                 **turnover_metrics,
                 **shot_metrics,
                 **rebound_metrics,
@@ -2161,7 +2388,11 @@ def build_compiled_frozen_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpe
     return jax.jit(_runner, static_argnums=(8,))
 
 
-def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSpec):
+def build_compiled_grouped_opponent_rollout_runner(
+    jax, jnp, spec: ActorCriticSpec, *, game_clock_mode: bool = False
+):
+    step_batch = step_batch_game_clock if game_clock_mode else step_batch_minimal
+
     def _runner(
         static,
         initial_state,
@@ -2344,13 +2575,30 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 jnp,
             )
             env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
-            env_out = step_batch_minimal(
+            env_out = step_batch(
                 static,
                 policy_state,
                 full_actions,
                 env_keys,
                 jax,
                 jnp,
+            )
+            truncation_bootstrap_values = _truncation_bootstrap_values(
+                static,
+                env_out.state,
+                env_out.truncated,
+                params,
+                spec,
+                game_clock_mode=game_clock_mode,
+                jnp=jnp,
+            )
+            game_clock_metrics = _game_clock_transition_metrics(
+                static,
+                policy_state,
+                env_out,
+                active_step,
+                game_clock_mode=game_clock_mode,
+                jnp=jnp,
             )
             reset_keys = jax.random.split(reset_key, initial_state.positions.shape[0])
             reset_state = reset_batch_minimal(static, reset_keys, jax, jnp)
@@ -2431,6 +2679,15 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                 values=policy_out["values"],
                 rewards=masked_reward,
                 dones=masked_done,
+                truncated=jnp.where(
+                    active_step, env_out.truncated.astype(jnp.int8), 0
+                ),
+                truncation_reason=jnp.where(
+                    active_step, env_out.truncation_reason.astype(jnp.int32), 0
+                ),
+                truncation_bootstrap_values=jnp.where(
+                    active_step, truncation_bootstrap_values, 0.0
+                ),
                 game_rewards=jnp.where(
                     active_step,
                     jnp.sum(
@@ -2498,6 +2755,20 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
                     env_out.completed_possession_live_steps.astype(jnp.int32),
                     0,
                 ),
+                completed_possession_game_clock_seconds=jnp.where(
+                    active_step,
+                    env_out.completed_possession_game_clock_seconds.astype(jnp.int32),
+                    0,
+                ),
+                elapsed_game_clock_seconds=jnp.where(
+                    active_step,
+                    (
+                        env_out.state.elapsed_game_clock_seconds
+                        - policy_state.elapsed_game_clock_seconds
+                    ).astype(jnp.int32),
+                    0,
+                ),
+                **game_clock_metrics,
                 **turnover_metrics,
                 **shot_metrics,
                 **rebound_metrics,
@@ -2662,7 +2933,11 @@ def build_compiled_grouped_opponent_rollout_runner(jax, jnp, spec: ActorCriticSp
     return jax.jit(_runner, static_argnums=(5, 6))
 
 
-def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
+def build_compiled_eval_runner(
+    jax, jnp, spec: ActorCriticSpec, *, game_clock_mode: bool = False
+):
+    step_batch = step_batch_game_clock if game_clock_mode else step_batch_minimal
+
     def _runner(
         static,
         initial_state,
@@ -2773,7 +3048,7 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 jnp,
             )
             env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
-            env_out = step_batch_minimal(
+            env_out = step_batch(
                 static,
                 state,
                 full_actions,
@@ -2790,6 +3065,8 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 full_actions=full_actions,
                 rewards=build_aggregated_reward_batch(static, env_out.rewards, jnp),
                 dones=env_out.done.astype(jnp.int8),
+                truncated=env_out.truncated.astype(jnp.int8),
+                truncation_reason=env_out.truncation_reason.astype(jnp.int32),
                 game_rewards=jnp.sum(
                     env_out.game_reward * static.training_player_mask[None, :], axis=1
                 ),
@@ -2865,7 +3142,11 @@ def build_compiled_eval_runner(jax, jnp, spec: ActorCriticSpec):
     return jax.jit(_runner, static_argnums=(4, 6, 7))
 
 
-def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
+def build_compiled_frozen_opponent_eval_runner(
+    jax, jnp, spec: ActorCriticSpec, *, game_clock_mode: bool = False
+):
+    step_batch = step_batch_game_clock if game_clock_mode else step_batch_minimal
+
     def _runner(
         static,
         initial_state,
@@ -3037,7 +3318,7 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 jnp,
             )
             env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
-            env_out = step_batch_minimal(
+            env_out = step_batch(
                 static,
                 state,
                 full_actions,
@@ -3054,6 +3335,8 @@ def build_compiled_frozen_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 full_actions=full_actions,
                 rewards=build_aggregated_reward_batch(static, env_out.rewards, jnp),
                 dones=env_out.done.astype(jnp.int8),
+                truncated=env_out.truncated.astype(jnp.int8),
+                truncation_reason=env_out.truncation_reason.astype(jnp.int32),
                 game_rewards=jnp.sum(
                     env_out.game_reward * static.training_player_mask[None, :], axis=1
                 ),
@@ -3329,7 +3612,11 @@ def _build_historical_match_step_diagnostics(
     return counters
 
 
-def build_compiled_historical_match_eval_runner(jax, jnp, spec: ActorCriticSpec):
+def build_compiled_historical_match_eval_runner(
+    jax, jnp, spec: ActorCriticSpec, *, game_clock_mode: bool = False
+):
+    step_batch = step_batch_game_clock if game_clock_mode else step_batch_minimal
+
     """Build deterministic candidate-versus-checkpoint match evaluation.
 
     ``static.training_player_mask`` chooses whether the candidate controls
@@ -3528,7 +3815,7 @@ def build_compiled_historical_match_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 jnp,
             )
             env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
-            env_out = step_batch_minimal(
+            env_out = step_batch(
                 static,
                 state,
                 full_actions,
@@ -3590,7 +3877,11 @@ def build_compiled_historical_match_eval_runner(jax, jnp, spec: ActorCriticSpec)
     return jax.jit(_runner, static_argnums=(5, 8, 9))
 
 
-def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec):
+def build_compiled_grouped_opponent_eval_runner(
+    jax, jnp, spec: ActorCriticSpec, *, game_clock_mode: bool = False
+):
+    step_batch = step_batch_game_clock if game_clock_mode else step_batch_minimal
+
     def _runner(
         static,
         initial_state,
@@ -3859,7 +4150,7 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 jnp,
             )
             env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
-            env_out = step_batch_minimal(
+            env_out = step_batch(
                 static,
                 state,
                 full_actions,
@@ -3876,6 +4167,8 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
                 full_actions=full_actions,
                 rewards=build_aggregated_reward_batch(static, env_out.rewards, jnp),
                 dones=env_out.done.astype(jnp.int8),
+                truncated=env_out.truncated.astype(jnp.int8),
+                truncation_reason=env_out.truncation_reason.astype(jnp.int32),
                 game_rewards=jnp.sum(
                     env_out.game_reward * static.training_player_mask[None, :], axis=1
                 ),
@@ -3951,7 +4244,11 @@ def build_compiled_grouped_opponent_eval_runner(jax, jnp, spec: ActorCriticSpec)
     return jax.jit(_runner, static_argnums=(5, 6, 9, 10))
 
 
-def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
+def build_compiled_deploy_eval_runner(
+    jax, jnp, spec: ActorCriticSpec, *, game_clock_mode: bool = False
+):
+    step_batch = step_batch_game_clock if game_clock_mode else step_batch_minimal
+
     """Build fixed-seed, same-policy, argmax-vs-argmax deploy evaluation."""
 
     def _runner(
@@ -4127,7 +4424,7 @@ def build_compiled_deploy_eval_runner(jax, jnp, spec: ActorCriticSpec):
                 jnp,
             )
             env_keys = jax.random.split(env_key, initial_state.positions.shape[0])
-            env_out = step_batch_minimal(
+            env_out = step_batch(
                 static,
                 state,
                 full_actions,
@@ -4352,12 +4649,54 @@ def summarize_deploy_eval_outputs(
         )
     )
     episode_count = int(len(outputs) * int(batch_size))
-    completed_episode_count = int(
+    ended_count = int(
         sum(
             int(np.asarray(output.final_state.episode_ended, dtype=np.int32).sum())
             for output in outputs
         )
     )
+    safety_truncated_count = int(
+        sum(
+            int(
+                np.asarray(
+                    getattr(
+                        output.final_state,
+                        "episode_truncated",
+                        np.zeros_like(output.final_state.episode_ended),
+                    ),
+                    dtype=np.int32,
+                ).sum()
+            )
+            for output in outputs
+        )
+    )
+    safety_truncated_steps = float(
+        sum(
+            float(
+                (
+                    np.asarray(
+                        getattr(
+                            output.final_state,
+                            "episode_truncated",
+                            np.zeros_like(output.final_state.episode_ended),
+                        ),
+                        dtype=np.float64,
+                    )
+                    * np.asarray(
+                        getattr(
+                            output.final_state,
+                            "step_count",
+                            np.zeros_like(output.final_state.episode_ended),
+                        ),
+                        dtype=np.float64,
+                    )
+                ).sum()
+            )
+            for output in outputs
+        )
+    )
+    completed_episode_count = int(ended_count - safety_truncated_count)
+    horizon_truncated_count = int(episode_count - ended_count)
     offense_score = float(
         sum(
             float(np.asarray(output.final_state.offense_score, dtype=np.float64).sum())
@@ -4388,12 +4727,16 @@ def summarize_deploy_eval_outputs(
         "batch_size": int(batch_size),
         "episode_count": episode_count,
         "completed_episode_count": completed_episode_count,
-        "truncated_episode_count": int(episode_count - completed_episode_count),
+        "truncated_episode_count": int(
+            safety_truncated_count + horizon_truncated_count
+        ),
+        "safety_truncated_episode_count": safety_truncated_count,
+        "horizon_truncated_episode_count": horizon_truncated_count,
         "completion_rate": _rate(completed_episode_count, episode_count),
         "active_step_count": int(totals["active_steps"]),
         "mean_steps_per_episode": _per_episode(totals["active_steps"]),
         "mean_completed_episode_length": _rate(
-            totals["completed_episode_steps"],
+            totals["completed_episode_steps"] - safety_truncated_steps,
             completed_episode_count,
         ),
         "completed_possession_count": int(totals["completed_possessions"]),
@@ -5771,7 +6114,11 @@ def summarize_training_step(
             * rollout_active
         ).sum()
     )
-    done_rate = _active_mean(rollout_out.trajectory.dones, rollout_active)
+    all_dones = np.asarray(rollout_out.trajectory.dones, dtype=bool)
+    truncated = np.asarray(rollout_out.trajectory.truncated, dtype=bool)
+    completed_dones = all_dones & (~truncated)
+    done_rate = _active_mean(completed_dones, rollout_active)
+    truncation_rate = _active_mean(truncated, rollout_active)
     opponent_deterministic_episode_rate = _active_mean(
         rollout_out.trajectory.opponent_deterministic_episode,
         rollout_active,
@@ -5784,8 +6131,12 @@ def summarize_training_step(
     return_mean = _active_mean(ppo_batch.returns, ppo_active)
     value_mean = _active_mean(rollout_out.trajectory.values, rollout_active)
     episode_metrics = summarize_episode_events(
-        rollout_out.trajectory.dones,
-        rollout_out.trajectory.terminal_episode_steps,
+        completed_dones,
+        np.where(
+            completed_dones,
+            np.asarray(rollout_out.trajectory.terminal_episode_steps),
+            0,
+        ),
         rollout_out.trajectory.pass_attempts,
         rollout_out.trajectory.completed_passes,
         rollout_out.trajectory.assists,
@@ -5824,6 +6175,8 @@ def summarize_training_step(
         "ppo_update_rollout_samples_per_sec": float(ppo_batch_size / update_sec),
         "ppo_update_optimizer_samples_per_sec": float(optimizer_sample_count / update_sec),
         "mean_reward": reward_mean,
+        "truncated_episode_count": int((truncated * rollout_active.astype(bool)).sum()),
+        "truncation_rate": truncation_rate,
         "phi_r_shape_mean": phi_r_shape_mean,
         "phi_r_shape_abs_mean": phi_r_shape_abs_mean,
         "phi_prev_mean": phi_prev_mean,
@@ -6107,6 +6460,8 @@ def serialize_eval_trace(
     full_actions = np.asarray(trace.full_actions)
     rewards = np.asarray(trace.rewards)
     dones = np.asarray(trace.dones)
+    truncated = np.asarray(trace.truncated)
+    truncation_reason = np.asarray(trace.truncation_reason)
     pass_attempts = np.asarray(trace.pass_attempts)
     completed_passes = np.asarray(trace.completed_passes)
     assists = np.asarray(trace.assists)
@@ -6149,6 +6504,8 @@ def serialize_eval_trace(
         "full_actions": full_actions[:, env_index].astype(np.int32),
         "rewards": rewards[:, env_index].astype(np.float32),
         "dones": dones[:, env_index].astype(np.int8),
+        "truncated": truncated[:, env_index].astype(np.int8),
+        "truncation_reason": truncation_reason[:, env_index].astype(np.int32),
         "pass_attempts": pass_attempts[:, env_index].astype(np.int8),
         "completed_passes": completed_passes[:, env_index].astype(np.int8),
         "assists": assists[:, env_index].astype(np.int8),

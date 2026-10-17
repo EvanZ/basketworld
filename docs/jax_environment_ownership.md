@@ -74,10 +74,25 @@ Stable-Baselines3.
 
 The JAX trainer owns `episode_end_mode`, `game_clock_seconds`,
 `overtime_seconds`, and `game_clock_max_total_steps`.
-The reset and scalar clock rules are implemented, but compiled training and
-native evaluation reject `game_clock` until issue #64 wires and verifies the
-compiled transitions. The trainer settings schema currently offers only
-`possessions`; a successful timed reset does not establish timed training support.
+Compiled training selects a mode-specialized stepper when each rollout runner
+is built: possession runs retain `step_batch_minimal`, while timed runs use
+`step_batch_game_clock`. Safety truncations reset the environment but bootstrap
+the learner from the final pre-reset observation. Native timed evaluation remains
+guarded until issue #65 adds timed horizons, paired overtime starts, and the full
+evaluation diagnostic contract.
+
+Game-clock policies observe seconds remaining divided by the fixed scale 720
+and observing-team score difference divided by 30. These semantics and scales
+are stored in checkpoint and MLflow observation metadata. Same-width policies
+from possession and clock modes are rejected as incompatible unless a caller
+uses an explicit adaptation path.
+
+Training trajectories retain the raw period index and pre-step clock value for
+each transition. MLflow training metrics use completed offensive possessions
+for per-team efficiency, elapsed game-clock minutes for per-team pace, and
+report regulation completions, overtime games/periods, terminal clock values,
+four regulation scoring segments, overtime scoring, possession duration, and
+safety truncations separately.
 
 ## Effective configuration and reproducibility
 
