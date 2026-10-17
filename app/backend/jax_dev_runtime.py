@@ -31,6 +31,7 @@ from basketworld_jax.env.minimal import (
     GAME_PHASE_AWAITING_CHECK,
     GAME_PHASE_CHECK_SETUP,
     GAME_PHASE_LIVE,
+    EPISODE_END_GAME_CLOCK,
     MADE_BASKET_RESTART_BASELINE_INBOUND,
     MADE_BASKET_RESTART_CHECK,
     MADE_BASKET_RESTART_DIRECT_HANDOFF,
@@ -114,6 +115,10 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "check_setup_steps",
     "check_clearance",
     "random_check_location",
+    "episode_end_mode",
+    "game_clock_seconds",
+    "overtime_seconds",
+    "game_clock_max_total_steps",
 }
 
 
@@ -159,6 +164,10 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "check_setup_steps": 0,
     "check_clearance": 0,
     "random_check_location": False,
+    "episode_end_mode": "possessions",
+    "game_clock_seconds": 300,
+    "overtime_seconds": 120,
+    "game_clock_max_total_steps": 10_000,
 }
 
 _JAX_STATIC_ONLY_ENV_CASTS = {
@@ -203,6 +212,10 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "check_setup_steps": "int",
     "check_clearance": "int",
     "random_check_location": "bool",
+    "episode_end_mode": "str",
+    "game_clock_seconds": "int",
+    "overtime_seconds": "int",
+    "game_clock_max_total_steps": "int",
 }
 
 
@@ -3621,6 +3634,14 @@ class JaxDevRuntime:
             "positions": _field0(self.state, "positions"),
             "ball_holder": _field0(self.state, "ball_holder"),
             "shot_clock": _field0(self.state, "shot_clock"),
+            "episode_end_mode": _field0(self.state, "episode_end_mode"),
+            "game_clock_remaining": _field0(self.state, "game_clock_remaining"),
+            "elapsed_game_clock_seconds": _field0(
+                self.state, "elapsed_game_clock_seconds"
+            ),
+            "period_elapsed_game_clock_seconds": _field0(
+                self.state, "period_elapsed_game_clock_seconds"
+            ),
             "episode_ended": _field0(self.state, "episode_ended"),
             "offense_team": _field0(self.state, "offense_team"),
             "team_a_score": _field0(self.state, "team_a_score"),
@@ -3726,6 +3747,10 @@ class JaxDevRuntime:
             else team_a_completed_possessions
         )
         game_phase = int(np.asarray(host["game_phase"]).reshape(-1)[0])
+        clock_mode = (
+            int(np.asarray(host["episode_end_mode"]).reshape(-1)[0])
+            == EPISODE_END_GAME_CLOCK
+        )
         clearance_achieved = bool(np.asarray(host["clearance_achieved"]).reshape(-1)[0])
         intent_active = bool(np.asarray(host["intent_active"]).reshape(-1)[0])
         intent_index = int(np.asarray(host["intent_index"]).reshape(-1)[0])
@@ -3779,6 +3804,22 @@ class JaxDevRuntime:
             "shot_clock": int(np.asarray(host["shot_clock"]).reshape(-1)[0]),
             "min_shot_clock": int(self.environment.min_shot_clock or 10),
             "shot_clock_steps": int(self.environment.shot_clock_steps or 24),
+            "episode_end_mode": "game_clock" if clock_mode else "possessions",
+            "game_clock_seconds": _int_from_static_field(
+                self.static, "game_clock_seconds", 300
+            ),
+            "overtime_seconds": _int_from_static_field(
+                self.static, "overtime_seconds", 120
+            ),
+            "game_clock_remaining": int(
+                np.asarray(host["game_clock_remaining"]).reshape(-1)[0]
+            ),
+            "elapsed_game_clock_seconds": int(
+                np.asarray(host["elapsed_game_clock_seconds"]).reshape(-1)[0]
+            ),
+            "period_elapsed_game_clock_seconds": int(
+                np.asarray(host["period_elapsed_game_clock_seconds"]).reshape(-1)[0]
+            ),
             "user_team_name": self.user_team.name,
             "done": bool(np.asarray(host["episode_ended"]).reshape(-1)[0]),
             "enable_multi_possession": bool(self.multi_possession_enabled),
@@ -4096,6 +4137,10 @@ class JaxDevRuntime:
         overtime_starting_team = _as_int(
             _field0(self.state, "overtime_starting_team")
         )
+        clock_mode = (
+            _as_int(_field0(self.state, "episode_end_mode"))
+            == EPISODE_END_GAME_CLOCK
+        )
         episode_possession_limit = _as_int(
             _field0(self.state, "episode_possession_limit")
         )
@@ -4135,6 +4180,22 @@ class JaxDevRuntime:
             "shot_clock": self.shot_clock,
             "min_shot_clock": int(self.environment.min_shot_clock or 10),
             "shot_clock_steps": int(self.environment.shot_clock_steps or 24),
+            "episode_end_mode": "game_clock" if clock_mode else "possessions",
+            "game_clock_seconds": _int_from_static_field(
+                self.static, "game_clock_seconds", 300
+            ),
+            "overtime_seconds": _int_from_static_field(
+                self.static, "overtime_seconds", 120
+            ),
+            "game_clock_remaining": _as_int(
+                _field0(self.state, "game_clock_remaining")
+            ),
+            "elapsed_game_clock_seconds": _as_int(
+                _field0(self.state, "elapsed_game_clock_seconds")
+            ),
+            "period_elapsed_game_clock_seconds": _as_int(
+                _field0(self.state, "period_elapsed_game_clock_seconds")
+            ),
             "user_team_name": self.user_team.name,
             "done": _as_bool(_field0(self.state, "episode_ended")),
             "enable_multi_possession": bool(self.multi_possession_enabled),

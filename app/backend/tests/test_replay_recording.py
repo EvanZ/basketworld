@@ -45,3 +45,31 @@ def test_replay_rejects_a_non_monotonic_recording(monkeypatch):
         analytics_routes.replay_last_episode()
 
     assert error.value.status_code == 409
+
+
+def test_replay_returns_each_recorded_game_mode_without_session_overrides(monkeypatch):
+    state = GameState()
+    state.env = object()
+    state.episode_states = [
+        {
+            **_state(possessions=0),
+            "episode_end_mode": "game_clock",
+            "game_clock_remaining": 300,
+            "overtime_round": 0,
+        },
+        {
+            **_state(possessions=1),
+            "episode_end_mode": "game_clock",
+            "game_clock_remaining": 241,
+            "overtime_round": 0,
+        },
+    ]
+    monkeypatch.setattr(analytics_routes, "game_state", state)
+
+    body = analytics_routes.replay_last_episode()
+
+    assert [row["episode_end_mode"] for row in body["states"]] == [
+        "game_clock",
+        "game_clock",
+    ]
+    assert body["states"][-1]["game_clock_remaining"] == 241

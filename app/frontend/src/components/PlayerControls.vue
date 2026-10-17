@@ -602,6 +602,7 @@ const policyLoadError = computed(() => props.policyLoadError);
 const userPolicySelection = ref('');
 const opponentPolicySelection = ref('');
 const isMultiPossessionGame = computed(() => Boolean(props.gameState?.enable_multi_possession));
+const isGameClockGame = computed(() => props.gameState?.episode_end_mode === 'game_clock');
 const multiPossessionLimitInput = ref(25);
 const madeBasketRestartModeInput = ref('baseline_inbound');
 const checkDeadlineStepsInput = ref(5);
@@ -611,7 +612,8 @@ const normalizedMultiPossessionLimit = computed(() => {
   return Number.isFinite(value) && value >= 1 ? value : 1;
 });
 const multiPossessionLimitIsCurrent = computed(() => (
-  normalizedMultiPossessionLimit.value === Number(props.gameState?.multi_possession_limit)
+  (isGameClockGame.value
+    || normalizedMultiPossessionLimit.value === Number(props.gameState?.multi_possession_limit))
   && madeBasketRestartModeInput.value === String(
     props.gameState?.made_basket_restart_mode ?? 'baseline_inbound'
   )
@@ -11898,6 +11900,14 @@ function offenseSkillDeltaLabel(idx) {
               <span class="param-name">Shot clock:</span>
               <span class="param-value">{{ props.gameState.shot_clock }}</span>
             </div>
+            <div v-if="isGameClockGame" class="param-item" data-tooltip="Actual time remaining in the recorded regulation or overtime period.">
+              <span class="param-name">Game clock:</span>
+              <span class="param-value">{{ props.gameState.game_clock_remaining ?? 'N/A' }} seconds</span>
+            </div>
+            <div v-if="isGameClockGame" class="param-item">
+              <span class="param-name">Period:</span>
+              <span class="param-value">{{ props.gameState.overtime_round > 0 ? `Overtime ${props.gameState.overtime_round}` : 'Regulation' }}</span>
+            </div>
             <div class="param-item" data-tooltip="Minimum shot clock value when the game resets for a new possession">
               <span class="param-name">Min shot clock at reset:</span>
               <span class="param-value">{{ props.gameState.min_shot_clock ?? 'N/A' }}</span>
@@ -11913,8 +11923,9 @@ function offenseSkillDeltaLabel(idx) {
           </div>
 
           <div v-if="isMultiPossessionGame" class="param-category">
-            <h5>Multi-Possession Game</h5>
+            <h5>{{ isGameClockGame ? 'Game Clock' : 'Multi-Possession Game' }}</h5>
             <div
+              v-if="!isGameClockGame"
               class="param-item"
               data-tooltip="Total completed possessions across both teams. Applying a new value starts a fresh game with the currently selected policies."
             >
@@ -11929,7 +11940,9 @@ function offenseSkillDeltaLabel(idx) {
               />
             </div>
             <p class="policy-mode-note">
-              Per team. Applying any setting below restarts the current game.
+              <template v-if="isGameClockGame">Regulation and overtime durations are fixed by the new-game setup.</template>
+              <template v-else>Possession limit is per team.</template>
+              Applying a restart setting below starts a fresh game.
             </p>
             <div
               class="param-item"

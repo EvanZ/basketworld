@@ -1908,6 +1908,41 @@ def test_jax_dev_runtime_box_score_is_present_in_full_and_fast_state():
         assert state["box_score"]["ai"]["totals"]["pts"] == state["ai_score"]
 
 
+def test_jax_dev_runtime_serializes_actual_clock_mode_in_full_and_fast_state():
+    runtime = _make_runtime(env_params={
+        "enable_multi_possession": True,
+        "episode_end_mode": "game_clock",
+        "game_clock_seconds": 300,
+        "overtime_seconds": 120,
+    })
+    runtime.state = runtime.state._replace(
+        game_clock_remaining=jnp.asarray([83], dtype=jnp.int32),
+        elapsed_game_clock_seconds=jnp.asarray([217], dtype=jnp.int32),
+        period_elapsed_game_clock_seconds=jnp.asarray([217], dtype=jnp.int32),
+        overtime_round=jnp.asarray([2], dtype=jnp.int32),
+    )
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.environment
+    game_state.unified_policy = runtime.unified_policy
+    game_state.defense_policy = runtime.opponent_policy
+    game_state.user_team = Team.OFFENSE
+
+    for compact in (False, True):
+        state = runtime.get_full_game_state(
+            game_state,
+            include_policy_probs=False,
+            compact=compact,
+        )
+        assert state["episode_end_mode"] == "game_clock"
+        assert state["game_clock_seconds"] == 300
+        assert state["overtime_seconds"] == 120
+        assert state["game_clock_remaining"] == 83
+        assert state["elapsed_game_clock_seconds"] == 217
+        assert state["period_elapsed_game_clock_seconds"] == 217
+        assert state["overtime_round"] == 2
+
+
 def test_jax_dev_runtime_box_score_resets_with_game_and_restores_with_snapshot():
     runtime = _make_runtime(
         env_params={

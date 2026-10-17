@@ -12,6 +12,9 @@ const selectedUnifiedPolicy = ref(null);
 const useDifferentOpponentPolicy = ref(false);
 const selectedOpponentUnifiedPolicy = ref(null);
 const isMultiPossessionRun = ref(false);
+const episodeEndMode = ref('possessions');
+const gameClockSeconds = ref(300);
+const overtimeSeconds = ref(120);
 const recentRuns = ref([]);
 const recentRunsLoading = ref(false);
 const trainerAvailable = ref(true);
@@ -103,6 +106,9 @@ async function fetchPolicies() {
     selectedUnifiedPolicy.value = unifiedPolicies.value.at(-1) || null;
     selectedOpponentUnifiedPolicy.value = selectedUnifiedPolicy.value;
     isMultiPossessionRun.value = res.enable_multi_possession === true;
+    episodeEndMode.value = res.episode_end_mode === 'game_clock' ? 'game_clock' : 'possessions';
+    gameClockSeconds.value = Math.max(1, Number(res.game_clock_seconds) || 300);
+    overtimeSeconds.value = Math.max(1, Number(res.overtime_seconds) || 120);
     if (isMultiPossessionRun.value) {
       // Team A is the blue player roster. Keep the legacy enum only as the
       // API's stable internal representation of that roster.
@@ -132,6 +138,9 @@ function startGame() {
             opponentUnifiedPolicyName: useDifferentOpponentPolicy.value
                 ? (selectedOpponentUnifiedPolicy.value || selectedUnifiedPolicy.value)
                 : null,
+            episodeEndMode: episodeEndMode.value,
+            gameClockSeconds: gameClockSeconds.value,
+            overtimeSeconds: overtimeSeconds.value,
         };
         console.log('[GameSetup] Emitting game-started event with:', payload);
         emit('game-started', payload);
@@ -231,6 +240,34 @@ function openTemplateSandbox() {
               <p>Playing as the Blue Team</p>
               <span>Teams alternate offense and defense; the opening possession is decided by the jump ball.</span>
             </div>
+
+            <fieldset class="game-mode-settings">
+              <legend>Episode format</legend>
+              <div class="mode-options">
+                <label :class="{ active: episodeEndMode === 'possessions' }">
+                  <input v-model="episodeEndMode" type="radio" value="possessions">
+                  Possessions
+                </label>
+                <label :class="{ active: episodeEndMode === 'game_clock' }">
+                  <input v-model="episodeEndMode" type="radio" value="game_clock">
+                  Game clock
+                </label>
+              </div>
+              <div v-if="episodeEndMode === 'game_clock'" class="clock-duration-grid">
+                <label>
+                  Regulation seconds
+                  <input v-model.number="gameClockSeconds" type="number" min="1" required>
+                  <span>Default 5:00</span>
+                </label>
+                <label>
+                  Overtime seconds
+                  <input v-model.number="overtimeSeconds" type="number" min="1" required>
+                  <span>Default 2:00</span>
+                </label>
+              </div>
+              <p v-else>Uses the run's possession limit and possession overtime settings.</p>
+              <small>Changing this starts a new game; it does not convert an active game.</small>
+            </fieldset>
 
             <div class="form-group" v-if="unifiedPolicies.length > 0">
                 <label for="unifiedPol">Unified Policy:</label>
@@ -477,6 +514,7 @@ label {
 }
 
 input[type="text"],
+input[type="number"],
 select {
   width: 100%;
   background: rgba(13, 20, 38, 0.85);
@@ -488,6 +526,31 @@ select {
   letter-spacing: 0.04em;
   transition: border 0.2s ease, box-shadow 0.2s ease;
 }
+
+.game-mode-settings {
+  margin: 0 0 1.2rem;
+  padding: 0.9rem;
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  border-radius: 16px;
+  background: rgba(7, 13, 28, 0.58);
+}
+
+.game-mode-settings legend {
+  padding: 0 0.4rem;
+  color: var(--app-text);
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.mode-options { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }
+.mode-options label { display: flex; align-items: center; gap: 0.45rem; padding: 0.55rem 0.7rem; border: 1px solid rgba(148, 163, 184, 0.25); border-radius: 12px; }
+.mode-options label.active { border-color: var(--app-accent); background: rgba(56, 189, 248, 0.12); color: var(--app-accent); }
+.clock-duration-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.65rem; margin-top: 0.8rem; }
+.clock-duration-grid label { display: grid; gap: 0.35rem; }
+.clock-duration-grid span, .game-mode-settings small { color: var(--app-text-muted); font-size: 0.7rem; }
+.game-mode-settings p { margin: 0.8rem 0 0.4rem; }
 
 input:focus,
 select:focus {

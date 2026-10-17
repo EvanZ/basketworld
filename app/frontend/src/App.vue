@@ -1657,6 +1657,9 @@ async function handleGameStarted(setupData) {
       unifiedPolicyName: setupData.unifiedPolicyName ?? null,
       opponentUnifiedPolicyName: setupData.opponentUnifiedPolicyName ?? null,
       multiPossessionLimit: setupData.multiPossessionLimit ?? null,
+      episodeEndMode: setupData.episodeEndMode ?? null,
+      gameClockSeconds: setupData.gameClockSeconds ?? null,
+      overtimeSeconds: setupData.overtimeSeconds ?? null,
     });
     if (sessionId !== gameSessionId) return;
     

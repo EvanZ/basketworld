@@ -13,6 +13,7 @@ import { defensiveLaneViolationBannerPayload } from '@/utils/outcomeBanners';
 import { resolveRenderableState } from '@/utils/renderableState';
 import { stableBoardViewBox } from '@/utils/boardViewBox';
 import { resolveEpisodeSkillMetadata } from '@/utils/episodeSkillMetadata';
+import { clockPresentation } from '@/utils/gameClockPresentation';
 import basketworldLogo from '@/assets/basketworld-logo.jpg';
 
 const props = defineProps({
@@ -2354,7 +2355,9 @@ const multiPossessionScoreboard = computed(() => {
     };
   };
   const userOnOffense = state.offense_label === 'user';
+  const clock = clockPresentation(state);
   return {
+    ...clock,
     completedPossessions: Number(state.completed_possessions ?? 0),
     userCompletedPossessions: Number(state.user_completed_possessions ?? 0),
     aiCompletedPossessions: Number(state.ai_completed_possessions ?? 0),
@@ -4702,6 +4705,7 @@ onBeforeUnmount(() => {
       'no-move-transitions': disableTransitions,
       'minimal-chrome': minimalChrome,
       'multi-possession-board': !!multiPossessionScoreboard,
+      'game-clock-board': !!multiPossessionScoreboard?.gameClockMode,
     }"
   >
     <div class="board-toolbar">
@@ -6147,8 +6151,21 @@ onBeforeUnmount(() => {
       <div class="score-center">
         <div class="score-clock-readouts">
           <span class="score-clock-readout">
-            <span class="score-period-label">Shot Clock</span>
-            <span class="clock-digits">{{ displayedShotClockValue }}</span>
+            <template v-if="multiPossessionScoreboard.gameClockMode">
+              <span class="score-period-label">{{ multiPossessionScoreboard.periodLabel }}</span>
+              <span class="game-clock-digits">{{ multiPossessionScoreboard.gameClock }}</span>
+              <span class="game-clock-status" :class="{ running: multiPossessionScoreboard.clockRunning }">
+                {{ multiPossessionScoreboard.clockRunning ? 'Running' : 'Stopped' }}
+              </span>
+            </template>
+            <template v-else>
+              <span class="score-period-label">Shot Clock</span>
+              <span class="clock-digits">{{ displayedShotClockValue }}</span>
+            </template>
+          </span>
+          <span v-if="multiPossessionScoreboard.gameClockMode" class="shot-clock-secondary">
+            <span class="score-period-label">Shot</span>
+            <span class="shot-clock-secondary-digits">{{ displayedShotClockValue }}</span>
           </span>
           <span
             v-if="multiPossessionScoreboard.inboundActive"
@@ -6179,7 +6196,10 @@ onBeforeUnmount(() => {
           </span>
         </div>
         <span class="score-possession-count">
-          <template v-if="multiPossessionScoreboard.inOvertime">
+          <template v-if="multiPossessionScoreboard.gameClockMode">
+            {{ multiPossessionScoreboard.periodLabel }} · game clock
+          </template>
+          <template v-else-if="multiPossessionScoreboard.inOvertime">
             OT {{ multiPossessionScoreboard.overtimeRound }}/{{ multiPossessionScoreboard.overtimeRoundCap }}
             · {{ multiPossessionScoreboard.overtimePossessionsCompleted }}/2 possessions
           </template>
@@ -6404,6 +6424,7 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: center;
   font-size: max(12px, 2.5cqw);
+  min-height: 7.8em;
   gap: 0.65rem;
   max-width: calc(100% - 1rem);
   margin: 0.15rem 0 0.2rem;
@@ -6792,13 +6813,15 @@ onBeforeUnmount(() => {
 }
 
 .score-clock-readout,
-.inbound-clock-readout {
+.inbound-clock-readout,
+.shot-clock-secondary {
   display: inline-flex;
   flex-direction: column;
   align-items: center;
 }
 
-.inbound-clock-readout {
+.inbound-clock-readout,
+.shot-clock-secondary {
   min-width: 2.4em;
   padding-left: 0.5em;
   border-left: 1px solid rgba(148, 163, 184, 0.3);
@@ -6819,6 +6842,35 @@ onBeforeUnmount(() => {
   line-height: 1;
   text-shadow: 0 0 5px #ff4d4d, 0 0 10px #ff4d4d;
 }
+
+.game-clock-digits {
+  color: #f8fafc;
+  font-family: 'DSEG7 Classic', sans-serif;
+  font-size: 2.45em;
+  line-height: 0.95;
+  text-shadow: 0 0 5px rgba(248, 250, 252, 0.8), 0 0 12px rgba(56, 189, 248, 0.72);
+}
+
+.game-clock-status {
+  margin-top: 0.3em;
+  color: #fbbf24;
+  font-size: max(8px, 0.48em);
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.game-clock-status.running { color: #4ade80; }
+
+.shot-clock-secondary-digits {
+  color: #ff4d4d;
+  font-family: 'DSEG7 Classic', sans-serif;
+  font-size: 1.55em;
+  line-height: 1;
+  text-shadow: 0 0 5px #ff4d4d;
+}
+
+.game-clock-board .score-center { min-width: 10.5em; }
 
 .inbound-clock-digits {
   color: #fbbf24;

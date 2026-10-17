@@ -64,10 +64,38 @@ class TrainingRunConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_cross_fields(self) -> "TrainingRunConfig":
-        if self.possession_limit_start > self.possession_limit_end:
+        episode_end_mode = str(
+            self.overrides.get("episode_end_mode", "possessions") or "possessions"
+        ).strip().lower()
+        if episode_end_mode not in {"possessions", "game_clock"}:
+            raise ValueError("episode_end_mode must be 'possessions' or 'game_clock'.")
+        if (
+            episode_end_mode == "possessions"
+            and self.possession_limit_start > self.possession_limit_end
+        ):
             raise ValueError(
                 "possession_limit_start cannot exceed possession_limit_end."
             )
+        if episode_end_mode == "game_clock":
+            for name, default in (
+                ("game_clock_seconds", 300),
+                ("overtime_seconds", 120),
+            ):
+                raw_value = self.overrides.get(name, default)
+                if isinstance(raw_value, bool):
+                    raise ValueError(f"{name} must be a positive whole number.")
+                try:
+                    value = int(raw_value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"{name} must be a positive whole number."
+                    ) from exc
+                try:
+                    preserves_whole_value = float(raw_value) == value
+                except (TypeError, ValueError):
+                    preserves_whole_value = False
+                if value < 1 or not preserves_whole_value:
+                    raise ValueError(f"{name} must be a positive whole number.")
         if self.check_clearance > 0:
             if self.made_basket_restart_mode != "check":
                 raise ValueError(

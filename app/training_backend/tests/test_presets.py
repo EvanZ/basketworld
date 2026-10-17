@@ -190,6 +190,31 @@ def test_preview_persists_and_launches_game_clock_configuration(tmp_path):
         assert possession_preview.argv[index + 1] == expected
 
 
+def test_game_clock_validation_ignores_inactive_possession_order_and_keeps_values():
+    config = TrainingRunConfig(
+        possession_limit_start=9,
+        possession_limit_end=3,
+        overrides={
+            "episode_end_mode": "game_clock",
+            "game_clock_seconds": 300,
+            "overtime_seconds": 120,
+        },
+    )
+    restored = TrainingRunConfig.model_validate_json(config.model_dump_json())
+    assert restored.possession_limit_start == 9
+    assert restored.possession_limit_end == 3
+    assert restored.overrides["episode_end_mode"] == "game_clock"
+    assert restored.overrides["game_clock_seconds"] == 300
+    assert restored.overrides["overtime_seconds"] == 120
+
+    with pytest.raises(ValueError, match="game_clock_seconds"):
+        TrainingRunConfig(overrides={
+            "episode_end_mode": "game_clock",
+            "game_clock_seconds": 0,
+            "overtime_seconds": 120,
+        })
+
+
 def test_preview_compiles_shot_contest_overrides(tmp_path):
     preview = build_halfcourt_multi_possession_preview(
         config=TrainingRunConfig(

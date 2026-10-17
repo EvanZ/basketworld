@@ -678,19 +678,58 @@ def _jax_local_env_config_from_metadata(policy_obj) -> tuple[dict, dict, dict, d
     return required_params, optional_params, trainer_config, phi_params
 
 
-def _run_uses_multi_possession(client, run_id: str) -> bool:
-    """Read the lightweight setup-mode flag logged with a training run."""
+def _run_game_mode_config(client, run_id: str) -> dict:
+    """Read the lightweight game-format settings logged with a training run."""
     try:
         params = dict(client.get_run(run_id).data.params or {})
     except Exception as exc:
         print(f"[list_policies] Failed to read run params for {run_id}: {exc}")
-        return False
-    return _str_to_bool(
-        params.get(
+        params = {}
+    enable_multi_possession = _str_to_bool(params.get(
             "jax/env/enable_multi_possession",
             params.get("enable_multi_possession", False),
+        ))
+    episode_end_mode = str(params.get(
+        "jax/env/episode_end_mode",
+        params.get("episode_end_mode", "possessions"),
+    ) or "possessions").strip().lower()
+    if episode_end_mode not in {"possessions", "game_clock"}:
+        episode_end_mode = "possessions"
+    def _positive_int(name: str, default: int) -> int:
+        try:
+            return max(1, int(params.get(f"jax/env/{name}", params.get(name, default))))
+        except (TypeError, ValueError):
+            return default
+    return {
+        "enable_multi_possession": enable_multi_possession,
+        "episode_end_mode": episode_end_mode,
+        "game_clock_seconds": _positive_int("game_clock_seconds", 300),
+        "overtime_seconds": _positive_int("overtime_seconds", 120),
+    }
+
+
+def _run_uses_multi_possession(client, run_id: str) -> bool:
+    return bool(_run_game_mode_config(client, run_id)["enable_multi_possession"])
+
+
+def _validate_requested_episode_end_mode(
+    checkpoint_env_config: dict,
+    requested_mode: str | None,
+) -> None:
+    if requested_mode is None:
+        return
+    checkpoint_mode = str(
+        checkpoint_env_config.get("episode_end_mode", "possessions") or "possessions"
+    ).strip().lower()
+    if requested_mode != checkpoint_mode:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Checkpoint episode mode mismatch: the selected "
+                f"{requested_mode!r} mode cannot load a {checkpoint_mode!r} policy. "
+                "Choose a checkpoint trained for the selected mode."
+            ),
         )
-    )
 
 
 @router.post("/api/list_policies")
@@ -703,17 +742,17 @@ def list_policies(request: ListPoliciesRequest):
             print(f"[list_policies] MLflow setup warning: {setup_err}")
 
         client = mlflow.tracking.MlflowClient()
-        multi_possession = _run_uses_multi_possession(client, request.run_id)
+        mode_config = _run_game_mode_config(client, request.run_id)
         try:
             unified_paths = list_policies_from_run(client, request.run_id)
         except Exception as e:
             print(f"[list_policies] Failed to list artifacts for run {request.run_id}: {e}")
-            return {"unified": [], "enable_multi_possession": multi_possession}
+            return {"unified": [], **mode_config}
         if not unified_paths:
-            return {"unified": [], "enable_multi_possession": multi_possession}
+            return {"unified": [], **mode_config}
         return {
             "unified": [os.path.basename(p) for p in unified_paths],
-            "enable_multi_possession": multi_possession,
+            **mode_config,
         }
     except Exception as e:
         import traceback
@@ -831,6 +870,7 @@ async def init_game(request: InitGameRequest):
         optional_params.pop("role_flag_encoding_version", None)
 
         # Apply request overrides for optional parameters
+        _validate_requested_episode_end_mode(optional_params, request.episode_end_mode)
         if request.spawn_distance is not None:
             optional_params["spawn_distance"] = request.spawn_distance
         if request.defender_spawn_distance is not None:
@@ -844,6 +884,12 @@ async def init_game(request: InitGameRequest):
             # loaded policy; it only controls how many completed possessions
             # the dev game plays before ending.
             optional_params["multi_possession_limit"] = request.multi_possession_limit
+        if request.episode_end_mode is not None:
+            optional_params["episode_end_mode"] = request.episode_end_mode
+        if request.game_clock_seconds is not None:
+            optional_params["game_clock_seconds"] = request.game_clock_seconds
+        if request.overtime_seconds is not None:
+            optional_params["overtime_seconds"] = request.overtime_seconds
 
         mlflow_default_env_optional_params = copy.deepcopy(optional_params)
 

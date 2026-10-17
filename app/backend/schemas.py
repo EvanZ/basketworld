@@ -35,6 +35,9 @@ class InitGameRequest(BaseModel):
     allow_dunks: bool | None = None
     dunk_pct: float | None = None
     multi_possession_limit: int | None = Field(default=None, ge=1)
+    episode_end_mode: Literal["possessions", "game_clock"] | None = None
+    game_clock_seconds: int | None = Field(default=None, ge=1)
+    overtime_seconds: int | None = Field(default=None, ge=1)
 
 
 class SetMultiPossessionLimitRequest(BaseModel):

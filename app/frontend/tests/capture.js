@@ -6,6 +6,66 @@ import GameBoard from '../src/components/GameBoard.vue';
 import '../src/assets/main.css';
 
 library.add(faToggleOff, faToggleOn);
+
+function syntheticBaseState() {
+  return {
+    players_per_side: 3,
+    positions: [[5, 7], [3, 6], [7, 6], [5, 3], [3, 4], [7, 4]],
+    ball_holder: 0,
+    shot_clock: 18,
+    shot_clock_steps: 24,
+    min_shot_clock: 10,
+    done: false,
+    enable_multi_possession: true,
+    episode_end_mode: 'possessions',
+    multi_possession_limit: 5,
+    completed_possessions: 3,
+    user_completed_possessions: 2,
+    ai_completed_possessions: 1,
+    user_score: 12,
+    ai_score: 10,
+    team_a_score: 12,
+    team_b_score: 10,
+    team_a_ids: [0, 1, 2],
+    team_b_ids: [3, 4, 5],
+    user_player_ids: [0, 1, 2],
+    ai_player_ids: [3, 4, 5],
+    offense_ids: [0, 1, 2],
+    defense_ids: [3, 4, 5],
+    offense_label: 'user',
+    offense_team: 'team_a',
+    team_ownership: { team_a: 'user', team_b: 'ai' },
+    game_phase: 'live',
+    in_overtime: false,
+    overtime_round: 0,
+    overtime_possessions_completed: 0,
+    inbound_steps_remaining: 0,
+    inbound_deadline_steps: 5,
+    check_setup_steps_remaining: 0,
+    check_setup_steps: 5,
+    check_steps_remaining: 0,
+    check_deadline_steps: 5,
+    clearance_required: false,
+    basket_position: [5, 1],
+    court_width: 11,
+    court_height: 11,
+    three_point_distance: 4,
+    three_point_short_distance: 3,
+    three_point_hexes: [],
+    offensive_lane_hexes: [],
+    defensive_lane_hexes: [],
+    offensive_lane_steps: { 0: 0, 1: 0, 2: 0 },
+    defensive_lane_steps: { 3: 0, 4: 0, 5: 0 },
+    three_second_max_steps: 3,
+    action_mask: Array.from({ length: 6 }, () => Array(18).fill(1)),
+    last_action_results: {},
+    player_shooting_skills: {},
+    player_episode_skills: {},
+    player_rebound_skills: {},
+    ep_by_player: Array(6).fill(0),
+  };
+}
+
 const app = createApp({
   setup() {
     const board = ref(null);
@@ -64,6 +124,20 @@ const app = createApp({
       state.offensive_lane_steps = Object.fromEntries(state.offense_ids.map((id) => [id, 2]));
       state.defensive_lane_steps = Object.fromEntries(state.defense_ids.map((id) => [id, 3]));
       state.enable_multi_possession = value !== 'legacy';
+      if (value === 'legacy') delete state.episode_end_mode;
+      if (value.startsWith('clock-')) {
+        state.enable_multi_possession = true;
+        state.episode_end_mode = 'game_clock';
+        state.game_clock_seconds = 300;
+        state.overtime_seconds = 120;
+        state.game_clock_remaining = value === 'clock-overtime' ? 83 : 247;
+        state.overtime_round = value === 'clock-overtime' ? 2 : 0;
+        state.game_phase = value === 'clock-setup'
+          ? 'check_setup'
+          : (value === 'clock-inbound' ? 'awaiting_inbound' : 'live');
+        state.check_setup_steps_remaining = value === 'clock-setup' ? 3 : 0;
+        state.inbound_steps_remaining = value === 'clock-inbound' ? 4 : 0;
+      }
       const shooter = state.offense_ids[0];
       const receiver = state.offense_ids[1];
       const defender = state.defense_ids[0];
@@ -181,6 +255,7 @@ const app = createApp({
             }
             for (const fixture of [
               'clearance', 'made', 'pass', 'rebound', 'steal', 'turnover', 'inbound',
+              'clock-live', 'clock-setup', 'clock-inbound', 'clock-overtime',
               'terminal-shot-action', 'terminal-shot-title', 'end',
             ]) {
               await selectVariant(fixture);
@@ -278,7 +353,12 @@ const app = createApp({
         cases.value = states.map((state, index) => `${index}: ${state.game_phase}, score ${state.user_score}-${state.ai_score}, ${state.clearance_required ? 'clearance' : ''} ${Object.keys(state.last_action_results?.shots || {}).length ? 'shot' : ''} ${state.done ? 'END' : ''}`).join(' | ');
         await select(0);
         status.value = `Ready: ${states.length} recorded states`;
-      } catch (error) { status.value = `FAIL: ${error.message}`; }
+      } catch (error) {
+        states = [syntheticBaseState()];
+        cases.value = 'Synthetic display fixture (backend replay unavailable)';
+        await select(0);
+        status.value = `Ready: synthetic fixture; ${error.message}`;
+      }
     });
 
     return () => h('div', [
@@ -298,6 +378,10 @@ const app = createApp({
         h('option', { value: 'terminal-shot-title' }, 'Terminal End Game hold'),
         h('option', { value: 'end' }, 'End Game'),
         h('option', { value: 'legacy' }, 'Legacy shot clock'),
+        h('option', { value: 'clock-live' }, 'Game clock / regulation / running'),
+        h('option', { value: 'clock-setup' }, 'Game clock / check setup / stopped'),
+        h('option', { value: 'clock-inbound' }, 'Game clock / inbound / stopped'),
+        h('option', { value: 'clock-overtime' }, 'Game clock / overtime'),
       ])]),
       h('button', { onClick: captureSelected, disabled: busy.value }, 'Capture PNG and GIF'),
       h('button', { onClick: exportEpisode, disabled: busy.value }, 'Export full recorded episode'),

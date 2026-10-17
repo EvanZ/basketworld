@@ -1,6 +1,6 @@
 # Board/GIF visual regression check
 
-With the dev backend on port 8080 and a recorded episode available:
+With the dev backend on port 8080:
 
 ```sh
 cd app/frontend
@@ -10,20 +10,23 @@ npm run dev -- --config tests/capture-vite.config.js --port 5174
 Open `http://localhost:5174/tests/capture.html`.
 
 The page mounts the real `GameBoard` and uses its public `renderStateToPng`
-method plus the real GIF encoder. It reads the recorded replay, without
-initializing, resetting, or stepping the user's game. Nothing in this test
-entry point is included in the production app.
+method plus the real GIF encoder. It reads the recorded replay when one is
+available and otherwise starts from a synthetic display-only state. It never
+initializes, resets, or steps the user's game. Nothing in this test entry point
+is included in the production app.
 
 1. Capture a recorded state; compare the live board and decoded GIF. Check the
    blue/red panels, scores, active possession light, clock, banners, and court.
 2. Check a shot/rebound state and the final End Game state.
 3. Check the explicitly labeled inbound fixture (double-digit scores, inbound
-   countdown, and lit lane-warning lights) and the legacy-clock fixture. These
-   vary the recorded state for display testing; they are not simulated plays.
+   countdown, and lit lane-warning lights), the legacy-clock fixture, and all
+   four game-clock fixtures. The clock fixtures cover regulation running,
+   stopped check setup, stopped inbound, and overtime. These vary the recorded
+   state for display testing; they are not simulated plays.
 4. Click **Check stable banner layout**. This measures court position and frame
    bounds through every recorded state and explicit clearance, shot/rebound,
-   steal, turnover, inbound, and end-game fixtures, at both 640px and 440px board
-   widths, with live animations and export mode. It also verifies that the
+   steal, turnover, inbound, game-clock phase, and end-game fixtures, at both
+   640px and 440px board widths, with live animations and export mode. It also verifies that the
    scoreboard scales down with the board, stays inside it, and export banners
    are fully opaque. Repeat captures at compact width; nothing should crop.
 5. Export the full recorded episode. This captures every recorded state and

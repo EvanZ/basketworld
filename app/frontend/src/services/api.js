@@ -69,6 +69,9 @@ export async function initGame(options = {}) {
         unifiedPolicyName = null,
         opponentUnifiedPolicyName = null,
         multiPossessionLimit = null,
+        episodeEndMode = null,
+        gameClockSeconds = null,
+        overtimeSeconds = null,
     } = options || {};
     const response = await fetch(`${API_BASE_URL}/api/init_game`, {
         method: 'POST',
@@ -83,6 +86,9 @@ export async function initGame(options = {}) {
             unified_policy_name: unifiedPolicyName,
             opponent_unified_policy_name: opponentUnifiedPolicyName,
             multi_possession_limit: multiPossessionLimit,
+            episode_end_mode: episodeEndMode,
+            game_clock_seconds: gameClockSeconds,
+            overtime_seconds: overtimeSeconds,
         }),
     });
     if (!response.ok) {
