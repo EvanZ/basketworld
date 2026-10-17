@@ -228,7 +228,8 @@ class JaxEnvironmentConfig:
         _team(self.training_team)
 
     @classmethod
-    def from_mapping(cls, values: Mapping[str, Any]) -> "JaxEnvironmentConfig":
+    def _normalize_keys(cls, values: Mapping[str, Any]) -> dict[str, Any]:
+        """Normalize one precedence layer without filling unspecified defaults."""
         raw = dict(values or {})
         aliases = {
             "court_height": "court_rows",
@@ -242,6 +243,12 @@ class JaxEnvironmentConfig:
         for old, new in aliases.items():
             if new not in raw and old in raw:
                 raw[new] = raw[old]
+            raw.pop(old, None)
+        return raw
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any]) -> "JaxEnvironmentConfig":
+        raw = cls._normalize_keys(values)
         library = raw.get("start_template_library")
         if isinstance(library, (str, PathLike)) and str(library).strip():
             from basketworld.utils.start_templates import load_start_template_library
@@ -267,10 +274,12 @@ class JaxEnvironmentConfig:
         raw = dict(metadata or {})
         merged: dict[str, Any] = {}
         nested = False
-        for key in ("frozen_config", "trainer_config", "env_config"):
+        for key in (
+            "frozen_config", "trainer_config", "env_config", "effective_env_config"
+        ):
             value = raw.get(key)
             if isinstance(value, Mapping):
-                merged.update(value)
+                merged.update(cls._normalize_keys(value))
                 nested = True
         if not nested:
             merged.update(raw)
@@ -287,8 +296,8 @@ class JaxEnvironmentConfig:
         merged: dict[str, Any] = {}
         if checkpoint_metadata:
             merged.update(asdict(cls.from_checkpoint_metadata(checkpoint_metadata)))
-        merged.update(required_params or {})
-        merged.update(optional_params or {})
+        merged.update(cls._normalize_keys(required_params or {}))
+        merged.update(cls._normalize_keys(optional_params or {}))
         return cls.from_mapping(merged)
 
     @classmethod

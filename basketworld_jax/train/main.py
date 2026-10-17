@@ -32,7 +32,7 @@ from basketworld_jax.checkpoints import (
     save_checkpoint,
 )
 from basketworld_jax.eval.fixed_pool_study import run_fixed_pool_study
-from basketworld_jax.config import TRAIN_FROZEN_VALUES
+from basketworld_jax.config import TRAIN_FROZEN_VALUES, JaxEnvironmentConfig
 from basketworld_jax.provenance import (
     capture_source_provenance,
     resume_config_snapshot,
@@ -1203,7 +1203,8 @@ def build_train_parser():
         default="possessions",
         help=(
             "End games after each team reaches its possession quota or when "
-            "the regulation game clock expires with timed overtime periods."
+            "the regulation game clock expires with timed overtime periods. "
+            "Game-clock training is unavailable pending compiled integration (#64)."
         ),
     )
     parser.add_argument(
@@ -1670,7 +1671,9 @@ def build_train_config_schema(args) -> list[dict[str, Any]]:
                 "default": to_builtin(action.default),
                 "effective_value": to_builtin(effective_value),
                 "choices": (
-                    to_builtin(list(action.choices))
+                    ["possessions"]
+                    if action.dest == "episode_end_mode"
+                    else to_builtin(list(action.choices))
                     if action.choices is not None
                     else None
                 ),
@@ -1814,6 +1817,11 @@ def validate_train_args(args) -> None:
     ):
         raise SystemExit(
             "--episode-end-mode game_clock requires --enable-multi-possession."
+        )
+    if str(getattr(args, "episode_end_mode", "possessions")) == "game_clock":
+        raise SystemExit(
+            "Game-clock training and evaluation are unavailable until issue #64 "
+            "integrates the compiled clock transitions. Use --episode-end-mode possessions."
         )
     for key in ("defender_spawn_distance", "defender_guard_distance", "assist_window"):
         value = getattr(args, key, None)
@@ -2290,6 +2298,18 @@ def _jax_env_config_from_args(args) -> dict[str, Any]:
         if bool(getattr(args, "enable_multi_possession", False)) else 1
     )
     return config
+
+
+def _effective_env_config_from_args(args) -> dict[str, Any]:
+    """Record resolved environment inputs separately from requested CLI values.
+
+    Curriculum endpoints retain the native-evaluation convention used by
+    env_config; per-update schedules remain in resolved_training_config.
+    """
+    requested = _jax_env_config_from_args(args)
+    resolved = JaxEnvironmentConfig.from_args(args)
+    requested["reward_shaping_gamma"] = resolved.reward_shaping_gamma
+    return requested
 
 
 _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
@@ -2979,6 +2999,34 @@ def _validate_resume_checkpoint_payload(
             dict(payload.get("env_config", {})),
             expected_env_config,
         )
+        saved_effective = payload.get("effective_env_config")
+        # A null request was 1.0 in the legacy constructor but inherited PPO
+        # gamma after the JAX migration. Metadata without effective values
+        # cannot distinguish these implementations when PPO gamma != 1.0.
+        saved_gamma = (
+            saved_effective.get("reward_shaping_gamma")
+            if isinstance(saved_effective, dict)
+            else actual_env_config.get("reward_shaping_gamma")
+        )
+        if saved_gamma is None and actual_trainer_config.get("gamma", 1.0) != 1.0:
+            explicit_gamma = getattr(args, "reward_shaping_gamma", None)
+            if explicit_gamma is None:
+                raise SystemExit(
+                    "Resume checkpoint does not record effective reward_shaping_gamma. "
+                    "Set --reward-shaping-gamma explicitly after checking its source: "
+                    "the legacy default was 1.0; JAX-owned training inherits PPO gamma."
+                )
+            saved_gamma = explicit_gamma
+        saved_gamma = 1.0 if saved_gamma is None else float(saved_gamma)
+        expected_gamma = _effective_env_config_from_args(args)["reward_shaping_gamma"]
+        if saved_gamma != expected_gamma:
+            raise SystemExit(
+                "Resume checkpoint effective reward_shaping_gamma differs "
+                f"(checkpoint={saved_gamma}, requested={expected_gamma}). "
+                "Set --reward-shaping-gamma explicitly to preserve the recorded value."
+            )
+        actual_env_config["reward_shaping_gamma"] = saved_gamma
+        expected_env_config["reward_shaping_gamma"] = expected_gamma
         if actual_env_config != expected_env_config:
             raise SystemExit(
                 "Resume checkpoint env_config does not match the current JAX run."
@@ -3038,6 +3086,7 @@ def _save_training_checkpoint(
         observation_metadata=_checkpoint_observation_metadata(spec),
         source_provenance=checkpoint_source_provenance,
         resolved_training_config=_checkpoint_resolved_training_config(args),
+        effective_env_config=_effective_env_config_from_args(args),
     )
     if checkpoint_dir is None:
         raise ValueError(
@@ -3661,6 +3710,14 @@ def _log_mlflow_params(
                 else "metadata/resolved_training_config.json"
             ),
         )
+        mlflow.log_dict(
+            _effective_env_config_from_args(args),
+            (
+                f"metadata/continuations/target_{int(args.num_updates):07d}_effective_env.json"
+                if continuation_run_id
+                else "metadata/effective_env_config.json"
+            ),
+        )
     # MLflow parameters are immutable within a run.  A continuation deliberately
     # raises --num-updates and also carries continuation-only settings, so trying
     # to log the full launch parameter set again aborts before the first update.
@@ -3686,6 +3743,7 @@ def _log_mlflow_params(
             getattr(args, "ppo_completed_episodes_only", False)
         ),
         "jax/num_updates": int(args.num_updates),
+        "jax/policy_seed": int(args.policy_seed),
         "jax/policy_update_epochs": int(args.policy_update_epochs),
         "jax/ppo_minibatches": int(args.ppo_minibatches),
         "jax/log_every_updates": int(args.log_every_updates),
@@ -4059,7 +4117,7 @@ def _log_mlflow_params(
             getattr(args, "intent_policy_sensitivity_log_every_rollouts", 4)
         ),
     }
-    for key, value in _jax_env_config_from_args(args).items():
+    for key, value in _effective_env_config_from_args(args).items():
         params[f"jax/env/{key}"] = value
     mlflow.log_params(params)
 

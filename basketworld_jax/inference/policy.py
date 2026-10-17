@@ -121,6 +121,7 @@ class JAXInferenceModel:
             "trainer_config": dict(payload.get("trainer_config", {})),
             "frozen_config": dict(payload.get("frozen_config", {})),
             "env_config": dict(payload.get("env_config", {}) or {}),
+            "effective_env_config": dict(payload.get("effective_env_config", {}) or {}),
             "last_metrics": dict(payload.get("last_metrics", {}) or {}),
             "checkpoint_version": int(payload.get("checkpoint_version", 0)),
         }

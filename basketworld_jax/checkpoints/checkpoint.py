@@ -89,6 +89,7 @@ def build_checkpoint_payload(
     observation_metadata: dict[str, Any] | None = None,
     source_provenance: dict[str, Any] | None = None,
     resolved_training_config: dict[str, Any] | None = None,
+    effective_env_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = {
         "checkpoint_version": CHECKPOINT_VERSION,
@@ -143,6 +144,8 @@ def build_checkpoint_payload(
         payload["source_provenance"] = dict(source_provenance)
     if resolved_training_config is not None:
         payload["resolved_training_config"] = dict(resolved_training_config)
+    if effective_env_config is not None:
+        payload["effective_env_config"] = dict(effective_env_config)
     return payload
 
 
@@ -203,6 +206,8 @@ def _metadata_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         metadata["resolved_training_config"] = _to_jsonable(
             dict(payload["resolved_training_config"])
         )
+    if payload.get("effective_env_config") is not None:
+        metadata["effective_env_config"] = _to_jsonable(payload["effective_env_config"])
     return metadata
 
 
@@ -261,6 +266,8 @@ def _payload_from_metadata(metadata: dict[str, Any], state: dict[str, Any]) -> d
         payload["resolved_training_config"] = _from_jsonable(
             metadata["resolved_training_config"]
         )
+    if "effective_env_config" in metadata:
+        payload["effective_env_config"] = _from_jsonable(metadata["effective_env_config"])
     return payload
 
 
@@ -318,6 +325,7 @@ def load_checkpoint_metadata(path: str | Path) -> dict[str, Any]:
         "observation_metadata",
         "source_provenance",
         "resolved_training_config",
+        "effective_env_config",
     ):
         if key in metadata:
             payload[key] = _from_jsonable(metadata[key])

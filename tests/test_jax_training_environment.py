@@ -211,19 +211,10 @@ base_args = [
     "--pass-mode", "pointer_targeted",
     "--no-progress",
 ]
-for mode_args, expected_mode in (
-    ([], "possessions"),
-    ([
-        "--enable-multi-possession",
-        "--episode-end-mode", "game_clock",
-        "--game-clock-seconds", "300",
-        "--overtime-seconds", "120",
-    ], "game_clock"),
-):
-    result = run_train_scaffold(parse_args(base_args + mode_args))
-    assert result["status"] == "trajectory_and_update_scaffold"
-    assert result["trajectory_spec"]["full_action_shape"] == [1, 2]
-    assert result["env_config"]["episode_end_mode"] == expected_mode
+result = run_train_scaffold(parse_args(base_args))
+assert result["status"] == "trajectory_and_update_scaffold"
+assert result["trajectory_spec"]["full_action_shape"] == [1, 2]
+assert result["env_config"]["episode_end_mode"] == "possessions"
 '''
     completed = subprocess.run(
         [sys.executable, "-c", script],

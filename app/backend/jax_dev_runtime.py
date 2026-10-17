@@ -465,6 +465,7 @@ def _jax_static_env_params_from_policy(policy_obj: Any) -> dict[str, Any]:
         metadata.get("frozen_config"),
         metadata.get("env_config"),
         metadata.get("trainer_config"),
+        metadata.get("effective_env_config"),
     )
     out: dict[str, Any] = {}
     if any(isinstance(source, dict) for source in sources[:2]):

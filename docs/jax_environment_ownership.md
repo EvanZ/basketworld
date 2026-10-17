@@ -74,6 +74,38 @@ Stable-Baselines3.
 
 The JAX trainer owns `episode_end_mode`, `game_clock_seconds`,
 `overtime_seconds`, and `game_clock_max_total_steps`.
+The reset and scalar clock rules are implemented, but compiled training and
+native evaluation reject `game_clock` until issue #64 wires and verifies the
+compiled transitions. The trainer settings schema currently offers only
+`possessions`; a successful timed reset does not establish timed training support.
+
+## Effective configuration and reproducibility
+
+Checkpoint `env_config` and `resolved_training_config` preserve requested
+settings. New checkpoints additionally store `effective_env_config`, including
+the resolved shaping discount and rebound terminal reward mode. Evaluation and
+inference prefer these effective values, then apply explicit request overrides.
+Each input layer normalizes aliases before merging; for example, an explicit
+`shot_clock_steps=18` overrides a checkpoint's `shot_clock=24`. Within one layer,
+the canonical key wins when both spellings are present.
+
+New MLflow runs log `jax/policy_seed` and effective `jax/env/*` values, plus
+`metadata/effective_env_config.json`. Continuations preserve existing immutable
+parameters and add an effective-config artifact under
+`metadata/continuations/target_<update>_effective_env.json`. These environment
+records retain the final possession-limit convention used by evaluation;
+per-update curriculum schedules remain in the requested configuration.
+
+New training inherits PPO `gamma` when `reward_shaping_gamma` is unset. The
+pre-migration constructor instead used `1.0`. Older checkpoints with a null
+request and no effective record cannot distinguish these cases when PPO gamma
+is not `1.0`; resume requires an explicit `--reward-shaping-gamma` after checking
+the source used for that run. For a pre-migration reproduction, set it to `1.0`.
+Evaluation retains its existing historical `1.0` fallback for such metadata;
+override it explicitly when the checkpoint was trained with the newer default.
+Historical metadata is never rewritten. Similarly, old recorded rebound reward
+requests may differ from the pre-migration kernel's always-`actual_points`
+behavior; reproductions must explicitly select the effective historical mode.
 
 ## Compatibility policy
 

@@ -2881,6 +2881,17 @@ def run_native_jax_evaluation(
         opponent_params = unified_params
         opponent_spec = spec
     _emit_progress_event("checkpoint_loaded", checkpoint="unified")
+    config = _resolve_native_environment_config(
+        required_params=required_params,
+        optional_params=optional_params,
+        unified_payload=unified_payload,
+        opponent_payload=opponent_payload,
+    )
+    if config.episode_end_mode == "game_clock":
+        raise ValueError(
+            "Game-clock evaluation is unavailable until issue #64 integrates "
+            "the compiled clock transitions. Use episode_end_mode='possessions'."
+        )
     _emit_progress_event("jax_initializing")
     jax, jnp = ensure_jax_available("basketworld_jax/eval/native.py")
     unified_params = jax.device_put(unified_params)
@@ -2917,12 +2928,6 @@ def run_native_jax_evaluation(
     )
 
     _emit_progress_event("environment_building")
-    config = _resolve_native_environment_config(
-        required_params=required_params,
-        optional_params=optional_params,
-        unified_payload=unified_payload,
-        opponent_payload=opponent_payload,
-    )
     static = build_kernel_static_from_config(config, jnp)
     static_multi = bool(
         int(np.asarray(jax.device_get(static.enable_multi_possession)).reshape(-1)[0])
