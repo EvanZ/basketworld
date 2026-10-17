@@ -563,6 +563,84 @@ def test_historical_match_summary_includes_compact_gameplay_diagnostics():
     assert team_b_row["completed_possessions"] == 25
 
 
+def test_historical_clock_summary_excludes_safety_truncations_and_keeps_events():
+    completed_final = SimpleNamespace(
+        episode_ended=np.asarray([True]),
+        episode_truncated=np.asarray([False]),
+        team_a_score=np.asarray([6]),
+        team_b_score=np.asarray([4]),
+        starting_offense_team=np.asarray([0]),
+        completed_possessions=np.asarray([5]),
+        team_a_completed_possessions=np.asarray([3]),
+        team_b_completed_possessions=np.asarray([2]),
+        step_count=np.asarray([140]),
+        overtime_round=np.asarray([1]),
+        game_clock_remaining=np.asarray([0]),
+        elapsed_game_clock_seconds=np.asarray([120]),
+    )
+    safety_final = SimpleNamespace(
+        episode_ended=np.asarray([True]),
+        episode_truncated=np.asarray([True]),
+        team_a_score=np.asarray([20]),
+        team_b_score=np.asarray([0]),
+        starting_offense_team=np.asarray([0]),
+        completed_possessions=np.asarray([2]),
+        team_a_completed_possessions=np.asarray([1]),
+        team_b_completed_possessions=np.asarray([1]),
+        step_count=np.asarray([50]),
+        overtime_round=np.asarray([0]),
+        game_clock_remaining=np.asarray([70]),
+        elapsed_game_clock_seconds=np.asarray([50]),
+    )
+    completed_diagnostics = {
+        "elapsed_game_clock_seconds": np.asarray([120.0]),
+        "completed_possession_game_clock_seconds": np.asarray([100.0]),
+        "regulation_completions": np.asarray([1]),
+        "terminal_overtime_periods": np.asarray([1]),
+        "terminal_game_clock_seconds_remaining": np.asarray([0.0]),
+        "regulation_segment_1_candidate_points": np.asarray([2.0]),
+        "regulation_segment_1_opponent_points": np.asarray([0.0]),
+        "overtime_candidate_points": np.asarray([2.0]),
+        "overtime_opponent_points": np.asarray([2.0]),
+        "clock_event_active": np.asarray([[1], [1]], dtype=np.int8),
+        "clock_event_period_index": np.asarray([[0], [1]], dtype=np.int32),
+        "clock_event_seconds_remaining": np.asarray([[90], [10]], dtype=np.int32),
+        "clock_event_candidate_score_delta": np.asarray([[2.0], [0.0]]),
+        "clock_event_opponent_score_delta": np.asarray([[0.0], [0.0]]),
+        "clock_event_possession_ended": np.asarray([[1], [0]], dtype=np.int8),
+        "clock_event_possession_end_reason": np.asarray([[1], [0]], dtype=np.int32),
+        "clock_event_done": np.asarray([[0], [1]], dtype=np.int8),
+        "clock_event_safety_truncated": np.asarray([[0], [0]], dtype=np.int8),
+    }
+    summary = _summarize_historical_match(
+        candidate_update=10,
+        opponent_update=5,
+        team_a_candidate_final_state=completed_final,
+        team_b_candidate_final_state=safety_final,
+        team_a_candidate_diagnostics=completed_diagnostics,
+        team_b_candidate_diagnostics={
+            "elapsed_game_clock_seconds": np.asarray([50.0]),
+            "completed_possession_game_clock_seconds": np.asarray([30.0]),
+        },
+        seed=3_000_000,
+        horizon=200,
+    )
+
+    assert summary["completed_episode_count"] == 1
+    assert summary["safety_truncated_episode_count"] == 1
+    assert summary["candidate_wins"] == 1
+    completed = summary["clock_metrics_completed_games"]
+    assert completed["candidate_offensive_efficiency_points_per_possession"] == pytest.approx(2.0)
+    assert completed["opponent_offensive_efficiency_points_per_possession"] == pytest.approx(2.0)
+    assert completed["candidate_pace_completed_offensive_possessions_per_game_minute"] == pytest.approx(1.5)
+    assert completed["mean_completed_possession_game_clock_seconds"] == pytest.approx(20.0)
+    assert completed["overtime_game_count"] == 1
+    assert completed["regulation_segments"][0]["candidate_point_differential"] == pytest.approx(2.0)
+    assert len(summary["clock_events"]) == 2
+    assert summary["clock_events"][0]["period_index"] == 0
+    assert summary["clock_events"][1]["period_index"] == 1
+
+
 def test_historical_match_evaluation_passes_runner_diagnostics_to_summary(monkeypatch):
     class FakeRandom:
         @staticmethod

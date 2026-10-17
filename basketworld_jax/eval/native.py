@@ -18,6 +18,8 @@ from basketworld_jax.env.minimal import (
     MOVE_ACTION_START,
     CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION,
     MULTI_POSSESSION_SCHEMA_VERSION,
+    GAME_CLOCK_SCORE_DIFFERENCE_NORMALIZATION,
+    GAME_CLOCK_TIME_NORMALIZATION_SECONDS,
     GAME_PHASE_AWAITING_INBOUND,
     GAME_PHASE_AWAITING_CHECK,
     GAME_PHASE_CHECK_SETUP,
@@ -48,6 +50,7 @@ from basketworld_jax.env.minimal import (
     build_policy_observation_batch_with_role_flag,
     reset_batch_minimal,
     set_offense_intent_state_batch,
+    step_batch_game_clock,
     step_batch_minimal,
 )
 from basketworld_jax.inference import is_checkpoint_path, require_checkpoint_path
@@ -72,6 +75,7 @@ from basketworld_jax.eval.lineup_schedule import (
     validate_lineup_schedule,
 )
 from basketworld_jax.eval.skills import ACTIVE_PLAYER_SKILL_REGISTRY
+from basketworld_jax.eval.clock_metrics import summarize_clock_metrics
 
 
 def can_run_native_jax_evaluation(
@@ -223,7 +227,52 @@ _JAX_EVALUATION_CONTRACT_FIELDS = (
     "episode_end_mode",
     "game_clock_seconds",
     "overtime_seconds",
+    "game_clock_max_total_steps",
 )
+
+
+def _validate_native_checkpoint_episode_semantics(
+    payload: Mapping[str, Any], *, expected_mode: str, context: str
+) -> None:
+    """Reject same-width checkpoints whose episode feature meanings differ."""
+    effective = dict(payload.get("effective_env_config", {}) or {})
+    recorded = dict(payload.get("env_config", {}) or {})
+    actual_mode = str(
+        effective.get(
+            "episode_end_mode",
+            recorded.get("episode_end_mode", "possessions"),
+        )
+        or "possessions"
+    )
+    if actual_mode != expected_mode:
+        raise ValueError(
+            f"{context} uses episode_end_mode={actual_mode!r}, but evaluation "
+            f"uses {expected_mode!r}; cross-mode policy reuse requires an "
+            "explicit adaptation workflow."
+        )
+    observation = dict(payload.get("observation_metadata", {}) or {})
+    metadata_mode = observation.get("episode_end_mode")
+    if metadata_mode is not None and str(metadata_mode) != actual_mode:
+        raise ValueError(
+            f"{context} has inconsistent episode-mode metadata "
+            f"(environment={actual_mode!r}, observation={metadata_mode!r})."
+        )
+    if actual_mode != "game_clock":
+        return
+    budget = dict(observation.get("episode_budget_feature", {}) or {})
+    score = dict(observation.get("relative_score_feature", {}) or {})
+    if (
+        budget.get("semantic") != "game_clock_seconds_remaining"
+        or budget.get("normalization")
+        != float(GAME_CLOCK_TIME_NORMALIZATION_SECONDS)
+        or score.get("semantic") != "observing_team_score_difference"
+        or score.get("normalization")
+        != float(GAME_CLOCK_SCORE_DIFFERENCE_NORMALIZATION)
+    ):
+        raise ValueError(
+            f"{context} does not record the required game-clock observation "
+            "semantics (seconds/720 and score difference/30)."
+        )
 
 
 def _resolve_native_environment_config(
@@ -978,7 +1027,10 @@ def _build_native_eval_runner(
     team_b_spec: ActorCriticSpec,
     *,
     fixed_pool_rng_streams: bool = False,
+    game_clock_mode: bool = False,
 ):
+    step_batch = step_batch_game_clock if game_clock_mode else step_batch_minimal
+
     def _runner(
         static,
         initial_state,
@@ -1410,8 +1462,25 @@ def _build_native_eval_runner(
                 if fixed_pool_rng_streams
                 else jax.random.split(env_key, initial_state.positions.shape[0])
             )
-            env_out = step_batch_minimal(
+            env_out = step_batch(
                 static, policy_state, full_actions, env_keys, jax, jnp
+            )
+            regulation_seconds = jnp.maximum(
+                static.game_clock_seconds.astype(jnp.int32),
+                jnp.asarray(1, dtype=jnp.int32),
+            )
+            regulation_elapsed = jnp.maximum(
+                regulation_seconds
+                - policy_state.game_clock_remaining.astype(jnp.int32),
+                0,
+            )
+            regulation_segment = jnp.minimum(
+                (regulation_elapsed * jnp.asarray(4, dtype=jnp.int32))
+                // regulation_seconds,
+                jnp.asarray(3, dtype=jnp.int32),
+            )
+            completed_game = env_out.done.astype(jnp.bool_) & (
+                ~env_out.truncated.astype(jnp.bool_)
             )
             trace = {
                 "full_actions": full_actions.astype(jnp.int32),
@@ -1419,6 +1488,8 @@ def _build_native_eval_runner(
                 "next_ball_holder": env_out.state.ball_holder.astype(jnp.int32),
                 "positions": env_out.state.positions.astype(jnp.int32),
                 "done": env_out.done.astype(jnp.int8),
+                "truncated": env_out.truncated.astype(jnp.int8),
+                "truncation_reason": env_out.truncation_reason.astype(jnp.int32),
                 "terminal_episode_steps": env_out.terminal_episode_steps.astype(
                     jnp.int32
                 ),
@@ -1502,6 +1573,63 @@ def _build_native_eval_runner(
                 ),
                 "team_a_score_delta": env_out.team_a_score_delta.astype(jnp.float32),
                 "team_b_score_delta": env_out.team_b_score_delta.astype(jnp.float32),
+                "completed_possession_game_clock_seconds": (
+                    env_out.completed_possession_game_clock_seconds.astype(jnp.int32)
+                ),
+                "elapsed_game_clock_seconds": jnp.where(
+                    active_step,
+                    (
+                        env_out.state.elapsed_game_clock_seconds
+                        - policy_state.elapsed_game_clock_seconds
+                    ).astype(jnp.int32),
+                    0,
+                ),
+                "game_clock_seconds_remaining": jnp.where(
+                    active_step,
+                    policy_state.game_clock_remaining.astype(jnp.int32),
+                    0,
+                ),
+                "clock_period_index": jnp.where(
+                    active_step,
+                    policy_state.overtime_round.astype(jnp.int32),
+                    -1,
+                ),
+                "regulation_clock_segment": jnp.where(
+                    active_step & (policy_state.overtime_round == 0),
+                    regulation_segment,
+                    -1,
+                ),
+                "regulation_completed": jnp.where(
+                    active_step
+                    & (policy_state.overtime_round == 0)
+                    & ((env_out.state.overtime_round > 0) | completed_game),
+                    1,
+                    0,
+                ).astype(jnp.int8),
+                "overtime_period_started": jnp.where(
+                    active_step
+                    & (env_out.state.overtime_round > policy_state.overtime_round),
+                    1,
+                    0,
+                ).astype(jnp.int8),
+                "terminal_overtime_periods": jnp.where(
+                    active_step & completed_game,
+                    env_out.state.overtime_round.astype(jnp.int32),
+                    0,
+                ),
+                "terminal_game_clock_seconds_remaining": jnp.where(
+                    active_step & completed_game,
+                    env_out.state.game_clock_remaining.astype(jnp.int32),
+                    0,
+                ),
+                "terminal_completed_possessions": jnp.where(
+                    active_step & completed_game,
+                    (
+                        env_out.state.team_a_completed_possessions
+                        + env_out.state.team_b_completed_possessions
+                    ).astype(jnp.int32),
+                    0,
+                ),
                 "team_a_score": env_out.state.team_a_score.astype(jnp.float32),
                 "team_b_score": env_out.state.team_b_score.astype(jnp.float32),
                 "starting_offense_team": policy_state.starting_offense_team.astype(
@@ -1695,11 +1823,18 @@ def _build_native_eval_runner(
 def _episode_stats_from_trace(
     trace: dict[str, np.ndarray], *, take: int, horizon: int
 ) -> dict[str, np.ndarray]:
+    done_trace = np.asarray(trace["done"])[:, :take].astype(bool)
+    truncated_trace = np.asarray(
+        trace.get("truncated", np.zeros_like(done_trace))
+    )[:, :take].astype(bool)
     terminal_steps = np.max(
         np.asarray(trace["terminal_episode_steps"])[:, :take], axis=0
     )
-    completed = terminal_steps > 0
-    steps = np.where(completed, terminal_steps, int(horizon)).astype(np.int32)
+    ended = np.any(done_trace, axis=0)
+    safety_truncated = np.any(truncated_trace, axis=0)
+    completed = ended & (~safety_truncated)
+    horizon_truncated = ~ended
+    steps = np.where(ended, terminal_steps, int(horizon)).astype(np.int32)
     final_indices = np.maximum(0, steps - 1)
 
     def _final_trace_value(key: str, dtype):
@@ -1722,6 +1857,14 @@ def _episode_stats_from_trace(
     return {
         "steps": steps,
         "completed": completed.astype(np.int8),
+        "safety_truncated": safety_truncated.astype(np.int8),
+        "horizon_truncated": horizon_truncated.astype(np.int8),
+        "truncation_reason": np.max(
+            np.asarray(
+                trace.get("truncation_reason", np.zeros_like(done_trace))
+            )[:, :take],
+            axis=0,
+        ).astype(np.int32),
         "offense_rewards": np.asarray(trace["offense_rewards"])[:, :take].sum(axis=0),
         "defense_rewards": np.asarray(trace["defense_rewards"])[:, :take].sum(axis=0),
         "game_rewards": np.asarray(trace["game_rewards"])[:, :take].sum(axis=0),
@@ -1735,6 +1878,89 @@ def _episode_stats_from_trace(
         "team_b_score_delta": np.asarray(trace["team_b_score_delta"])[:, :take].sum(
             axis=0
         ),
+        "elapsed_game_clock_seconds": np.asarray(
+            trace.get("elapsed_game_clock_seconds", np.zeros_like(done_trace))
+        )[:, :take].sum(axis=0),
+        "completed_possession_game_clock_seconds": np.asarray(
+            trace.get(
+                "completed_possession_game_clock_seconds",
+                np.zeros_like(done_trace),
+            )
+        )[:, :take].sum(axis=0),
+        "regulation_completion_count": np.asarray(
+            trace.get("regulation_completed", np.zeros_like(done_trace))
+        )[:, :take].sum(axis=0),
+        "overtime_period_start_count": np.asarray(
+            trace.get("overtime_period_started", np.zeros_like(done_trace))
+        )[:, :take].sum(axis=0),
+        "terminal_overtime_periods": np.asarray(
+            trace.get("terminal_overtime_periods", np.zeros_like(done_trace))
+        )[:, :take].sum(axis=0),
+        "terminal_game_clock_seconds_remaining": np.asarray(
+            trace.get(
+                "terminal_game_clock_seconds_remaining",
+                np.zeros_like(done_trace),
+            )
+        )[:, :take].sum(axis=0),
+        "terminal_completed_possessions": np.asarray(
+            trace.get("terminal_completed_possessions", np.zeros_like(done_trace))
+        )[:, :take].sum(axis=0),
+        "regulation_segment_team_a_points": np.stack(
+            [
+                np.where(
+                    np.asarray(
+                        trace.get(
+                            "regulation_clock_segment",
+                            np.full_like(done_trace, -1, dtype=np.int32),
+                        )
+                    )[:, :take]
+                    == segment,
+                    np.asarray(trace["team_a_score_delta"])[:, :take],
+                    0.0,
+                ).sum(axis=0)
+                for segment in range(4)
+            ],
+            axis=1,
+        ),
+        "regulation_segment_team_b_points": np.stack(
+            [
+                np.where(
+                    np.asarray(
+                        trace.get(
+                            "regulation_clock_segment",
+                            np.full_like(done_trace, -1, dtype=np.int32),
+                        )
+                    )[:, :take]
+                    == segment,
+                    np.asarray(trace["team_b_score_delta"])[:, :take],
+                    0.0,
+                ).sum(axis=0)
+                for segment in range(4)
+            ],
+            axis=1,
+        ),
+        "overtime_team_a_points": np.where(
+            np.asarray(
+                trace.get(
+                    "clock_period_index",
+                    np.full_like(done_trace, -1, dtype=np.int32),
+                )
+            )[:, :take]
+            > 0,
+            np.asarray(trace["team_a_score_delta"])[:, :take],
+            0.0,
+        ).sum(axis=0),
+        "overtime_team_b_points": np.where(
+            np.asarray(
+                trace.get(
+                    "clock_period_index",
+                    np.full_like(done_trace, -1, dtype=np.int32),
+                )
+            )[:, :take]
+            > 0,
+            np.asarray(trace["team_b_score_delta"])[:, :take],
+            0.0,
+        ).sum(axis=0),
         "phi_shaping": np.asarray(trace["phi_r_shape"])[:, :take].sum(axis=0),
         "offense_points": np.asarray(trace["offense_score_delta"])[:, :take].sum(
             axis=0
@@ -1856,6 +2082,7 @@ def _apply_paired_starting_teams(static, state, *, episode_offset: int, jnp):
         offense_team=desired_starters,
         starting_offense_team=desired_starters,
         ball_holder=paired_holder.astype(jnp.int32),
+        overtime_pair_inversion=desired_starters.astype(jnp.int8),
     )
 
 
@@ -2887,11 +3114,16 @@ def run_native_jax_evaluation(
         unified_payload=unified_payload,
         opponent_payload=opponent_payload,
     )
-    if config.episode_end_mode == "game_clock":
-        raise ValueError(
-            "Game-clock native evaluation is unavailable until issue #65 adds "
-            "timed horizons, paired overtime starts, and clock diagnostics. "
-            "Use episode_end_mode='possessions'."
+    _validate_native_checkpoint_episode_semantics(
+        unified_payload,
+        expected_mode=config.episode_end_mode,
+        context="Unified JAX checkpoint",
+    )
+    if opponent_payload is not unified_payload:
+        _validate_native_checkpoint_episode_semantics(
+            opponent_payload,
+            expected_mode=config.episode_end_mode,
+            context="Opponent JAX checkpoint",
         )
     _emit_progress_event("jax_initializing")
     jax, jnp = ensure_jax_available("basketworld_jax/eval/native.py")
@@ -3054,6 +3286,7 @@ def run_native_jax_evaluation(
         team_a_spec,
         team_b_spec,
         fixed_pool_rng_streams=bool(fixed_pool_mode),
+        game_clock_mode=(config.episode_end_mode == "game_clock"),
     )
     _emit_progress_event(
         "runner_ready",
@@ -4574,6 +4807,48 @@ def run_native_jax_evaluation(
                 steps=step_count,
             )
 
+            clock_events: list[dict[str, Any]] = []
+            if config.episode_end_mode == "game_clock":
+                event_team_a = np.asarray(trace["team_a_score_delta"])[
+                    :active_steps, idx
+                ]
+                event_team_b = np.asarray(trace["team_b_score_delta"])[
+                    :active_steps, idx
+                ]
+                event_possession = np.asarray(trace["possession_ended"])[
+                    :active_steps, idx
+                ].astype(bool)
+                event_done = np.asarray(trace["done"])[
+                    :active_steps, idx
+                ].astype(bool)
+                for event_step in np.flatnonzero(
+                    (event_team_a != 0)
+                    | (event_team_b != 0)
+                    | event_possession
+                    | event_done
+                ):
+                    clock_events.append(
+                        {
+                            "environment_step": int(event_step + 1),
+                            "period_index": int(
+                                trace["clock_period_index"][event_step, idx]
+                            ),
+                            "seconds_remaining": int(
+                                trace["game_clock_seconds_remaining"][event_step, idx]
+                            ),
+                            "team_a_score_delta": float(event_team_a[event_step]),
+                            "team_b_score_delta": float(event_team_b[event_step]),
+                            "possession_ended": bool(event_possession[event_step]),
+                            "possession_end_reason": int(
+                                trace["possession_end_reason"][event_step, idx]
+                            ),
+                            "done": bool(event_done[event_step]),
+                            "safety_truncated": bool(
+                                trace["truncated"][event_step, idx]
+                            ),
+                        }
+                    )
+
             episode_result = {
                 "episode": int(episode_num),
                 "intent_index": episode_intent_index,
@@ -4583,7 +4858,22 @@ def run_native_jax_evaluation(
                 "defense_intent_active": episode_defense_intent_active,
                 "steps": step_count,
                 "completed": game_completed,
-                "truncated": not game_completed,
+                "truncated": bool(
+                    stats["safety_truncated"][idx]
+                    or stats["horizon_truncated"][idx]
+                ),
+                "safety_truncated": bool(stats["safety_truncated"][idx]),
+                "horizon_truncated": bool(stats["horizon_truncated"][idx]),
+                "termination_kind": (
+                    "completed"
+                    if game_completed
+                    else (
+                        "safety_truncated"
+                        if bool(stats["safety_truncated"][idx])
+                        else "horizon_truncated"
+                    )
+                ),
+                "truncation_reason": int(stats["truncation_reason"][idx]),
                 "game": {
                     "completed": game_completed,
                     "result": game_result,
@@ -4626,6 +4916,39 @@ def run_native_jax_evaluation(
                         if int(stats["starting_offense_team"][idx]) == TEAM_A
                         else "team_b"
                     ),
+                    "elapsed_game_clock_seconds": int(
+                        stats["elapsed_game_clock_seconds"][idx]
+                    ),
+                    "completed_possession_game_clock_seconds": int(
+                        stats["completed_possession_game_clock_seconds"][idx]
+                    ),
+                    "regulation_completion_count": int(
+                        stats["regulation_completion_count"][idx]
+                    ),
+                    "terminal_overtime_periods": int(
+                        stats["terminal_overtime_periods"][idx]
+                    ),
+                    "terminal_game_clock_seconds_remaining": int(
+                        stats["terminal_game_clock_seconds_remaining"][idx]
+                    ),
+                    "terminal_completed_possessions": int(
+                        stats["terminal_completed_possessions"][idx]
+                    ),
+                    "regulation_segment_team_a_points": [
+                        float(value)
+                        for value in stats["regulation_segment_team_a_points"][idx]
+                    ],
+                    "regulation_segment_team_b_points": [
+                        float(value)
+                        for value in stats["regulation_segment_team_b_points"][idx]
+                    ],
+                    "overtime_team_a_points": float(
+                        stats["overtime_team_a_points"][idx]
+                    ),
+                    "overtime_team_b_points": float(
+                        stats["overtime_team_b_points"][idx]
+                    ),
+                    "clock_events": clock_events,
                 },
                 "episode_rewards": {
                     "offense": offense_reward,
@@ -5144,6 +5467,101 @@ def run_native_jax_evaluation(
         if user_team == Team.OFFENSE
         else completed_team_a_possessions
     )
+
+    def _clock_summary(episode_subset: list[dict[str, Any]]) -> dict[str, Any]:
+        games = [episode["game"] for episode in episode_subset]
+        game_count = len(games)
+        elapsed_seconds = float(
+            sum(game["elapsed_game_clock_seconds"] for game in games)
+        )
+        team_a_points = float(sum(game["team_a_score"] for game in games))
+        team_b_points = float(sum(game["team_b_score"] for game in games))
+        team_a_possessions = int(
+            sum(game["team_a_completed_possessions"] for game in games)
+        )
+        team_b_possessions = int(
+            sum(game["team_b_completed_possessions"] for game in games)
+        )
+        possession_clock_seconds = float(
+            sum(game["completed_possession_game_clock_seconds"] for game in games)
+        )
+        regulation_segments_a = [
+            float(sum(game["regulation_segment_team_a_points"][i] for game in games))
+            for i in range(4)
+        ]
+        regulation_segments_b = [
+            float(sum(game["regulation_segment_team_b_points"][i] for game in games))
+            for i in range(4)
+        ]
+        overtime_games = [
+            game for game in games if game["terminal_overtime_periods"] > 0
+        ]
+
+        shared = summarize_clock_metrics(
+            game_count=game_count,
+            side_a_points=team_a_points,
+            side_b_points=team_b_points,
+            side_a_completed_offensive_possessions=team_a_possessions,
+            side_b_completed_offensive_possessions=team_b_possessions,
+            elapsed_game_clock_seconds=elapsed_seconds,
+            completed_possession_game_clock_seconds=possession_clock_seconds,
+            regulation_completion_count=int(
+                sum(game["regulation_completion_count"] for game in games)
+            ),
+            overtime_game_count=len(overtime_games),
+            overtime_periods_total=int(
+                sum(game["terminal_overtime_periods"] for game in overtime_games)
+            ),
+            terminal_game_clock_seconds_total=float(
+                sum(game["terminal_game_clock_seconds_remaining"] for game in games)
+            ),
+            regulation_segment_side_a_points=regulation_segments_a,
+            regulation_segment_side_b_points=regulation_segments_b,
+            overtime_side_a_points=float(
+                sum(game["overtime_team_a_points"] for game in games)
+            ),
+            overtime_side_b_points=float(
+                sum(game["overtime_team_b_points"] for game in games)
+            ),
+        )
+        stable = {"team_a": shared.pop("side_a"), "team_b": shared.pop("side_b")}
+        shared["regulation_segments"] = [
+            {
+                "segment": row["segment"],
+                "team_a_points": row["side_a_points"],
+                "team_b_points": row["side_b_points"],
+                "team_a_point_differential": row["side_a_point_differential"],
+            }
+            for row in shared["regulation_segments"]
+        ]
+        shared["overtime"] = {
+            "team_a_points": shared["overtime"]["side_a_points"],
+            "team_b_points": shared["overtime"]["side_b_points"],
+            "team_a_point_differential": shared["overtime"][
+                "side_a_point_differential"
+            ],
+        }
+        user_side = "team_a" if user_team == Team.OFFENSE else "team_b"
+        opponent_side = "team_b" if user_side == "team_a" else "team_a"
+        return {
+            **shared,
+            "stable_teams": stable,
+            "user": stable[user_side],
+            "opponent": stable[opponent_side],
+        }
+
+    completed_clock_metrics = _clock_summary(
+        [episode for episode in results if episode["completed"]]
+    )
+    truncated_clock_metrics = _clock_summary(
+        [episode for episode in results if episode["truncated"]]
+    )
+    safety_truncated_game_count = int(
+        sum(bool(episode["safety_truncated"]) for episode in results)
+    )
+    horizon_truncated_game_count = int(
+        sum(bool(episode["horizon_truncated"]) for episode in results)
+    )
     spatial_live_step_total = float(sum(all_spatial_live_steps))
     spatial_ball_handler_sample_total = float(sum(all_spatial_ball_handler_samples))
 
@@ -5200,6 +5618,10 @@ def run_native_jax_evaluation(
         },
         "completed_games": int(len(completed_game_indices)),
         "incomplete_games": int(incomplete_game_count),
+        "safety_truncated_games": safety_truncated_game_count,
+        "horizon_truncated_games": horizon_truncated_game_count,
+        "clock_metrics_completed_games": completed_clock_metrics,
+        "clock_metrics_truncated_games": truncated_clock_metrics,
         "win_count": win_count,
         "loss_count": loss_count,
         "tie_count": tie_count,

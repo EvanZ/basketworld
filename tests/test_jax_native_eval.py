@@ -30,6 +30,7 @@ from basketworld_jax.eval.native import (
     _record_assist_event,
     _record_pass_link_diagnostics,
     _task_reward_scale_for_eval,
+    _validate_native_checkpoint_episode_semantics,
 )
 from basketworld_jax.eval.skills import ACTIVE_PLAYER_SKILL_REGISTRY
 from basketworld_jax.env.minimal import (
@@ -184,6 +185,7 @@ def test_native_eval_pairs_reset_rows_with_swapped_starting_teams_without_moving
         TEAM_B,
     ]
     assert np.asarray(paired.offense_team).tolist() == [TEAM_A, TEAM_B, TEAM_A, TEAM_B]
+    assert np.asarray(paired.overtime_pair_inversion).tolist() == [0, 1, 0, 1]
     team_a_ids = set(np.asarray(static.offense_ids, dtype=np.int32).tolist())
     team_b_ids = set(np.asarray(static.defense_ids, dtype=np.int32).tolist())
     for idx, holder in enumerate(
@@ -193,6 +195,37 @@ def test_native_eval_pairs_reset_rows_with_swapped_starting_teams_without_moving
 
     np.testing.assert_array_equal(
         np.asarray(paired.positions), np.asarray(state.positions)
+    )
+
+
+def test_native_eval_rejects_clock_checkpoint_without_explicit_observation_semantics():
+    payload = {
+        "effective_env_config": {"episode_end_mode": "game_clock"},
+        "observation_metadata": {"episode_end_mode": "game_clock"},
+    }
+    with pytest.raises(ValueError, match="seconds/720 and score difference/30"):
+        _validate_native_checkpoint_episode_semantics(
+            payload,
+            expected_mode="game_clock",
+            context="test checkpoint",
+        )
+
+    payload["observation_metadata"].update(
+        {
+            "episode_budget_feature": {
+                "semantic": "game_clock_seconds_remaining",
+                "normalization": 720.0,
+            },
+            "relative_score_feature": {
+                "semantic": "observing_team_score_difference",
+                "normalization": 30.0,
+            },
+        }
+    )
+    _validate_native_checkpoint_episode_semantics(
+        payload,
+        expected_mode="game_clock",
+        context="test checkpoint",
     )
 
 
@@ -572,7 +605,101 @@ def test_native_multi_possession_evaluation_pairs_starters_and_separates_cutoffs
             assert episode["game"]["result"] is None
 
 
+def test_game_clock_native_and_historical_evaluation_emit_clock_diagnostics(tmp_path):
+    checkpoint_dir = tmp_path / "clock_eval_ckpts"
+    args = parse_args(
+        [
+            "--run-train-loop",
+            "--enable-multi-possession",
+            "--episode-end-mode",
+            "game_clock",
+            "--game-clock-seconds",
+            "4",
+            "--overtime-seconds",
+            "2",
+            "--game-clock-max-total-steps",
+            "40",
+            "--players",
+            "2",
+            "--kernel-batch-size",
+            "2",
+            "--rollout-horizon",
+            "2",
+            "--num-updates",
+            "1",
+            "--policy-update-epochs",
+            "1",
+            "--ppo-minibatches",
+            "1",
+            "--eval-every-updates",
+            "0",
+            "--eval-deploy-every-updates",
+            "0",
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "--checkpoint-every-updates",
+            "1",
+            "--historical-eval-updates",
+            "1",
+            "--historical-eval-episodes",
+            "2",
+            "--historical-eval-horizon",
+            "40",
+            "--no-progress",
+        ]
+    )
+    validate_train_args(args)
+    training_result = run_training_loop(args)
+    historical = training_result["historical_eval_history"][0]
+    assert historical["environment_contract"]["episode_end_mode"] == "game_clock"
+    assert historical["completed_episode_count"] + historical["truncated_episode_count"] == 2
+    assert "clock_metrics_completed_games" in historical
+    assert "clock_metrics_truncated_games" in historical
+    assert all(
+        event["period_index"] >= 0 and event["seconds_remaining"] >= 0
+        for event in historical["clock_events"]
+    )
 
+    optional_params = _native_eval_env_params()
+    optional_params.update(
+        {
+            "players": 2,
+            "enable_multi_possession": True,
+            "episode_end_mode": "game_clock",
+            "game_clock_seconds": 4,
+            "overtime_seconds": 2,
+            "game_clock_max_total_steps": 40,
+        }
+    )
+    native = run_native_jax_evaluation(
+        num_episodes=2,
+        player_deterministic=True,
+        opponent_deterministic=True,
+        required_params={},
+        optional_params=optional_params,
+        unified_policy_path=training_result["latest_checkpoint_path"],
+        opponent_policy_path=None,
+        user_team_name="OFFENSE",
+        role_flag_offense=1.0,
+        role_flag_defense=-1.0,
+        eval_seed=65,
+        evaluation_batch_size=2,
+    )
+    summary = native["eval_diagnostics"]["jax_native_summary"]
+    assert summary["environment_contract"]["episode_end_mode"] == "game_clock"
+    assert summary["horizon"] == 40
+    assert summary["completed_games"] + summary["incomplete_games"] == 2
+    assert (
+        summary["safety_truncated_games"] + summary["horizon_truncated_games"]
+        == summary["incomplete_games"]
+    )
+    assert "clock_metrics_completed_games" in summary
+    assert "clock_metrics_truncated_games" in summary
+    assert all(
+        event["period_index"] >= 0 and event["seconds_remaining"] >= 0
+        for episode in native["results"]
+        for event in episode["game"]["clock_events"]
+    )
 def test_native_fixed_pool_evaluation_uses_scheduled_profiles_and_rng_streams(tmp_path):
     checkpoint_dir = tmp_path / "native_fixed_pool_eval_ckpts"
     args = parse_args(

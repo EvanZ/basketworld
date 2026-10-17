@@ -32,6 +32,7 @@ from basketworld_jax.checkpoints import (
     save_checkpoint,
 )
 from basketworld_jax.eval.fixed_pool_study import run_fixed_pool_study
+from basketworld_jax.eval.clock_metrics import summarize_clock_metrics
 from basketworld_jax.config import TRAIN_FROZEN_VALUES, JaxEnvironmentConfig
 from basketworld_jax.provenance import (
     capture_source_provenance,
@@ -4573,6 +4574,14 @@ def _historical_episode_rows(
 ) -> list[dict[str, Any]]:
     """Convert compact device-side counters into JSON-ready episode records."""
     episode_ended = np.asarray(final_state.episode_ended, dtype=bool)
+    episode_truncated = np.asarray(
+        getattr(final_state, "episode_truncated", np.zeros_like(episode_ended)),
+        dtype=bool,
+    )
+    truncation_reason = np.asarray(
+        getattr(final_state, "truncation_reason", np.zeros_like(episode_ended)),
+        dtype=np.int32,
+    )
     team_a_score = np.asarray(final_state.team_a_score, dtype=np.int64)
     team_b_score = np.asarray(final_state.team_b_score, dtype=np.int64)
     batch_size = int(episode_ended.size)
@@ -4611,6 +4620,18 @@ def _historical_episode_rows(
         getattr(final_state, "step_count", np.zeros(batch_size)),
         dtype=np.int32,
     )
+    overtime_round = np.asarray(
+        getattr(final_state, "overtime_round", np.zeros(batch_size)),
+        dtype=np.int32,
+    )
+    game_clock_remaining = np.asarray(
+        getattr(final_state, "game_clock_remaining", np.zeros(batch_size)),
+        dtype=np.int32,
+    )
+    elapsed_game_clock_seconds = np.asarray(
+        getattr(final_state, "elapsed_game_clock_seconds", np.zeros(batch_size)),
+        dtype=np.int32,
+    )
     diagnostic_arrays = {
         key: np.asarray(value, dtype=np.float64)
         for key, value in (diagnostics or {}).items()
@@ -4633,7 +4654,10 @@ def _historical_episode_rows(
             int(starting_offense_team[episode_index])
             == (0 if candidate_is_team_a else 1)
         )
-        if not bool(episode_ended[episode_index]):
+        safety_truncated = bool(episode_truncated[episode_index])
+        horizon_truncated = not bool(episode_ended[episode_index])
+        completed = bool(episode_ended[episode_index]) and not safety_truncated
+        if not completed:
             outcome = "truncated"
         elif candidate_score > opponent_score:
             outcome = "candidate_win"
@@ -4648,12 +4672,15 @@ def _historical_episode_rows(
             "starting_offense_team": (
                 "team_a" if int(starting_offense_team[episode_index]) == 0 else "team_b"
             ),
-            "completed": bool(episode_ended[episode_index]),
+            "completed": completed,
+            "safety_truncated": safety_truncated,
+            "horizon_truncated": horizon_truncated,
             "termination_kind": (
                 "completed"
-                if bool(episode_ended[episode_index])
-                else "horizon_truncated"
+                if completed
+                else ("safety_truncated" if safety_truncated else "horizon_truncated")
             ),
+            "truncation_reason": int(truncation_reason[episode_index]),
             "candidate_score": candidate_score,
             "opponent_score": opponent_score,
             "candidate_point_differential": candidate_score - opponent_score,
@@ -4670,6 +4697,15 @@ def _historical_episode_rows(
                 else team_a_completed_possessions[episode_index]
             ),
             "environment_steps": int(step_count[episode_index]),
+            "elapsed_game_clock_seconds": int(
+                elapsed_game_clock_seconds[episode_index]
+            ),
+            "terminal_overtime_periods": (
+                int(overtime_round[episode_index]) if completed else 0
+            ),
+            "terminal_game_clock_seconds_remaining": (
+                int(game_clock_remaining[episode_index]) if completed else 0
+            ),
         }
         for key in HISTORICAL_MATCH_DIAGNOSTIC_KEYS:
             values = diagnostic_arrays.get(key)
@@ -4781,14 +4817,26 @@ def _summarize_historical_match(
             else int(total)
         )
 
+    def _completed_total(key: str) -> float | int:
+        total = sum(row[key] for row in completed_rows)
+        return (
+            float(total)
+            if key in HISTORICAL_MATCH_FLOAT_DIAGNOSTIC_KEYS
+            else int(total)
+        )
+
     def _rate(numerator: float, denominator: float) -> float | None:
         return float(numerator / denominator) if denominator else None
 
     candidate_score_total = int(sum(row["candidate_score"] for row in completed_rows))
     opponent_score_total = int(sum(row["opponent_score"] for row in completed_rows))
-    completed_possessions = _total("completed_possessions")
-    candidate_completed_possessions = _total("candidate_completed_possessions")
-    opponent_completed_possessions = _total("opponent_completed_possessions")
+    completed_possessions = _completed_total("completed_possessions")
+    candidate_completed_possessions = int(
+        sum(row["candidate_completed_possessions"] for row in completed_rows)
+    )
+    opponent_completed_possessions = int(
+        sum(row["opponent_completed_possessions"] for row in completed_rows)
+    )
     scalar_diagnostics: dict[str, Any] = {
         "mean_candidate_score": outcome_summary["mean_candidate_score"],
         "mean_opponent_score": outcome_summary["mean_opponent_score"],
@@ -4948,6 +4996,177 @@ def _summarize_historical_match(
             "mean_candidate_score"
         ]
 
+    def _clock_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        row_count = len(rows)
+        elapsed_seconds = float(
+            sum(row["elapsed_game_clock_seconds"] for row in rows)
+        )
+        candidate_points = float(sum(row["candidate_score"] for row in rows))
+        opponent_points = float(sum(row["opponent_score"] for row in rows))
+        candidate_possessions = int(
+            sum(row["candidate_completed_possessions"] for row in rows)
+        )
+        opponent_possessions = int(
+            sum(row["opponent_completed_possessions"] for row in rows)
+        )
+        possession_seconds = float(
+            sum(row["completed_possession_game_clock_seconds"] for row in rows)
+        )
+        overtime_rows = [row for row in rows if row["terminal_overtime_periods"] > 0]
+
+        segment_rows = []
+        for segment in range(1, 5):
+            candidate_segment_points = float(
+                sum(row[f"regulation_segment_{segment}_candidate_points"] for row in rows)
+            )
+            opponent_segment_points = float(
+                sum(row[f"regulation_segment_{segment}_opponent_points"] for row in rows)
+            )
+            segment_rows.append(
+                {
+                    "segment": segment,
+                    "candidate_points": candidate_segment_points,
+                    "opponent_points": opponent_segment_points,
+                    "candidate_point_differential": (
+                        candidate_segment_points - opponent_segment_points
+                    ),
+                }
+            )
+        overtime_candidate_points = float(
+            sum(row["overtime_candidate_points"] for row in rows)
+        )
+        overtime_opponent_points = float(
+            sum(row["overtime_opponent_points"] for row in rows)
+        )
+        shared = summarize_clock_metrics(
+            game_count=row_count,
+            side_a_points=candidate_points,
+            side_b_points=opponent_points,
+            side_a_completed_offensive_possessions=candidate_possessions,
+            side_b_completed_offensive_possessions=opponent_possessions,
+            elapsed_game_clock_seconds=elapsed_seconds,
+            completed_possession_game_clock_seconds=possession_seconds,
+            regulation_completion_count=int(
+                sum(row["regulation_completions"] for row in rows)
+            ),
+            overtime_game_count=len(overtime_rows),
+            overtime_periods_total=int(
+                sum(row["terminal_overtime_periods"] for row in overtime_rows)
+            ),
+            terminal_game_clock_seconds_total=float(
+                sum(row["terminal_game_clock_seconds_remaining"] for row in rows)
+            ),
+            regulation_segment_side_a_points=[
+                row["candidate_points"] for row in segment_rows
+            ],
+            regulation_segment_side_b_points=[
+                row["opponent_points"] for row in segment_rows
+            ],
+            overtime_side_a_points=overtime_candidate_points,
+            overtime_side_b_points=overtime_opponent_points,
+        )
+        candidate = shared.pop("side_a")
+        opponent = shared.pop("side_b")
+        shared["candidate_offensive_efficiency_points_per_possession"] = candidate[
+            "offensive_efficiency_points_per_possession"
+        ]
+        shared["opponent_offensive_efficiency_points_per_possession"] = opponent[
+            "offensive_efficiency_points_per_possession"
+        ]
+        shared[
+            "candidate_pace_completed_offensive_possessions_per_game_minute"
+        ] = candidate["pace_completed_offensive_possessions_per_game_minute"]
+        shared[
+            "opponent_pace_completed_offensive_possessions_per_game_minute"
+        ] = opponent["pace_completed_offensive_possessions_per_game_minute"]
+        shared["regulation_segments"] = segment_rows
+        shared["overtime"] = {
+            "candidate_points": overtime_candidate_points,
+            "opponent_points": overtime_opponent_points,
+            "candidate_point_differential": (
+                overtime_candidate_points - overtime_opponent_points
+            ),
+        }
+        return shared
+
+    def _raw_clock_events(
+        diagnostics: dict[str, Any] | None,
+        *,
+        candidate_fixed_team: str,
+        episode_offset: int,
+    ) -> list[dict[str, Any]]:
+        if not diagnostics or "clock_event_active" not in diagnostics:
+            return []
+        arrays = {
+            key: np.asarray(diagnostics[key])
+            for key in (
+                "clock_event_active",
+                "clock_event_period_index",
+                "clock_event_seconds_remaining",
+                "clock_event_candidate_score_delta",
+                "clock_event_opponent_score_delta",
+                "clock_event_possession_ended",
+                "clock_event_possession_end_reason",
+                "clock_event_done",
+                "clock_event_safety_truncated",
+            )
+        }
+        events: list[dict[str, Any]] = []
+        horizon_steps, batch_size = arrays["clock_event_active"].shape
+        for step_index in range(horizon_steps):
+            for episode_index in range(batch_size):
+                if not bool(arrays["clock_event_active"][step_index, episode_index]):
+                    continue
+                candidate_delta = float(
+                    arrays["clock_event_candidate_score_delta"][step_index, episode_index]
+                )
+                opponent_delta = float(
+                    arrays["clock_event_opponent_score_delta"][step_index, episode_index]
+                )
+                possession_ended = bool(
+                    arrays["clock_event_possession_ended"][step_index, episode_index]
+                )
+                done = bool(arrays["clock_event_done"][step_index, episode_index])
+                if not (candidate_delta or opponent_delta or possession_ended or done):
+                    continue
+                events.append(
+                    {
+                        "episode_index": int(episode_offset + episode_index),
+                        "candidate_fixed_team": candidate_fixed_team,
+                        "environment_step": int(step_index + 1),
+                        "period_index": int(
+                            arrays["clock_event_period_index"][step_index, episode_index]
+                        ),
+                        "seconds_remaining": int(
+                            arrays["clock_event_seconds_remaining"][step_index, episode_index]
+                        ),
+                        "candidate_score_delta": candidate_delta,
+                        "opponent_score_delta": opponent_delta,
+                        "possession_ended": possession_ended,
+                        "possession_end_reason": int(
+                            arrays["clock_event_possession_end_reason"][step_index, episode_index]
+                        ),
+                        "done": done,
+                        "safety_truncated": bool(
+                            arrays["clock_event_safety_truncated"][step_index, episode_index]
+                        ),
+                    }
+                )
+        return events
+
+    raw_clock_events = [
+        *_raw_clock_events(
+            team_a_candidate_diagnostics,
+            candidate_fixed_team="team_a",
+            episode_offset=0,
+        ),
+        *_raw_clock_events(
+            team_b_candidate_diagnostics,
+            candidate_fixed_team="team_b",
+            episode_offset=len(team_a_rows),
+        ),
+    ]
+
     return {
         "candidate_update": int(candidate_update),
         "opponent_update": int(opponent_update),
@@ -4957,6 +5176,17 @@ def _summarize_historical_match(
         "episodes_candidate_team_b": len(team_b_rows),
         "completed_episode_count": completed_count,
         "truncated_episode_count": int(episode_count - completed_count),
+        "safety_truncated_episode_count": int(
+            sum(row["safety_truncated"] for row in episode_rows)
+        ),
+        "horizon_truncated_episode_count": int(
+            sum(row["horizon_truncated"] for row in episode_rows)
+        ),
+        "clock_metrics_completed_games": _clock_metrics(completed_rows),
+        "clock_metrics_truncated_games": _clock_metrics(
+            [row for row in episode_rows if not row["completed"]]
+        ),
+        "clock_events": raw_clock_events,
         "completion_rate": _rate(completed_count, episode_count) or 0.0,
         **outcome_summary,
         **scalar_diagnostics,
@@ -5030,7 +5260,7 @@ def _run_historical_match_evaluation(
             team_b_diagnostics,
         )
     )
-    return _summarize_historical_match(
+    summary = _summarize_historical_match(
         candidate_update=candidate_update,
         opponent_update=opponent_update,
         team_a_candidate_final_state=team_a_final_state,
@@ -5040,6 +5270,17 @@ def _run_historical_match_evaluation(
         seed=int(getattr(args, "historical_eval_seed", 3_000_000)),
         horizon=int(getattr(args, "historical_eval_horizon", 1024)),
     )
+    summary["environment_contract"] = {
+        "episode_end_mode": str(
+            getattr(args, "episode_end_mode", "possessions") or "possessions"
+        ),
+        "game_clock_seconds": int(getattr(args, "game_clock_seconds", 720)),
+        "overtime_seconds": int(getattr(args, "overtime_seconds", 120)),
+        "game_clock_max_total_steps": int(
+            getattr(args, "game_clock_max_total_steps", 10_000)
+        ),
+    }
+    return summary
 
 
 def _historical_eval_artifact_payload(
@@ -6322,10 +6563,6 @@ def _summarize_role_rollout_metrics(
     completed_possession_clock_seconds = _active_sum(
         rollout.trajectory.completed_possession_game_clock_seconds
     )
-    elapsed_game_clock_minutes = elapsed_game_clock_seconds / 60.0
-    total_completed_possessions = (
-        learner_completed_possessions + opponent_completed_possessions
-    )
     terminal_overtime_periods = np.asarray(
         rollout.trajectory.terminal_overtime_periods,
         dtype=np.int32,
@@ -6361,6 +6598,58 @@ def _summarize_role_rollout_metrics(
     team_b_score_delta = np.asarray(
         rollout.trajectory.team_b_score_delta,
         dtype=np.float32,
+    )
+    regulation_segment_team_a_points = [
+        float(
+            (
+                team_a_score_delta
+                * (active_bool & (regulation_segment == segment)).astype(np.float32)
+            ).sum()
+        )
+        for segment in range(4)
+    ]
+    regulation_segment_team_b_points = [
+        float(
+            (
+                team_b_score_delta
+                * (active_bool & (regulation_segment == segment)).astype(np.float32)
+            ).sum()
+        )
+        for segment in range(4)
+    ]
+    overtime_mask = active_bool & (clock_period_index > 0)
+    overtime_team_a_points = float(
+        (team_a_score_delta * overtime_mask.astype(np.float32)).sum()
+    )
+    overtime_team_b_points = float(
+        (team_b_score_delta * overtime_mask.astype(np.float32)).sum()
+    )
+    shared_clock_metrics = summarize_clock_metrics(
+        game_count=completed_episodes,
+        side_a_points=learner_points_total,
+        side_b_points=opponent_points_total,
+        side_a_completed_offensive_possessions=learner_completed_possessions,
+        side_b_completed_offensive_possessions=opponent_completed_possessions,
+        elapsed_game_clock_seconds=elapsed_game_clock_seconds,
+        completed_possession_game_clock_seconds=completed_possession_clock_seconds,
+        regulation_completion_count=regulation_completion_count,
+        overtime_game_count=overtime_game_count,
+        overtime_periods_total=int(
+            (terminal_overtime_periods * overtime_game_mask.astype(np.int32)).sum()
+        ),
+        terminal_game_clock_seconds_total=float(
+            (terminal_clock_seconds * terminal_mask.astype(np.float32)).sum()
+        ),
+        regulation_segment_side_a_points=regulation_segment_team_a_points,
+        regulation_segment_side_b_points=regulation_segment_team_b_points,
+        overtime_side_a_points=overtime_team_a_points,
+        overtime_side_b_points=overtime_team_b_points,
+        completed_possessions_for_per_game=int(
+            (
+                terminal_completed_possessions
+                * terminal_mask.astype(np.int32)
+            ).sum()
+        ),
     )
 
     metrics = {
@@ -6414,46 +6703,33 @@ def _summarize_role_rollout_metrics(
         f"{role}_opponent_points_total": opponent_points_total,
         f"{role}_learner_completed_possessions": learner_completed_possessions,
         f"{role}_opponent_completed_possessions": opponent_completed_possessions,
-        f"{role}_learner_offensive_efficiency": _safe_metric_ratio(
-            learner_points_total,
-            learner_completed_possessions,
-        ),
-        f"{role}_opponent_offensive_efficiency": _safe_metric_ratio(
-            opponent_points_total,
-            opponent_completed_possessions,
-        ),
+        f"{role}_learner_offensive_efficiency": shared_clock_metrics["side_a"][
+            "offensive_efficiency_points_per_possession"
+        ],
+        f"{role}_opponent_offensive_efficiency": shared_clock_metrics["side_b"][
+            "offensive_efficiency_points_per_possession"
+        ],
         f"{role}_elapsed_game_clock_seconds": elapsed_game_clock_seconds,
-        f"{role}_learner_pace_possessions_per_game_minute": _safe_metric_ratio(
-            learner_completed_possessions,
-            elapsed_game_clock_minutes,
-        ),
-        f"{role}_opponent_pace_possessions_per_game_minute": _safe_metric_ratio(
-            opponent_completed_possessions,
-            elapsed_game_clock_minutes,
-        ),
-        f"{role}_mean_completed_possession_game_clock_seconds": _safe_metric_ratio(
-            completed_possession_clock_seconds,
-            total_completed_possessions,
-        ),
-        f"{role}_completed_possessions_per_completed_game": _safe_metric_ratio(
-            int(
-                (
-                    terminal_completed_possessions
-                    * terminal_mask.astype(np.int32)
-                ).sum()
-            ),
-            completed_episodes,
-        ),
+        f"{role}_learner_pace_possessions_per_game_minute": shared_clock_metrics[
+            "side_a"
+        ]["pace_completed_offensive_possessions_per_game_minute"],
+        f"{role}_opponent_pace_possessions_per_game_minute": shared_clock_metrics[
+            "side_b"
+        ]["pace_completed_offensive_possessions_per_game_minute"],
+        f"{role}_mean_completed_possession_game_clock_seconds": shared_clock_metrics[
+            "mean_completed_possession_game_clock_seconds"
+        ],
+        f"{role}_completed_possessions_per_completed_game": shared_clock_metrics[
+            "completed_possessions_per_game"
+        ],
         f"{role}_regulation_completion_count": regulation_completion_count,
         f"{role}_overtime_game_count": overtime_game_count,
-        f"{role}_mean_overtime_periods": _safe_metric_ratio(
-            int((terminal_overtime_periods * overtime_game_mask.astype(np.int32)).sum()),
-            overtime_game_count,
-        ),
-        f"{role}_mean_terminal_game_clock_seconds_remaining": _safe_metric_ratio(
-            float((terminal_clock_seconds * terminal_mask.astype(np.float32)).sum()),
-            completed_episodes,
-        ),
+        f"{role}_mean_overtime_periods": shared_clock_metrics[
+            "mean_overtime_periods"
+        ],
+        f"{role}_mean_terminal_game_clock_seconds_remaining": shared_clock_metrics[
+            "mean_terminal_game_clock_seconds_remaining"
+        ],
         f"{role}_rebound_reward_advance_count": int(
             _active_sum(rebound_reward_advances > 0.0)
         ),
@@ -6479,26 +6755,14 @@ def _summarize_role_rollout_metrics(
         f"{role}_phi_beta_mean": _active_mean(rollout.trajectory.phi_beta),
     }
     for segment_index in range(4):
-        segment_mask = active_bool & (regulation_segment == segment_index)
-        team_a_points = float(
-            (team_a_score_delta * segment_mask.astype(np.float32)).sum()
-        )
-        team_b_points = float(
-            (team_b_score_delta * segment_mask.astype(np.float32)).sum()
-        )
+        team_a_points = regulation_segment_team_a_points[segment_index]
+        team_b_points = regulation_segment_team_b_points[segment_index]
         segment_prefix = f"{role}_regulation_segment_{segment_index + 1}"
         metrics[f"{segment_prefix}_team_a_points"] = team_a_points
         metrics[f"{segment_prefix}_team_b_points"] = team_b_points
         metrics[f"{segment_prefix}_point_differential"] = (
             team_a_points - team_b_points
         )
-    overtime_mask = active_bool & (clock_period_index > 0)
-    overtime_team_a_points = float(
-        (team_a_score_delta * overtime_mask.astype(np.float32)).sum()
-    )
-    overtime_team_b_points = float(
-        (team_b_score_delta * overtime_mask.astype(np.float32)).sum()
-    )
     metrics[f"{role}_overtime_team_a_points"] = overtime_team_a_points
     metrics[f"{role}_overtime_team_b_points"] = overtime_team_b_points
     metrics[f"{role}_overtime_point_differential"] = (

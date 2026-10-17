@@ -74,13 +74,21 @@ game across fixed PPO rollout boundaries. Its budget observation is seconds
 remaining divided by 720, and its relative-score observation is the observing
 team's score difference divided by 30; neither value is clipped. A total-step
 safety truncation is reported separately and bootstraps from the final state
-before the environment resets. Native timed evaluation is tracked separately
-in issue #65.
+before the environment resets. Native and historical timed evaluation run the
+same JAX clock kernel, keep safety and horizon truncations separate, and exclude
+both from completed-game outcome rates.
 
 Training metrics preserve raw period and clock coordinates and report completed
 possessions per game, per-team offensive efficiency and pace, mean clock time per
 possession, regulation/overtime counts, terminal clock values, regulation
 quarter-segment scoring, overtime scoring, and safety truncations separately.
+The native and historical summaries use those same definitions: points per
+completed offensive possession for efficiency, completed offensive possessions
+per elapsed game-clock minute for pace, and elapsed game-clock seconds per
+completed possession for duration. Zero denominators produce `0.0`. Evaluation
+artifacts also retain compact scoring and possession events with their period
+and pre-step clock timestamp, plus separate summaries for completed and
+truncated games.
 
 ## Rollout variants
 

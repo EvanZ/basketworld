@@ -30,6 +30,8 @@ from basketworld_jax.env import (
 )
 from basketworld_jax.env.minimal import (
     GAME_PHASE_LIVE,
+    TEAM_A,
+    TEAM_B,
     POSSESSION_END_DEFENSIVE_REBOUND,
     POSSESSION_END_DEFENSIVE_VIOLATION,
     POSSESSION_END_CHECK_VIOLATION,
@@ -83,6 +85,25 @@ HISTORICAL_MATCH_DIAGNOSTIC_KEYS = (
     "active_steps",
     "completed_possessions",
     "completed_possession_live_steps",
+    "completed_possession_game_clock_seconds",
+    "elapsed_game_clock_seconds",
+    "candidate_completed_offensive_possessions",
+    "opponent_completed_offensive_possessions",
+    "regulation_completions",
+    "overtime_period_starts",
+    "terminal_overtime_periods",
+    "terminal_game_clock_seconds_remaining",
+    "terminal_completed_possessions",
+    "regulation_segment_1_candidate_points",
+    "regulation_segment_1_opponent_points",
+    "regulation_segment_2_candidate_points",
+    "regulation_segment_2_opponent_points",
+    "regulation_segment_3_candidate_points",
+    "regulation_segment_3_opponent_points",
+    "regulation_segment_4_candidate_points",
+    "regulation_segment_4_opponent_points",
+    "overtime_candidate_points",
+    "overtime_opponent_points",
     "check_opportunities",
     "check_setup_opportunities",
     "check_setup_steps",
@@ -163,6 +184,43 @@ HISTORICAL_MATCH_FLOAT_DIAGNOSTIC_KEYS = frozenset(
         "spatial_offense_nearest_defender_distance",
         "spatial_unguarded_offense_fraction",
         "spatial_team_centroid_distance",
+        "completed_possession_game_clock_seconds",
+        "elapsed_game_clock_seconds",
+        "terminal_game_clock_seconds_remaining",
+        "regulation_segment_1_candidate_points",
+        "regulation_segment_1_opponent_points",
+        "regulation_segment_2_candidate_points",
+        "regulation_segment_2_opponent_points",
+        "regulation_segment_3_candidate_points",
+        "regulation_segment_3_opponent_points",
+        "regulation_segment_4_candidate_points",
+        "regulation_segment_4_opponent_points",
+        "overtime_candidate_points",
+        "overtime_opponent_points",
+    }
+)
+
+_DEPLOY_EVAL_PER_EPISODE_CLOCK_FIELDS = frozenset(
+    {
+        "elapsed_game_clock_seconds",
+        "completed_possession_game_clock_seconds",
+        "team_a_completed_offensive_possessions",
+        "team_b_completed_offensive_possessions",
+        "regulation_completions",
+        "overtime_period_starts",
+        "terminal_overtime_periods",
+        "terminal_game_clock_seconds_remaining",
+        "terminal_completed_possessions",
+        "regulation_segment_1_team_a_points",
+        "regulation_segment_1_team_b_points",
+        "regulation_segment_2_team_a_points",
+        "regulation_segment_2_team_b_points",
+        "regulation_segment_3_team_a_points",
+        "regulation_segment_3_team_b_points",
+        "regulation_segment_4_team_a_points",
+        "regulation_segment_4_team_b_points",
+        "overtime_team_a_points",
+        "overtime_team_b_points",
     }
 )
 
@@ -3425,6 +3483,7 @@ def _build_historical_match_step_diagnostics(
     env_out,
     candidate_role_flags,
     active_step,
+    game_clock_mode: bool,
     jnp,
 ) -> dict[str, Any]:
     """Collect compact per-episode gameplay counters for historical matches."""
@@ -3473,6 +3532,101 @@ def _build_historical_match_step_diagnostics(
         env_out.completed_possession_live_steps.astype(jnp.float32),
         0.0,
     )
+    possession_ended = active_step & env_out.possession_ended.astype(jnp.bool_)
+    counters["candidate_completed_offensive_possessions"] = (
+        possession_ended & candidate_is_offense
+    ).astype(jnp.float32)
+    counters["opponent_completed_offensive_possessions"] = (
+        possession_ended & (~candidate_is_offense)
+    ).astype(jnp.float32)
+    if game_clock_mode:
+        completed_game = env_out.done.astype(jnp.bool_) & (
+            ~env_out.truncated.astype(jnp.bool_)
+        )
+        counters["completed_possession_game_clock_seconds"] = jnp.where(
+            active_step,
+            env_out.completed_possession_game_clock_seconds.astype(jnp.float32),
+            0.0,
+        )
+        counters["elapsed_game_clock_seconds"] = jnp.where(
+            active_step,
+            (
+                env_out.state.elapsed_game_clock_seconds
+                - state.elapsed_game_clock_seconds
+            ).astype(jnp.float32),
+            0.0,
+        )
+        counters["regulation_completions"] = (
+            active_step
+            & (state.overtime_round == 0)
+            & ((env_out.state.overtime_round > 0) | completed_game)
+        ).astype(jnp.float32)
+        counters["overtime_period_starts"] = (
+            active_step & (env_out.state.overtime_round > state.overtime_round)
+        ).astype(jnp.float32)
+        counters["terminal_overtime_periods"] = jnp.where(
+            active_step & completed_game,
+            env_out.state.overtime_round.astype(jnp.float32),
+            0.0,
+        )
+        counters["terminal_game_clock_seconds_remaining"] = jnp.where(
+            active_step & completed_game,
+            env_out.state.game_clock_remaining.astype(jnp.float32),
+            0.0,
+        )
+        counters["terminal_completed_possessions"] = jnp.where(
+            active_step & completed_game,
+            (
+                env_out.state.team_a_completed_possessions
+                + env_out.state.team_b_completed_possessions
+            ).astype(jnp.float32),
+            0.0,
+        )
+        regulation_seconds = jnp.maximum(
+            static.game_clock_seconds.astype(jnp.int32),
+            jnp.asarray(1, dtype=jnp.int32),
+        )
+        segment = jnp.minimum(
+            (
+                jnp.maximum(
+                    regulation_seconds - state.game_clock_remaining.astype(jnp.int32),
+                    0,
+                )
+                * 4
+            )
+            // regulation_seconds,
+            3,
+        )
+        candidate_is_team_a = static.training_player_mask[static.offense_ids[0]] > 0.5
+        candidate_score_delta = jnp.where(
+            candidate_is_team_a,
+            env_out.team_a_score_delta,
+            env_out.team_b_score_delta,
+        ).astype(jnp.float32)
+        opponent_score_delta = jnp.where(
+            candidate_is_team_a,
+            env_out.team_b_score_delta,
+            env_out.team_a_score_delta,
+        ).astype(jnp.float32)
+        for segment_index in range(4):
+            in_segment = (
+                active_step
+                & (state.overtime_round == 0)
+                & (segment == segment_index)
+            )
+            counters[
+                f"regulation_segment_{segment_index + 1}_candidate_points"
+            ] = jnp.where(in_segment, candidate_score_delta, 0.0)
+            counters[
+                f"regulation_segment_{segment_index + 1}_opponent_points"
+            ] = jnp.where(in_segment, opponent_score_delta, 0.0)
+        in_overtime = active_step & (state.overtime_round > 0)
+        counters["overtime_candidate_points"] = jnp.where(
+            in_overtime, candidate_score_delta, 0.0
+        )
+        counters["overtime_opponent_points"] = jnp.where(
+            in_overtime, opponent_score_delta, 0.0
+        )
     counters["check_opportunities"] = _count(env_out.check_opportunity)
     counters["check_setup_opportunities"] = _count(env_out.check_setup_opportunity)
     counters["check_setup_steps"] = _count(env_out.check_setup_step)
@@ -3830,6 +3984,7 @@ def build_compiled_historical_match_eval_runner(
                 env_out,
                 candidate_role_flags,
                 active_step,
+                game_clock_mode,
                 jnp,
             )
             next_diagnostics = {
@@ -3846,13 +4001,47 @@ def build_compiled_historical_match_eval_runner(
                 & (~env_out.done.astype(jnp.bool_))
                 & env_out.offensive_rebound.astype(jnp.bool_)
             )
+            candidate_is_team_a = (
+                static.training_player_mask[static.offense_ids[0]] > 0.5
+            )
+            clock_event_trace = {
+                "clock_event_active": active_step.astype(jnp.int8),
+                "clock_event_period_index": jnp.where(
+                    active_step,
+                    state.overtime_round.astype(jnp.int32),
+                    -1,
+                ),
+                "clock_event_seconds_remaining": jnp.where(
+                    active_step,
+                    state.game_clock_remaining.astype(jnp.int32),
+                    0,
+                ),
+                "clock_event_candidate_score_delta": jnp.where(
+                    candidate_is_team_a,
+                    env_out.team_a_score_delta,
+                    env_out.team_b_score_delta,
+                ).astype(jnp.float32),
+                "clock_event_opponent_score_delta": jnp.where(
+                    candidate_is_team_a,
+                    env_out.team_b_score_delta,
+                    env_out.team_a_score_delta,
+                ).astype(jnp.float32),
+                "clock_event_possession_ended": env_out.possession_ended.astype(
+                    jnp.int8
+                ),
+                "clock_event_possession_end_reason": (
+                    env_out.possession_end_reason.astype(jnp.int32)
+                ),
+                "clock_event_done": env_out.done.astype(jnp.int8),
+                "clock_event_safety_truncated": env_out.truncated.astype(jnp.int8),
+            }
             return (
                 env_out.state,
                 key,
                 next_completed_pass_boundary,
                 next_offensive_rebound_boundary,
                 next_diagnostics,
-            ), None
+            ), clock_event_trace
 
         (
             final_state,
@@ -3860,7 +4049,7 @@ def build_compiled_historical_match_eval_runner(
             _,
             _,
             diagnostics,
-        ), _ = jax.lax.scan(
+        ), clock_event_trace = jax.lax.scan(
             _scan_step,
             (
                 initial_state,
@@ -3872,6 +4061,7 @@ def build_compiled_historical_match_eval_runner(
             xs=None,
             length=int(horizon),
         )
+        diagnostics = {**diagnostics, **clock_event_trace}
         return final_state, diagnostics
 
     return jax.jit(_runner, static_argnums=(5, 8, 9))
@@ -4265,7 +4455,12 @@ def build_compiled_deploy_eval_runner(
         n_players = int(static.role_encoding.shape[0])
         zero = jnp.asarray(0.0, dtype=jnp.float32)
         initial_totals = DeployEvalTotals(
-            *([zero] * len(DeployEvalTotals._fields))
+            *(
+                jnp.zeros(initial_state.episode_ended.shape, dtype=jnp.float32)
+                if field in _DEPLOY_EVAL_PER_EPISODE_CLOCK_FIELDS
+                else zero
+                for field in DeployEvalTotals._fields
+            )
         )
         initial_rebound_totals = zero_rebound_diagnostic_totals_like(zero, jnp)
         initial_completed_pass_boundary = jnp.zeros(
@@ -4440,6 +4635,21 @@ def build_compiled_deploy_eval_runner(
                 value = jnp.asarray(value, dtype=jnp.float32)
                 return jnp.sum(jnp.where(active_step, value, jnp.zeros_like(value)))
 
+            def _active_vector(value):
+                value = jnp.asarray(value, dtype=jnp.float32)
+                return jnp.where(active_step, value, jnp.zeros_like(value))
+
+            clock_transition = _game_clock_transition_metrics(
+                static,
+                state,
+                env_out,
+                active_step,
+                game_clock_mode=game_clock_mode,
+                jnp=jnp,
+            )
+            clock_segment = clock_transition["regulation_clock_segment"]
+            in_overtime = clock_transition["clock_period_index"] > 0
+
             step_totals = DeployEvalTotals(
                 active_steps=jnp.sum(active_step.astype(jnp.float32)),
                 completed_episode_steps=_active_sum(env_out.terminal_episode_steps),
@@ -4563,6 +4773,60 @@ def build_compiled_deploy_eval_runner(
                 selector_boundary_offensive_rebound=_active_sum(
                     selector_metrics["selector_boundary_offensive_rebound"]
                 ),
+                elapsed_game_clock_seconds=_active_vector(
+                    env_out.state.elapsed_game_clock_seconds
+                    - state.elapsed_game_clock_seconds
+                ) if game_clock_mode else _active_vector(0.0),
+                completed_possession_game_clock_seconds=_active_vector(
+                    env_out.completed_possession_game_clock_seconds
+                ) if game_clock_mode else _active_vector(0.0),
+                team_a_completed_offensive_possessions=_active_vector(
+                    env_out.possession_ended.astype(jnp.bool_)
+                    & (state.offense_team == TEAM_A)
+                ),
+                team_b_completed_offensive_possessions=_active_vector(
+                    env_out.possession_ended.astype(jnp.bool_)
+                    & (state.offense_team == TEAM_B)
+                ),
+                regulation_completions=clock_transition["regulation_completed"].astype(jnp.float32),
+                overtime_period_starts=clock_transition["overtime_period_started"].astype(jnp.float32),
+                terminal_overtime_periods=clock_transition["terminal_overtime_periods"].astype(jnp.float32),
+                terminal_game_clock_seconds_remaining=clock_transition[
+                    "terminal_game_clock_seconds_remaining"
+                ].astype(jnp.float32),
+                terminal_completed_possessions=clock_transition[
+                    "terminal_completed_possessions"
+                ].astype(jnp.float32),
+                regulation_segment_1_team_a_points=jnp.where(
+                    clock_segment == 0, env_out.team_a_score_delta, 0.0
+                ).astype(jnp.float32),
+                regulation_segment_1_team_b_points=jnp.where(
+                    clock_segment == 0, env_out.team_b_score_delta, 0.0
+                ).astype(jnp.float32),
+                regulation_segment_2_team_a_points=jnp.where(
+                    clock_segment == 1, env_out.team_a_score_delta, 0.0
+                ).astype(jnp.float32),
+                regulation_segment_2_team_b_points=jnp.where(
+                    clock_segment == 1, env_out.team_b_score_delta, 0.0
+                ).astype(jnp.float32),
+                regulation_segment_3_team_a_points=jnp.where(
+                    clock_segment == 2, env_out.team_a_score_delta, 0.0
+                ).astype(jnp.float32),
+                regulation_segment_3_team_b_points=jnp.where(
+                    clock_segment == 2, env_out.team_b_score_delta, 0.0
+                ).astype(jnp.float32),
+                regulation_segment_4_team_a_points=jnp.where(
+                    clock_segment == 3, env_out.team_a_score_delta, 0.0
+                ).astype(jnp.float32),
+                regulation_segment_4_team_b_points=jnp.where(
+                    clock_segment == 3, env_out.team_b_score_delta, 0.0
+                ).astype(jnp.float32),
+                overtime_team_a_points=jnp.where(
+                    in_overtime, env_out.team_a_score_delta, 0.0
+                ).astype(jnp.float32),
+                overtime_team_b_points=jnp.where(
+                    in_overtime, env_out.team_b_score_delta, 0.0
+                ).astype(jnp.float32),
             )
             next_totals = DeployEvalTotals(
                 *(
@@ -4628,7 +4892,11 @@ def summarize_deploy_eval_outputs(
     totals = {
         field: float(
             sum(
-                float(np.asarray(getattr(output.totals, field), dtype=np.float64))
+                float(
+                    np.asarray(
+                        getattr(output.totals, field), dtype=np.float64
+                    ).sum()
+                )
                 for output in outputs
             )
         )
@@ -4904,6 +5172,158 @@ def summarize_deploy_eval_outputs(
     )
     metrics["rebound_softmax_empirical_gap_defense"] = float(
         defensive_rebound_rate - metrics["rebound_softmax_win_rate_defense"]
+    )
+
+    def _masked_clock_total(field: str, *, completed: bool) -> float:
+        total = 0.0
+        for output in outputs:
+            ended = np.asarray(output.final_state.episode_ended, dtype=bool).reshape(-1)
+            truncated = np.asarray(
+                getattr(
+                    output.final_state,
+                    "episode_truncated",
+                    np.zeros_like(ended),
+                ),
+                dtype=bool,
+            ).reshape(-1)
+            completed_mask = ended & (~truncated)
+            mask = completed_mask if completed else ~completed_mask
+            values = np.asarray(getattr(output.totals, field), dtype=np.float64).reshape(-1)
+            if values.size == 1 and mask.size != 1:
+                values = np.broadcast_to(values, mask.shape)
+            total += float(values[mask].sum())
+        return total
+
+    def _masked_final_score(field: str, *, completed: bool) -> float:
+        total = 0.0
+        for output in outputs:
+            ended = np.asarray(output.final_state.episode_ended, dtype=bool).reshape(-1)
+            truncated = np.asarray(
+                getattr(
+                    output.final_state,
+                    "episode_truncated",
+                    np.zeros_like(ended),
+                ),
+                dtype=bool,
+            ).reshape(-1)
+            completed_mask = ended & (~truncated)
+            mask = completed_mask if completed else ~completed_mask
+            fallback_field = (
+                "offense_score" if field == "team_a_score" else "defense_score"
+            )
+            values = np.asarray(
+                getattr(
+                    output.final_state,
+                    field,
+                    getattr(output.final_state, fallback_field),
+                ),
+                dtype=np.float64,
+            ).reshape(-1)
+            total += float(values[mask].sum())
+        return total
+
+    completed_elapsed_seconds = _masked_clock_total(
+        "elapsed_game_clock_seconds", completed=True
+    )
+    completed_team_a_possessions = _masked_clock_total(
+        "team_a_completed_offensive_possessions", completed=True
+    )
+    completed_team_b_possessions = _masked_clock_total(
+        "team_b_completed_offensive_possessions", completed=True
+    )
+    completed_possession_clock_seconds = _masked_clock_total(
+        "completed_possession_game_clock_seconds", completed=True
+    )
+    completed_team_a_points = _masked_final_score("team_a_score", completed=True)
+    completed_team_b_points = _masked_final_score("team_b_score", completed=True)
+    completed_overtime_periods = _masked_clock_total(
+        "terminal_overtime_periods", completed=True
+    )
+    overtime_game_count = 0
+    for output in outputs:
+        ended = np.asarray(output.final_state.episode_ended, dtype=bool).reshape(-1)
+        truncated = np.asarray(
+            getattr(output.final_state, "episode_truncated", np.zeros_like(ended)),
+            dtype=bool,
+        ).reshape(-1)
+        overtime_round = np.asarray(
+            getattr(output.final_state, "overtime_round", np.zeros_like(ended)),
+            dtype=np.int32,
+        ).reshape(-1)
+        overtime_game_count += int(((ended & (~truncated)) & (overtime_round > 0)).sum())
+
+    completed_possession_count_clock = (
+        completed_team_a_possessions + completed_team_b_possessions
+    )
+    metrics.update(
+        {
+            "clock_elapsed_game_clock_seconds_completed_games": completed_elapsed_seconds,
+            "clock_completed_possessions_per_completed_game": _rate(
+                completed_possession_count_clock, completed_episode_count
+            ),
+            "clock_team_a_offensive_efficiency_points_per_possession": _rate(
+                completed_team_a_points, completed_team_a_possessions
+            ),
+            "clock_team_b_offensive_efficiency_points_per_possession": _rate(
+                completed_team_b_points, completed_team_b_possessions
+            ),
+            "clock_team_a_pace_completed_offensive_possessions_per_game_minute": _rate(
+                completed_team_a_possessions, completed_elapsed_seconds / 60.0
+            ),
+            "clock_team_b_pace_completed_offensive_possessions_per_game_minute": _rate(
+                completed_team_b_possessions, completed_elapsed_seconds / 60.0
+            ),
+            "clock_mean_completed_possession_game_clock_seconds": _rate(
+                completed_possession_clock_seconds, completed_possession_count_clock
+            ),
+            "clock_regulation_completion_count": int(
+                _masked_clock_total("regulation_completions", completed=True)
+            ),
+            "clock_overtime_game_count": int(overtime_game_count),
+            "clock_mean_overtime_periods": _rate(
+                completed_overtime_periods, overtime_game_count
+            ),
+            "clock_mean_terminal_game_clock_seconds_remaining": _rate(
+                _masked_clock_total(
+                    "terminal_game_clock_seconds_remaining", completed=True
+                ),
+                completed_episode_count,
+            ),
+            "clock_elapsed_game_clock_seconds_truncated_games": _masked_clock_total(
+                "elapsed_game_clock_seconds", completed=False
+            ),
+            "clock_completed_possessions_truncated_games": (
+                _masked_clock_total(
+                    "team_a_completed_offensive_possessions", completed=False
+                )
+                + _masked_clock_total(
+                    "team_b_completed_offensive_possessions", completed=False
+                )
+            ),
+        }
+    )
+    for segment in range(1, 5):
+        team_a_points = _masked_clock_total(
+            f"regulation_segment_{segment}_team_a_points", completed=True
+        )
+        team_b_points = _masked_clock_total(
+            f"regulation_segment_{segment}_team_b_points", completed=True
+        )
+        metrics[f"clock_regulation_segment_{segment}_team_a_points"] = team_a_points
+        metrics[f"clock_regulation_segment_{segment}_team_b_points"] = team_b_points
+        metrics[
+            f"clock_regulation_segment_{segment}_team_a_point_differential"
+        ] = team_a_points - team_b_points
+    overtime_team_a_points = _masked_clock_total(
+        "overtime_team_a_points", completed=True
+    )
+    overtime_team_b_points = _masked_clock_total(
+        "overtime_team_b_points", completed=True
+    )
+    metrics["clock_overtime_team_a_points"] = overtime_team_a_points
+    metrics["clock_overtime_team_b_points"] = overtime_team_b_points
+    metrics["clock_overtime_team_a_point_differential"] = (
+        overtime_team_a_points - overtime_team_b_points
     )
     return metrics
 

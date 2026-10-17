@@ -357,6 +357,25 @@ class DeployEvalTotals(NamedTuple):
     selector_boundary_commitment_timeout: Any
     selector_boundary_completed_pass: Any
     selector_boundary_offensive_rebound: Any
+    elapsed_game_clock_seconds: Any = 0.0
+    completed_possession_game_clock_seconds: Any = 0.0
+    team_a_completed_offensive_possessions: Any = 0.0
+    team_b_completed_offensive_possessions: Any = 0.0
+    regulation_completions: Any = 0.0
+    overtime_period_starts: Any = 0.0
+    terminal_overtime_periods: Any = 0.0
+    terminal_game_clock_seconds_remaining: Any = 0.0
+    terminal_completed_possessions: Any = 0.0
+    regulation_segment_1_team_a_points: Any = 0.0
+    regulation_segment_1_team_b_points: Any = 0.0
+    regulation_segment_2_team_a_points: Any = 0.0
+    regulation_segment_2_team_b_points: Any = 0.0
+    regulation_segment_3_team_a_points: Any = 0.0
+    regulation_segment_3_team_b_points: Any = 0.0
+    regulation_segment_4_team_a_points: Any = 0.0
+    regulation_segment_4_team_b_points: Any = 0.0
+    overtime_team_a_points: Any = 0.0
+    overtime_team_b_points: Any = 0.0
 
 
 class DeployEvalOutput(NamedTuple):

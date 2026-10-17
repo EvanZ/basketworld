@@ -77,9 +77,10 @@ The JAX trainer owns `episode_end_mode`, `game_clock_seconds`,
 Compiled training selects a mode-specialized stepper when each rollout runner
 is built: possession runs retain `step_batch_minimal`, while timed runs use
 `step_batch_game_clock`. Safety truncations reset the environment but bootstrap
-the learner from the final pre-reset observation. Native timed evaluation remains
-guarded until issue #65 adds timed horizons, paired overtime starts, and the full
-evaluation diagnostic contract.
+the learner from the final pre-reset observation. Native and historical timed
+evaluation use the same clock stepper and size their compiled scans with an
+explicit horizon. They report a safety-cap termination separately from a scan
+horizon cutoff; neither contributes to completed-game win rates.
 
 Game-clock policies observe seconds remaining divided by the fixed scale 720
 and observing-team score difference divided by 30. These semantics and scales
@@ -93,6 +94,22 @@ for per-team efficiency, elapsed game-clock minutes for per-team pace, and
 report regulation completions, overtime games/periods, terminal clock values,
 four regulation scoring segments, overtime scoring, possession duration, and
 safety truncations separately.
+
+Native and historical evaluation use the same denominators. Offensive
+efficiency is points per completed offensive possession. Pace is completed
+offensive possessions per elapsed game-clock minute, including overtime and
+clock time consumed during check pickup while excluding stopped setup/inbound
+steps. Possession duration sums elapsed game-clock seconds through every
+completed possession, including `period_expired`, exactly once. Ratios with no
+denominator are reported as `0.0`. Completed and truncated groups are preserved
+separately, and raw scoring/possession events retain period index and pre-step
+seconds remaining for reanalysis.
+
+Adjacent native evaluation rows share reset randomness, start with opposite
+stable teams, and set opposite overtime inversion flags. Historical matches
+reuse the same seeded game row across candidate Team A/Team B assignments, so
+the episode-stable overtime draw is inverted from the candidate's perspective
+without depending on how many steps either game used to reach overtime.
 
 ## Effective configuration and reproducibility
 
