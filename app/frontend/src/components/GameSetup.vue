@@ -149,7 +149,7 @@ function openTemplateSandbox() {
 <template>
     <div class="setup-container">
         <h2>Game Setup</h2>
-        <p>Enter an MLflow Run ID to load either an SB3 model or a JAX checkpoint artifact from that run.</p>
+        <p>Enter an MLflow Run ID to load a JAX checkpoint artifact from that run.</p>
 
         <section class="recent-runs-panel" aria-labelledby="recent-runs-heading">
           <div class="recent-runs-header">

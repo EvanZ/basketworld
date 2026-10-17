@@ -1,141 +1,19 @@
 from __future__ import annotations
 
 from argparse import Namespace
-import inspect
 import json
 from pathlib import Path
 import subprocess
 import sys
 
-import numpy as np
 import pytest
 
 jnp = pytest.importorskip("jax.numpy")
 
 from basketworld.domain import ActionType, Team
-from basketworld.envs.basketworld_env_v2 import HexagonBasketballEnv
 from basketworld.utils.start_templates import load_start_template_library
 from basketworld_jax.config import JaxEnvironmentConfig
-from basketworld_jax.env.minimal import (
-    build_kernel_static_from_config,
-    build_kernel_static_from_env,
-)
-
-
-def _assert_static_equal(legacy_static, config_static) -> None:
-    assert legacy_static._fields == config_static._fields
-    for name, legacy_value, config_value in zip(
-        legacy_static._fields, legacy_static, config_static
-    ):
-        legacy_array = np.asarray(legacy_value)
-        config_array = np.asarray(config_value)
-        assert legacy_array.shape == config_array.shape, name
-        np.testing.assert_allclose(
-            legacy_array,
-            config_array,
-            atol=0.0,
-            rtol=0.0,
-            equal_nan=True,
-            err_msg=name,
-        )
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {
-            "players": 1,
-            "court_rows": 9,
-            "court_cols": 8,
-        },
-        {
-            "players": 3,
-            "court_rows": 9,
-            "court_cols": 8,
-            "allow_dunks": True,
-            "three_point_distance": 4.25,
-            "three_point_short_distance": 3.0,
-            "illegal_defense_enabled": False,
-            "offensive_three_seconds_enabled": True,
-            "pressure_skill_mean": 0.2,
-            "pressure_skill_std": 0.4,
-            "shot_contest_skill_mean": -0.1,
-            "shot_contest_skill_std": 0.3,
-            "ball_handling_skill_mean": 0.5,
-            "ball_handling_skill_std": 0.2,
-            "steal_skill_mean": 0.1,
-            "steal_skill_std": 0.6,
-            "passing_skill_mean": -0.2,
-            "passing_skill_std": 0.7,
-        },
-    ],
-)
-def test_jax_owned_static_geometry_matches_legacy_builder(kwargs):
-    env = HexagonBasketballEnv(render_mode=None, seed=0, **kwargs)
-    config = JaxEnvironmentConfig.from_legacy_env(env)
-
-    _assert_static_equal(
-        build_kernel_static_from_env(env, jnp),
-        build_kernel_static_from_config(config, jnp),
-    )
-
-
-@pytest.mark.parametrize("mode", ["possessions", "game_clock"])
-def test_jax_owned_static_multi_possession_modes_match_legacy_builder(mode):
-    env = HexagonBasketballEnv(
-        players=2,
-        court_rows=16,
-        court_cols=16,
-        render_mode=None,
-        seed=0,
-    )
-    overrides = {
-        "enable_multi_possession": True,
-        "multi_possession_limit": 4,
-        "episode_end_mode": mode,
-        "game_clock_seconds": 17,
-        "overtime_seconds": 9,
-        "multi_possession_reward_mode": "scoring_events",
-        "game_winner_reward": 2.0,
-        "check_clearance": 1,
-        "check_setup_steps": 2,
-        "check_deadline_steps": 6,
-        "random_check_location": True,
-    }
-    for key, value in overrides.items():
-        setattr(env, key, value)
-
-    config = JaxEnvironmentConfig.from_legacy_env(env)
-    _assert_static_equal(
-        build_kernel_static_from_env(env, jnp),
-        build_kernel_static_from_config(config, jnp),
-    )
-
-
-def test_jax_owned_start_template_compilation_matches_legacy_builder():
-    path = Path(__file__).resolve().parents[1] / "configs" / "start_templates_v2.json"
-    library = load_start_template_library(path, players_per_side=3)
-    env = HexagonBasketballEnv(
-        players=3,
-        court_rows=9,
-        court_cols=8,
-        shot_clock=24,
-        min_shot_clock=14,
-        render_mode=None,
-        seed=0,
-        start_template_enabled=True,
-        start_template_library=library,
-        start_template_prob=1.0,
-        start_template_jitter_scale=0.0,
-        start_template_mirror_prob=0.0,
-        start_template_strict=True,
-    )
-    config = JaxEnvironmentConfig.from_legacy_env(env)
-
-    _assert_static_equal(
-        build_kernel_static_from_env(env, jnp),
-        build_kernel_static_from_config(config, jnp),
-    )
+from basketworld_jax.env.minimal import build_kernel_static_from_config
 
 
 def test_environment_config_adapters_share_one_contract(tmp_path):
@@ -225,24 +103,10 @@ def test_environment_config_validation_names_the_invalid_field(kwargs, message):
         JaxEnvironmentConfig(**kwargs)
 
 
-def test_domain_types_keep_legacy_values_and_identity():
-    from basketworld.envs.basketworld_env_v2 import ActionType as LegacyActionType
-    from basketworld.envs.basketworld_env_v2 import Team as LegacyTeam
-
-    assert LegacyActionType is ActionType
-    assert LegacyTeam is Team
+def test_domain_types_keep_stable_wire_values():
     assert [action.value for action in ActionType] == list(range(14))
-
-
-def test_legacy_environment_constructor_does_not_own_game_clock_configuration():
-    parameters = inspect.signature(HexagonBasketballEnv.__init__).parameters
-    for name in (
-        "episode_end_mode",
-        "game_clock_seconds",
-        "overtime_seconds",
-        "game_clock_max_total_steps",
-    ):
-        assert name not in parameters
+    assert Team.OFFENSE.value == 0
+    assert Team.DEFENSE.value == 1
 
 
 def test_jax_config_and_static_builder_import_without_legacy_or_sb3():

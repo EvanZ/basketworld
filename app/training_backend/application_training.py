@@ -7,9 +7,8 @@ from typing import Any
 from app.training_backend.config_schema import compile_config_values
 
 
-# Arguments inherited from the historical SB3/shared parser that are not read
-# by either the JAX trainer or the environment bootstrap used by that trainer.
-# Do not expose them as editable no-ops. Representative JAX replacements are:
+# Arguments not read by either the JAX trainer or its environment bootstrap.
+# Do not expose them as editable no-ops. Representative replacements are:
 # n_steps -> rollout_horizon, n_epochs -> policy_update_epochs,
 # batch_size -> ppo_minibatches, num_envs -> kernel_batch_size,
 # net_arch* -> policy_hidden_dims/attention_*, and eval_freq/eval_episodes ->
@@ -38,7 +37,6 @@ JAX_INAPPLICABLE_FIELDS = frozenset(
         "log_episode_artifacts",
         "mlflow_episode_log_every_rollouts",
         "mlflow_gradnorm_log_every_rollouts",
-        "mlflow_sb3_log_every_writes",
         "mlflow_schedule_log_every_rollouts",
         "n_epochs",
         "n_steps",

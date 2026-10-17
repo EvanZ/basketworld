@@ -1,5 +1,8 @@
 # Schedule Continuation Guide
 
+> **Historical SB3 guide.** Its commands and checkpoint workflow are retired.
+> Use the JAX trainer and Orbax checkpoints for supported continuation runs.
+
 ## Overview
 
 When continuing training from a previous run using `--continue-run-id`, you now have fine-grained control over how schedules (entropy, phi-shaping, pass curriculum, etc.) behave. This guide explains the three continuation modes and when to use each.
@@ -276,6 +279,5 @@ Check MLflow UI → Run → Parameters → search for "schedule_" to see all sav
 | `extend` | Add more alternations to existing run | Continues from where it left off, extends to new total |
 | `constant` | Train more with fixed hyperparameters | Uses final schedule values as constants |
 | `restart` | Try different schedule parameters | Ignores previous run, uses new parameters |
-
 
 

@@ -1,14 +1,12 @@
 import copy
-import inspect
 import os
 import tempfile
 from pathlib import Path
 
-import basketworld
 import mlflow
 import numpy as np
-import torch
 from fastapi import APIRouter, HTTPException
+from fastapi.encoders import jsonable_encoder
 
 from basketworld.utils.mlflow_params import (
     get_mlflow_params,
@@ -17,9 +15,8 @@ from basketworld.utils.mlflow_params import (
     get_mlflow_training_params,
 )
 from basketworld.utils.mlflow_config import setup_mlflow
-from basketworld.envs.basketworld_env_v2 import ActionType, Team
+from basketworld.domain import ActionType, Team
 from basketworld.utils.start_templates import load_start_template_library, resolve_start_template
-from basketworld.utils.wrappers import SetObservationWrapper
 
 from app.backend.inference_adapters import (
     get_policy_backend_kind,
@@ -27,22 +24,12 @@ from app.backend.inference_adapters import (
     get_policy_metadata,
     load_inference_policy,
 )
-from app.backend.mcts import _run_mcts_advisor
 from app.backend.observations import (
-    _compute_q_values_for_player,
-    rebuild_observation_from_env,
     validate_policy_observation_schema,
-)
-from app.backend.rollout_runtime import combine_team_actions, predict_joint_policy_actions
-from app.backend.selector_runtime import (
-    apply_rollout_segment_start,
-    maybe_apply_rollout_multisegment_boundary,
-    selector_runtime_active_for_rollout,
 )
 from app.backend.rebound_preview import compute_rebound_preview
 from app.backend.policies import (
     _compute_param_counts_from_policy,
-    get_latest_policies_from_run,
     get_unified_policy_path,
     list_policies_from_run,
 )
@@ -51,7 +38,6 @@ from app.backend.schemas import (
     ActionRequest,
     InitGameRequest,
     ListPoliciesRequest,
-    MCTSAdviseRequest,
     ReboundPreviewRequest,
     SetMultiPossessionLimitRequest,
     StartSelfPlayRequest,
@@ -129,17 +115,6 @@ _REBOUND_RUNTIME_STICKY_ENV_KEYS = {
     "offensive_rebound_reward_advance",
     "rebound_reward_once_per_possession",
 }
-
-
-def _split_env_and_wrapper_params(optional_params: dict) -> tuple[dict, dict]:
-    """Separate real env kwargs from wrapper/training-only metadata."""
-    env_signature = inspect.signature(basketworld.HexagonBasketballEnv.__init__)
-    valid_env_keys = {
-        name for name in env_signature.parameters.keys() if name not in {"self", "render_mode"}
-    }
-    env_kwargs = {k: v for k, v in optional_params.items() if k in valid_env_keys}
-    wrapper_kwargs = {k: v for k, v in optional_params.items() if k not in valid_env_keys}
-    return env_kwargs, wrapper_kwargs
 
 
 def _split_jax_env_and_wrapper_params(optional_params: dict) -> tuple[dict, dict]:
@@ -438,7 +413,7 @@ def _jax_int_param(params: dict, key: str, default: int | None = None) -> int | 
 
 
 def _populate_jax_training_ui_aliases(training_params: dict) -> dict:
-    """Populate SB3-style UI aliases from JAX-native MLflow/trainer params."""
+    """Populate UI aliases from JAX-native MLflow/trainer params."""
     merged = dict(training_params or {})
 
     kernel_batch_size = _jax_int_param(merged, "kernel_batch_size")
@@ -703,148 +678,6 @@ def _jax_local_env_config_from_metadata(policy_obj) -> tuple[dict, dict, dict, d
     return required_params, optional_params, trainer_config, phi_params
 
 
-def _selector_runtime_active_for_app() -> bool:
-    return selector_runtime_active_for_rollout(
-        getattr(game_state, "mlflow_training_params", None),
-        unified_policy=game_state.unified_policy,
-        opponent_policy=game_state.defense_policy,
-        user_team=game_state.user_team or Team.OFFENSE,
-    )
-
-
-def _apply_app_segment_start(*, allow_uniform_fallback: bool) -> bool:
-    result = apply_rollout_segment_start(
-        game_state.env,
-        game_state.obs,
-        training_params=getattr(game_state, "mlflow_training_params", None),
-        unified_policy=game_state.unified_policy,
-        opponent_policy=game_state.defense_policy,
-        user_team=game_state.user_team or Team.OFFENSE,
-        role_flag_offense=_role_flag_value_for_team(Team.OFFENSE),
-        allow_uniform_fallback=allow_uniform_fallback,
-    )
-    if result.get("obs") is not None:
-        game_state.obs = result["obs"]
-    return bool(result.get("used_selector", False))
-
-
-def _resolve_self_play_start_template(
-    request: StartSelfPlayRequest,
-) -> tuple[list[tuple[int, int]], int | None, int | None, dict | None]:
-    template_id = str(getattr(request, "template_id", "") or "").strip()
-    if not template_id:
-        return [], None, None, None
-    if not game_state.env:
-        raise HTTPException(status_code=400, detail="Game not initialized.")
-    runtime_env = getattr(game_state.env, "unwrapped", game_state.env)
-    if bool(getattr(runtime_env, "enable_multi_possession", False)):
-        raise HTTPException(
-            status_code=400,
-            detail="Start templates are disabled for continuous multi-possession games.",
-        )
-    library = getattr(game_state, "mlflow_start_template_library", None)
-    if not library or not isinstance(library, dict):
-        raise HTTPException(
-            status_code=400,
-            detail="No start-template library is loaded for this UI session.",
-        )
-
-    template = next(
-        (
-            dict(item)
-            for item in list(library.get("templates") or [])
-            if str(item.get("id", "")).strip() == template_id
-        ),
-        None,
-    )
-    if template is None:
-        raise HTTPException(status_code=404, detail=f"Unknown start template: {template_id}")
-
-    env = runtime_env
-    original_rng = getattr(env, "_rng", None)
-    seed = getattr(request, "template_seed", None)
-    if seed is not None:
-        setattr(env, "_rng", np.random.default_rng(int(seed)))
-    elif original_rng is None:
-        setattr(env, "_rng", np.random.default_rng())
-    rng = getattr(env, "_rng")
-
-    mirrored_requested = getattr(request, "template_mirrored", None)
-    if mirrored_requested is None:
-        training_params = getattr(game_state, "mlflow_training_params", None) or {}
-        try:
-            mirror_prob = float(training_params.get("start_template_mirror_prob", 0.5))
-        except Exception:
-            mirror_prob = 0.5
-        mirrored = bool(template.get("mirrorable", False) and float(rng.random()) < mirror_prob)
-    else:
-        mirrored = bool(mirrored_requested) and bool(template.get("mirrorable", False))
-
-    training_params = getattr(game_state, "mlflow_training_params", None) or {}
-    try:
-        jitter_scale = float(training_params.get("start_template_jitter_scale", 1.0))
-    except Exception:
-        jitter_scale = 1.0
-
-    try:
-        resolved = resolve_start_template(
-            env,
-            template,
-            jitter_scale=jitter_scale,
-            mirror=mirrored,
-        )
-    finally:
-        if seed is not None:
-            setattr(env, "_rng", original_rng)
-
-    positions = [
-        (int(pos[0]), int(pos[1]))
-        for pos in list(resolved.get("initial_positions") or [])
-    ]
-    if not positions:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Start template {template_id} did not resolve any positions.",
-        )
-    return (
-        positions,
-        int(resolved["ball_holder"]) if resolved.get("ball_holder") is not None else None,
-        int(resolved["shot_clock"]) if resolved.get("shot_clock") is not None else None,
-        {
-            "template_id": str(resolved.get("template_id") or template_id),
-            "mirrored": bool(resolved.get("mirrored", mirrored)),
-            "source": getattr(game_state, "start_template_library_source", None),
-        },
-    )
-
-
-def _initialize_app_selector_runtime_for_episode() -> None:
-    game_state.selector_segment_index = 0
-    game_state.selector_last_boundary_reason = None
-    _apply_app_segment_start(allow_uniform_fallback=False)
-
-
-def _maybe_apply_app_multisegment_boundary(info: dict | None, done: bool) -> str | None:
-    boundary = maybe_apply_rollout_multisegment_boundary(
-        game_state.env,
-        game_state.obs,
-        info=info,
-        done=bool(done),
-        training_params=getattr(game_state, "mlflow_training_params", None),
-        unified_policy=game_state.unified_policy,
-        opponent_policy=game_state.defense_policy,
-        user_team=game_state.user_team or Team.OFFENSE,
-        role_flag_offense=_role_flag_value_for_team(Team.OFFENSE),
-        selector_segment_index=int(getattr(game_state, "selector_segment_index", 0)),
-    )
-    game_state.obs = boundary.get("obs", game_state.obs)
-    game_state.selector_segment_index = int(
-        boundary.get("selector_segment_index", getattr(game_state, "selector_segment_index", 0))
-    )
-    game_state.selector_last_boundary_reason = boundary.get("reason")
-    return boundary.get("reason")
-
-
 def _run_uses_multi_possession(client, run_id: str) -> bool:
     """Read the lightweight setup-mode flag logged with a training run."""
     try:
@@ -852,8 +685,6 @@ def _run_uses_multi_possession(client, run_id: str) -> bool:
     except Exception as exc:
         print(f"[list_policies] Failed to read run params for {run_id}: {exc}")
         return False
-    # Legacy SB3 training logs the bare CLI argument, while JAX training
-    # namespaces environment parameters under ``jax/env/``.
     return _str_to_bool(
         params.get(
             "jax/env/enable_multi_possession",
@@ -961,74 +792,38 @@ async def init_game(request: InitGameRequest):
             else None
         )
 
-        if get_policy_backend_kind(game_state.unified_policy) == "jax":
-            (
-                required_params,
-                optional_params,
-                mlflow_training_params,
-                mlflow_phi_params,
-            ) = _jax_local_env_config_from_metadata(game_state.unified_policy)
-            policy_metadata = get_policy_metadata(game_state.unified_policy) or {}
-            run_params = {}
-            try:
-                run_params = dict(mlflow_client.get_run(run_id).data.params or {})
-                mlflow_training_params = _overlay_jax_mlflow_training_params(
-                    mlflow_training_params,
-                    run_params,
-                )
-                mlflow_phi_params = get_mlflow_phi_shaping_params(mlflow_client, run_id)
-            except Exception as e:
-                print(f"[init_game] Warning: failed to apply JAX MLflow training params: {e}")
-            try:
-                optional_params = _overlay_jax_mlflow_env_params(optional_params, run_params)
-            except Exception as e:
-                print(f"[init_game] Warning: failed to apply JAX MLflow env params: {e}")
-            (
-                start_template_library,
-                start_template_library_source,
-                start_template_library_path,
-            ) = _resolve_start_template_library_for_init(
-                mlflow_client=mlflow_client,
-                run_id=run_id,
-                mlflow_training_params=mlflow_training_params,
-                previous_library=previous_start_template_library,
-                previous_source=previous_start_template_source,
-                previous_path=previous_start_template_path,
+        (
+            required_params,
+            optional_params,
+            mlflow_training_params,
+            mlflow_phi_params,
+        ) = _jax_local_env_config_from_metadata(game_state.unified_policy)
+        run_params = {}
+        try:
+            run_params = dict(mlflow_client.get_run(run_id).data.params or {})
+            mlflow_training_params = _overlay_jax_mlflow_training_params(
+                mlflow_training_params, run_params
             )
-            if start_template_library is not None:
-                optional_params["start_template_library"] = start_template_library
-                if start_template_library_source == "mlflow_artifact":
-                    mlflow_training_params.setdefault(
-                        "start_template_library_artifact_path",
-                        start_template_library_path or "metadata/start_template_library.json",
-                    )
-            else:
-                # Checkpoint metadata stores the source path for reproducibility,
-                # but the live Python env expects the resolved library dict.
-                optional_params.pop("start_template_library", None)
+            mlflow_phi_params = get_mlflow_phi_shaping_params(mlflow_client, run_id)
+        except Exception as exc:
+            print(f"[init_game] Warning: failed to apply JAX MLflow params: {exc}")
+        optional_params = _overlay_jax_mlflow_env_params(optional_params, run_params)
+        (
+            start_template_library,
+            start_template_library_source,
+            start_template_library_path,
+        ) = _resolve_start_template_library_for_init(
+            mlflow_client=mlflow_client,
+            run_id=run_id,
+            mlflow_training_params=mlflow_training_params,
+            previous_library=previous_start_template_library,
+            previous_source=previous_start_template_source,
+            previous_path=previous_start_template_path,
+        )
+        if start_template_library is not None:
+            optional_params["start_template_library"] = start_template_library
         else:
-            try:
-                required_params, optional_params = get_mlflow_params(mlflow_client, run_id)
-                mlflow_phi_params = get_mlflow_phi_shaping_params(mlflow_client, run_id)
-                mlflow_training_params = get_mlflow_training_params(mlflow_client, run_id)
-            except Exception as e:
-                msg = str(e)
-                if "RESOURCE_DOES_NOT_EXIST" in msg:
-                    raise HTTPException(status_code=404, detail=f"MLflow run not found: {run_id}")
-                raise HTTPException(status_code=500, detail=f"Failed to fetch MLflow params: {e}")
-
-            (
-                start_template_library,
-                start_template_library_source,
-                start_template_library_path,
-            ) = _resolve_start_template_library_for_init(
-                mlflow_client=mlflow_client,
-                run_id=run_id,
-                mlflow_training_params=mlflow_training_params,
-                previous_library=previous_start_template_library,
-                previous_source=previous_start_template_source,
-                previous_path=previous_start_template_path,
-            )
+            optional_params.pop("start_template_library", None)
 
         # Extract role_flag encoding for backward compatibility (not passed to env)
         game_state.role_flag_offense = optional_params.pop("role_flag_offense_value", 1.0)
@@ -1073,50 +868,30 @@ async def init_game(request: InitGameRequest):
         game_state.unified_policy_capabilities = get_policy_capabilities(game_state.unified_policy)
         game_state.defense_policy_capabilities = get_policy_capabilities(game_state.defense_policy)
 
-        if game_state.unified_policy_backend == "jax":
-            env_optional_params, wrapper_only_params = _split_jax_env_and_wrapper_params(
-                optional_params
-            )
-        else:
-            env_optional_params, wrapper_only_params = _split_env_and_wrapper_params(
-                optional_params
-            )
-        use_set_obs = bool(wrapper_only_params.get("use_set_obs", False))
+        env_optional_params, _wrapper_only_params = _split_jax_env_and_wrapper_params(
+            optional_params
+        )
         resolved_user_team = Team[request.user_team_name.upper()]
         game_state.user_team = resolved_user_team
 
-        if game_state.unified_policy_backend == "jax":
-            from app.backend.jax_dev_runtime import JaxDevRuntime
+        from app.backend.jax_dev_runtime import JaxDevRuntime
 
-            game_state.jax_runtime = JaxDevRuntime(
-                required_params=required_params,
-                env_params=env_optional_params,
-                unified_policy=game_state.unified_policy,
-                opponent_policy=game_state.defense_policy,
-                user_team=resolved_user_team,
-                role_flag_offense=game_state.role_flag_offense,
-                role_flag_defense=game_state.role_flag_defense,
-            )
-            # The JAX runtime canonicalizes multi-possession ownership to
-            # Team A / blue.  Persist its resolved value before any state or
-            # observation is created so a jump-ball winner cannot leak into
-            # the player-vs-opponent mapping.
-            resolved_user_team = game_state.jax_runtime.user_team
-            game_state.user_team = resolved_user_team
-            game_state.jax_runtime.reset()
-            game_state.env = game_state.jax_runtime.environment
-            game_state.obs = game_state.jax_runtime.observation_dict(
-                observer_is_offense=resolved_user_team != Team.DEFENSE
-            )
-        else:
-            game_state.jax_runtime = None
-            game_state.env = basketworld.HexagonBasketballEnv(
-                **required_params,
-                **env_optional_params,
-                render_mode="rgb_array",
-            )
-            if use_set_obs:
-                game_state.env = SetObservationWrapper(game_state.env)
+        game_state.jax_runtime = JaxDevRuntime(
+            required_params=required_params,
+            env_params=env_optional_params,
+            unified_policy=game_state.unified_policy,
+            opponent_policy=game_state.defense_policy,
+            user_team=resolved_user_team,
+            role_flag_offense=game_state.role_flag_offense,
+            role_flag_defense=game_state.role_flag_defense,
+        )
+        resolved_user_team = game_state.jax_runtime.user_team
+        game_state.user_team = resolved_user_team
+        game_state.jax_runtime.reset()
+        game_state.env = game_state.jax_runtime.environment
+        game_state.obs = game_state.jax_runtime.observation_dict(
+            observer_is_offense=resolved_user_team != Team.DEFENSE
+        )
 
         def _apply_policy_pass_mode(policy_obj, mode_value: str) -> None:
             if policy_obj is None:
@@ -1138,8 +913,6 @@ async def init_game(request: InitGameRequest):
         _apply_policy_pass_mode(game_state.unified_policy, current_pass_mode)
         _apply_policy_pass_mode(game_state.defense_policy, current_pass_mode)
 
-        if game_state.jax_runtime is None:
-            game_state.obs, _ = game_state.env.reset()
         try:
             game_state.obs = validate_policy_observation_schema(
                 game_state.unified_policy,
@@ -1194,11 +967,8 @@ async def init_game(request: InitGameRequest):
         game_state.replay_session_id = None
         game_state.phi_log = []
         game_state.playable_session = None
-        if game_state.jax_runtime is None:
-            _initialize_app_selector_runtime_for_episode()
-        else:
-            game_state.selector_segment_index = 0
-            game_state.selector_last_boundary_reason = None
+        game_state.selector_segment_index = 0
+        game_state.selector_last_boundary_reason = None
 
         try:
             frame = game_state.env.render()
@@ -1290,115 +1060,80 @@ async def init_game(request: InitGameRequest):
 
 @router.post("/api/template_bootstrap")
 async def template_bootstrap(request: TemplateBootstrapRequest | None = None):
-    """Initialize a model-free sandbox state for template authoring."""
-    global game_state
-
+    """Initialize a JAX sandbox state for template authoring."""
     request = request or TemplateBootstrapRequest()
-    players_per_side = int(max(1, request.players_per_side or 3))
     user_team_name = str(request.user_team_name or "OFFENSE").strip().upper()
     if user_team_name not in {"OFFENSE", "DEFENSE"}:
         raise HTTPException(status_code=400, detail="user_team_name must be OFFENSE or DEFENSE")
 
-    required_params = {"players": players_per_side}
-    env_optional_params = {}
-    mlflow_training_params: dict = {}
-    run_name = "Template Sandbox"
     source_run_id = str(request.run_id or "").strip() or None
+    required_params = {"players": int(max(1, request.players_per_side or 3))}
+    env_optional_params: dict = {}
+    training_params: dict = {}
+    policy = None
+    policy_path = None
+    run_name = "Template Sandbox"
 
     if source_run_id:
-        try:
-            setup_mlflow(verbose=False)
-        except Exception as setup_err:
-            print(f"[template_bootstrap] MLflow setup warning: {setup_err}")
-
-        mlflow_client = mlflow.tracking.MlflowClient()
-        try:
-            required_params, optional_params = get_mlflow_params(mlflow_client, source_run_id)
-            mlflow_training_params = get_mlflow_training_params(
-                mlflow_client, source_run_id
-            )
-        except Exception as e:
-            msg = str(e)
-            if "RESOURCE_DOES_NOT_EXIST" in msg:
-                raise HTTPException(status_code=404, detail=f"MLflow run not found: {source_run_id}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to fetch MLflow params for template sandbox: {e}",
-            )
-
-        env_optional_params, _wrapper_only_params = _split_env_and_wrapper_params(optional_params)
-        game_state.mlflow_start_template_library = _load_start_template_library_for_run(
-            mlflow_client, source_run_id
+        setup_mlflow(verbose=False)
+        client = mlflow.tracking.MlflowClient()
+        policy_path = get_unified_policy_path(client, source_run_id, None)
+        policy = load_inference_policy(policy_path, device="cpu")
+        required_params, env_optional_params, training_params, _ = (
+            _jax_local_env_config_from_metadata(policy)
         )
-        if game_state.mlflow_start_template_library is not None:
-            game_state.start_template_library_source = "mlflow_artifact"
-            game_state.start_template_library_path = str(
-                mlflow_training_params.get(
-                    "start_template_library_artifact_path",
-                    "metadata/start_template_library.json",
-                )
-            )
-        else:
-            game_state.start_template_library_source = None
-            game_state.start_template_library_path = None
-        if request.allow_dunks is not None:
-            env_optional_params["allow_dunks"] = bool(request.allow_dunks)
+        run_params = dict(client.get_run(source_run_id).data.params or {})
+        env_optional_params = _overlay_jax_mlflow_env_params(
+            env_optional_params, run_params
+        )
+        training_params = _overlay_jax_mlflow_training_params(
+            training_params, run_params
+        )
+        game_state.mlflow_start_template_library = _load_start_template_library_for_run(
+            client, source_run_id
+        )
         run_name = f"Template Sandbox ({source_run_id})"
-    elif request.allow_dunks is not None:
-        env_optional_params["allow_dunks"] = bool(request.allow_dunks)
-        game_state.mlflow_start_template_library = None
-        game_state.start_template_library_source = None
-        game_state.start_template_library_path = None
     else:
         game_state.mlflow_start_template_library = None
-        game_state.start_template_library_source = None
-        game_state.start_template_library_path = None
 
-    game_state.unified_policy = None
+    if request.allow_dunks is not None:
+        env_optional_params["allow_dunks"] = bool(request.allow_dunks)
+
+    from app.backend.jax_dev_runtime import JaxDevRuntime
+
+    game_state.unified_policy = policy
     game_state.offense_policy = None
     game_state.defense_policy = None
-    game_state.unified_policy_key = None
+    game_state.unified_policy_key = os.path.basename(policy_path) if policy_path else None
     game_state.opponent_unified_policy_key = None
-    game_state.unified_policy_backend = None
+    game_state.unified_policy_backend = "jax" if policy is not None else None
     game_state.defense_policy_backend = None
-    game_state.unified_policy_capabilities = None
+    game_state.unified_policy_capabilities = get_policy_capabilities(policy)
     game_state.defense_policy_capabilities = None
-    game_state.unified_policy_path = None
+    game_state.unified_policy_path = policy_path
     game_state.opponent_policy_path = None
-
-    env_kwargs = {
-        **required_params,
-        **env_optional_params,
-        "render_mode": "rgb_array",
-    }
-
-    game_state.jax_runtime = None
-    game_state.env = basketworld.HexagonBasketballEnv(**env_kwargs)
-    game_state.obs, _ = game_state.env.reset()
+    game_state.user_team = Team[user_team_name]
+    game_state.jax_runtime = JaxDevRuntime(
+        required_params=required_params,
+        env_params=env_optional_params,
+        unified_policy=policy,
+        opponent_policy=None,
+        user_team=game_state.user_team,
+    )
+    game_state.jax_runtime.reset()
+    game_state.env = game_state.jax_runtime.environment
+    game_state.obs = game_state.jax_runtime.observation_dict(
+        observer_is_offense=game_state.jax_runtime.user_team_is_a
+    )
+    game_state.user_team = game_state.jax_runtime.user_team
     game_state.prev_obs = None
-
-    env_read = env_view(game_state.env)
-    sampled_skills = {
-        "layup": list(env_read.offense_layup_pct_by_player or []),
-        "three_pt": list(env_read.offense_three_pt_pct_by_player or []),
-        "dunk": list(env_read.offense_dunk_pct_by_player or []),
-    }
-    game_state.replay_offense_skills = copy.deepcopy(sampled_skills)
-    game_state.sampled_offense_skills = copy.deepcopy(sampled_skills)
-
     game_state.env_required_params = copy.deepcopy(required_params)
     game_state.env_optional_params = copy.deepcopy(env_optional_params)
-    if "allow_dunks" not in game_state.env_optional_params:
-        game_state.env_optional_params["allow_dunks"] = bool(getattr(env_read, "allow_dunks", False))
-    game_state.mlflow_env_optional_defaults = copy.deepcopy(game_state.env_optional_params)
-
-    _capture_turn_start_snapshot()
-
-    game_state.user_team = Team[user_team_name]
+    game_state.mlflow_env_optional_defaults = copy.deepcopy(env_optional_params)
     game_state.run_id = source_run_id
     game_state.run_name = run_name
+    game_state.mlflow_training_params = training_params
     game_state.mlflow_phi_shaping_params = None
-    game_state.mlflow_training_params = mlflow_training_params
     game_state.counterfactual_snapshot = None
     game_state.frames = []
     game_state.reward_history = []
@@ -1410,21 +1145,9 @@ async def template_bootstrap(request: TemplateBootstrapRequest | None = None):
     game_state.playable_session = None
     game_state.selector_segment_index = 0
     game_state.selector_last_boundary_reason = None
-
-    try:
-        frame = game_state.env.render()
-        if frame is not None:
-            game_state.frames.append(frame)
-    except Exception:
-        pass
-
-    initial_state = get_full_game_state(
-        include_policy_probs=False,
-        include_action_values=False,
-        include_state_values=True,
-    )
+    _capture_turn_start_snapshot()
+    initial_state = get_ui_game_state()
     game_state.episode_states.append(initial_state)
-
     return {
         "status": "success",
         "state": initial_state,
@@ -1489,494 +1212,28 @@ def _normalize_action_overrides(raw_actions, n_players: int) -> tuple[dict[int, 
 
 @router.post("/api/step")
 def step(request: ActionRequest):
-    """Takes a single step in the environment (restored full behavior from pre-refactor)."""
-    if getattr(game_state, "jax_runtime", None) is not None:
-        try:
-            return game_state.jax_runtime.step(request, game_state)
-        except ValueError as err:
-            raise HTTPException(status_code=400, detail=str(err))
-        except Exception as err:
-            import traceback
-
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail=f"JAX runtime step failed: {err}")
-
-    if not game_state.env or game_state.obs is None:
-        raise HTTPException(status_code=400, detail="Game not initialized.")
-
-    user_team = game_state.user_team or Team.OFFENSE
-    ai_obs = game_state.obs
-    mcts_results: dict[str, dict] = {}
-    env_read = env_view(game_state.env)
-
-    player_deterministic = True if request.player_deterministic is None else bool(request.player_deterministic)
-    opponent_deterministic = True if request.opponent_deterministic is None else bool(request.opponent_deterministic)
-
-    rollout_actions = predict_joint_policy_actions(
-        unified_policy=game_state.unified_policy,
-        opponent_policy=game_state.defense_policy,
-        obs=ai_obs,
-        env=game_state.env,
-        player_deterministic=player_deterministic,
-        opponent_deterministic=opponent_deterministic,
-        role_flag_offense=game_state.role_flag_offense,
-        role_flag_defense=game_state.role_flag_defense,
-    )
-    resolved_unified = rollout_actions["resolved_unified"]
-    unified_probs = rollout_actions["unified_probs"]
-    resolved_opponent = rollout_actions["resolved_opponent"]
-    opponent_probs = rollout_actions["opponent_probs"]
-
-    if request.use_mcts:
-        try:
-            target_pids: list[int] = []
-            if request.mcts_player_ids:
-                target_pids = [int(pid) for pid in request.mcts_player_ids if pid is not None]
-            elif request.mcts_player_id is not None:
-                target_pids = [int(request.mcts_player_id)]
-            else:
-                default_pid = env_read.ball_holder
-                target_pids = [int(default_pid) if default_pid is not None else 0]
-
-            if not target_pids:
-                target_pids = [0]
-
-            unique_targets: list[int] = []
-            for pid in target_pids:
-                if pid not in unique_targets:
-                    unique_targets.append(pid)
-
-            for target_pid in unique_targets:
-                result = _run_mcts_advisor(
-                    player_id=target_pid,
-                    obs=ai_obs,
-                    env=game_state.env,
-                    max_depth=request.mcts_max_depth,
-                    time_budget_ms=request.mcts_time_budget_ms,
-                    exploration_c=request.mcts_exploration_c,
-                    use_priors=request.mcts_use_priors,
-                )
-                mcts_results[str(target_pid)] = result
-                best_action = result.get("action") if isinstance(result, dict) else None
-                if best_action is not None:
-                    if resolved_unified is None:
-                        resolved_unified = np.zeros(int(env_read.n_players or 0), dtype=int)
-                    if target_pid in (env_read.offense_ids or []):
-                        resolved_unified[target_pid] = int(best_action)
-                    elif resolved_opponent is not None:
-                        resolved_opponent[target_pid] = int(best_action)
-                    else:
-                        resolved_unified[target_pid] = int(best_action)
-        except Exception as err:
-            print(f"[MCTS] Failed to run advisor inside step: {err}")
-
-    action_mask = ai_obs.get("action_mask") if isinstance(ai_obs, dict) else None
-    if action_mask is None:
-        action_mask = np.ones((int(env_read.n_players or 0), len(ActionType)), dtype=int)
-
-    # Combine user and AI actions, then apply any explicit per-player overrides.
-    full_action = combine_team_actions(
-        env=game_state.env,
-        user_team=user_team,
-        resolved_unified=resolved_unified,
-        resolved_opponent=resolved_opponent,
-    )
-    overrides, action_meta = _normalize_action_overrides(
-        request.actions,
-        int(env_read.n_players or 0),
-    )
-
-    pointer_targets: dict[int, int] = {}
-    for pid, meta in action_meta.items():
-        if str(meta.get("type", "")).upper() != "PASS":
-            continue
-        try:
-            pointer_targets[int(pid)] = int(meta.get("target"))
-        except Exception:
-            continue
-    set_pointer_pass_targets = env_read.set_pointer_pass_targets
-    if set_pointer_pass_targets is not None:
-        set_pointer_pass_targets(pointer_targets)
-
-    for i in range(int(env_read.n_players or 0)):
-        if i in overrides:
-            proposed = overrides[i]
-            try:
-                if proposed is not None and proposed >= 0 and proposed < len(action_mask[i]) and action_mask[i][proposed] == 1:
-                    full_action[i] = proposed
-                else:
-                    full_action[i] = 0
-            except Exception:
-                full_action[i] = 0
-            continue
-
-        full_action[i] = int(full_action[i])
-
-    # Pre-step state values (guard when unified policy missing)
-    pre_step_offensive_value = None
-    pre_step_defensive_value = None
-    if game_state.unified_policy is not None:
-        try:
-            offense_ids = list(env_read.offense_ids or [])
-            defense_ids = list(env_read.defense_ids or [])
-
-            if offense_ids and unified_probs is not None:
-                offense_rep = (
-                    env_read.ball_holder
-                    if env_read.ball_holder in offense_ids
-                    else offense_ids[0]
-                )
-                offense_q_values = _compute_q_values_for_player(offense_rep, game_state)
-                offense_probs = unified_probs
-                pre_step_offensive_value = sum(
-                    offense_probs[offense_rep][i] * offense_q_values.get(ActionType(i).name, 0.0)
-                    for i in range(len(offense_probs[offense_rep]))
-                )
-
-            if defense_ids and unified_probs is not None:
-                defense_rep = defense_ids[0]
-                defense_q_values = _compute_q_values_for_player(defense_rep, game_state)
-                defense_probs = unified_probs
-                pre_step_defensive_value = sum(
-                    defense_probs[defense_rep][i] * defense_q_values.get(ActionType(i).name, 0.0)
-                    for i in range(len(defense_probs[defense_rep]))
-                )
-        except Exception as e:
-            print(f"[WARNING] Failed to calculate pre-step state values: {e}")
-
-    game_state.prev_obs = game_state.obs
-    game_state.obs, rewards, done, _, info = game_state.env.step(full_action)
-    _maybe_apply_app_multisegment_boundary(
-        info if isinstance(info, dict) else None,
-        bool(done),
-    )
-
+    """Advance the active JAX runtime by one interactive step."""
+    runtime = getattr(game_state, "jax_runtime", None)
+    if runtime is None:
+        raise HTTPException(status_code=400, detail="Game not initialized with a JAX checkpoint.")
     try:
-        game_state.actions_log.append([int(a) for a in full_action.tolist()])
-    except Exception:
-        game_state.actions_log.append([int(a) for a in list(full_action)])
-
-    if isinstance(rewards, np.ndarray):
-        rewards_list = rewards.tolist()
-    elif isinstance(rewards, (list, tuple)):
-        rewards_list = list(rewards)
-    else:
-        rewards_list = [rewards]
-
-    if len(rewards_list) > 1:
-        step_rewards = {"offense": 0.0, "defense": 0.0}
-        for i, reward in enumerate(rewards_list):
-            if i in (env_read.offense_ids or []):
-                team_key = "offense"
-            elif i in (env_read.defense_ids or []):
-                team_key = "defense"
-            else:
-                continue
-            step_rewards[team_key] += float(reward)
-            game_state.episode_rewards[team_key] += float(reward)
-    else:
-        step_rewards = {"offense": float(rewards_list[0]), "defense": 0.0}
-        game_state.episode_rewards["offense"] += float(rewards_list[0])
-
-    offense_reasons: list[str] = []
-    defense_reasons: list[str] = []
-    action_results = info.get("action_results", {}) if info else {}
-
-    if action_results.get("shots"):
-        for pid, shot_res in action_results["shots"].items():
-            try:
-                pid_int = int(pid)
-            except Exception:
-                pid_int = pid
-            dist_at_shot = int(shot_res.get("distance", 0))
-            is_three = bool(
-                shot_res.get("is_three")
-                if "is_three" in shot_res
-                else dist_at_shot >= getattr(game_state.env, "three_point_distance", dist_at_shot)
-            )
-            game_state.shot_log.append(
-                {
-                    "step": int(len(game_state.reward_history) + 1),
-                    "player_id": int(pid_int),
-                    "distance": dist_at_shot,
-                    "probability": float(shot_res.get("probability", 0.0)),
-                    "success": bool(shot_res.get("success", False)),
-                    "is_three": is_three,
-                    "rng": float(shot_res.get("rng", -1.0)),
-                    "base_probability": float(shot_res.get("base_probability", -1.0)),
-                    "pressure_multiplier": float(shot_res.get("pressure_multiplier", -1.0)),
-                    "expected_points": float(shot_res.get("expected_points", 0.0)),
-                    "shooter_fg_pct": float(shot_res.get("probability", 0.0)),
-                }
-            )
-
-    if action_results.get("shots"):
-        for _, shot_result in action_results["shots"].items():
-            ep_val = float(shot_result.get("expected_points", 0.0))
-            ep_str = f"{ep_val:.2f}"
-            if shot_result.get("success"):
-                offense_reasons.append(f"Shot Make (EP={ep_str})")
-                defense_reasons.append(f"Opp Shot (EP={ep_str})")
-            else:
-                offense_reasons.append(f"Shot Miss (EP={ep_str})")
-                defense_reasons.append(f"Opp Shot (EP={ep_str})")
-
-    if action_results.get("passes"):
-        successful_passes = 0
-        for _, pass_result in action_results["passes"].items():
-            if pass_result.get("success"):
-                successful_passes += 1
-        if successful_passes > 0:
-            if successful_passes == 1:
-                offense_reasons.append("Pass")
-                defense_reasons.append("Opp Pass")
-            else:
-                offense_reasons.append(f"{successful_passes} Passes")
-                defense_reasons.append(f"Opp {successful_passes} Passes")
-
-    if action_results.get("turnovers"):
-        for turnover_info in action_results["turnovers"]:
-            reason = turnover_info.get("reason", "Unknown")
-            if reason == "out_of_bounds":
-                offense_reasons.append("TO - OOB")
-                defense_reasons.append("Forced TO - OOB")
-            elif reason == "pressure":
-                offense_reasons.append("TO - Pressure")
-                defense_reasons.append("Forced TO - Pressure")
-            elif reason == "steal":
-                offense_reasons.append("TO - Steal")
-                defense_reasons.append("Forced TO - Steal")
-            else:
-                offense_reasons.append(f"TO - {reason}")
-                defense_reasons.append(f"Forced TO - {reason}")
-
-    if action_results.get("moves"):
-        for player_id, move_result in action_results["moves"].items():
-            if not move_result.get("success", True) and move_result.get("reason") == "out_of_bounds":
-                if player_id in (env_read.offense_ids or []):
-                    offense_reasons.append("OOB Move")
-                    defense_reasons.append("Opp OOB")
-                else:
-                    defense_reasons.append("OOB Move")
-                    offense_reasons.append("Opp OOB")
-
-    off_reward = step_rewards["offense"]
-    def_reward = step_rewards["defense"]
-    if not offense_reasons and not defense_reasons:
-        if abs(off_reward) < 0.001 and abs(def_reward) < 0.001:
-            offense_reasons.append("None")
-            defense_reasons.append("None")
-        else:
-            offense_reasons.append("Positive" if off_reward > 0 else "Negative" if off_reward < 0 else "None")
-            defense_reasons.append("Positive" if def_reward > 0 else "Negative" if def_reward < 0 else "None")
-
-    phi_r_shape_per_team = float(info.get("phi_r_shape", 0.0)) if info else 0.0
-    ep_by_player = []
-    if info and "phi_ep_by_player" in info:
-        try:
-            ep_by_player = [float(x) for x in info.get("phi_ep_by_player", [])]
-        except Exception:
-            ep_by_player = []
-
-    if not ep_by_player and game_state.env:
-        try:
-            env = getattr(game_state.env, "unwrapped", game_state.env)
-            for pid in range(getattr(env, "n_players", 0)):
-                pos = getattr(env, "positions", [])[pid] if pid < len(getattr(env, "positions", [])) else (0, 0)
-                dist = env._hex_distance(pos, getattr(env, "basket_position", (0, 0))) if hasattr(env, "_hex_distance") else 0
-                is_three = env.is_three_point_location(pos) if hasattr(env, "is_three_point_location") else False
-                if getattr(env, "allow_dunks", False) and dist == 0:
-                    shot_value = 2.0
-                else:
-                    shot_value = 3.0 if is_three else 2.0
-                p = float(env._calculate_shot_probability(pid, dist)) if hasattr(env, "_calculate_shot_probability") else 0.0
-                ep_by_player.append(float(shot_value * p))
-        except Exception as e:
-            print(f"[WARNING] Failed to calculate EP data: {e}")
-            ep_by_player = []
-
-    env_read = env_view(game_state.env)
-    game_state.reward_history.append(
-        {
-            "step": len(game_state.reward_history) + 1,
-            "offense": float(step_rewards["offense"]),
-            "defense": float(step_rewards["defense"]),
-            "offense_reason": ", ".join(offense_reasons) if offense_reasons else "None",
-            "defense_reason": ", ".join(defense_reasons) if defense_reasons else "None",
-            "phi_r_shape": phi_r_shape_per_team,
-            "ep_by_player": ep_by_player,
-            "ball_handler": (
-                int(env_read.ball_holder)
-                if env_read.ball_holder is not None
-                else -1
-            ),
-            "offense_ids": list(env_read.offense_ids or []),
-            "is_terminal": bool(done),
-            "shot_clock": int(env_read.shot_clock or -1),
-        }
-    )
-
-    try:
-        entry = {
-            "step": int(len(game_state.reward_history)),
-            "phi_prev": float(info.get("phi_prev", -1.0)) if info else -1.0,
-            "phi_next": float(info.get("phi_next", -1.0)) if info else -1.0,
-            "phi_beta": float(info.get("phi_beta", -1.0)) if info else -1.0,
-            "phi_r_shape": float(info.get("phi_r_shape", 0.0)) if info else 0.0,
-            "ball_handler": (
-                int(env_read.ball_holder)
-                if env_read.ball_holder is not None
-                else -1
-            ),
-            "offense_ids": list(env_read.offense_ids or []),
-            "defense_ids": list(env_read.defense_ids or []),
-            "shot_clock": int(env_read.shot_clock or -1),
-            "is_terminal": bool(done),
-        }
-        if info and "phi_ep_by_player" in info:
-            try:
-                ep_list = list(info.get("phi_ep_by_player", []))
-                entry["ep_by_player"] = [float(x) for x in ep_list]
-            except Exception:
-                entry["ep_by_player"] = []
-        if info and "phi_team_best_ep" in info:
-            entry["team_best_ep"] = float(info.get("phi_team_best_ep", -1.0))
-        if info and "phi_ball_handler_ep" in info:
-            entry["ball_handler_ep"] = float(info.get("phi_ball_handler_ep", -1.0))
-        game_state.phi_log.append(entry)
-    except Exception:
-        pass
-
-    try:
-        frame = game_state.env.render()
-        if frame is not None:
-            game_state.frames.append(frame)
-    except Exception as e:
-        print(f"Warning: Failed to capture frame at step {len(game_state.frames)}: {e}")
-
-    action_names = [a.name for a in ActionType]
-    actions_taken = {}
-    actions_taken_meta = {}
-    for pid, act_idx in enumerate(full_action):
-        action_name = action_names[act_idx] if act_idx < len(action_names) else "UNKNOWN"
-        actions_taken[str(pid)] = action_name
-        actions_taken_meta[str(pid)] = {"type": action_name}
-
-    env_read = env_view(game_state.env)
-    is_pointer_mode = str(env_read.pass_mode or "directional").lower() == "pointer_targeted"
-    if is_pointer_mode:
-        for pid, act_idx in enumerate(full_action):
-            action_name = action_names[act_idx] if act_idx < len(action_names) else "UNKNOWN"
-            if not str(action_name).startswith("PASS"):
-                continue
-
-            intended_target = None
-            meta = action_meta.get(pid)
-            if isinstance(meta, dict) and str(meta.get("type", "")).upper() == "PASS":
-                try:
-                    intended_target = int(meta.get("target"))
-                except Exception:
-                    intended_target = None
-
-            if intended_target is None:
-                pass_entry = action_results.get("passes", {}).get(pid)
-                if pass_entry is None:
-                    pass_entry = action_results.get("passes", {}).get(str(pid))
-                if isinstance(pass_entry, dict):
-                    raw_target = pass_entry.get("intended_target")
-                    if raw_target is None:
-                        raw_target = pass_entry.get("target")
-                    try:
-                        intended_target = int(raw_target)
-                    except Exception:
-                        intended_target = None
-
-            if intended_target is None:
-                for turnover in action_results.get("turnovers", []):
-                    try:
-                        turnover_pid = int(turnover.get("player_id"))
-                    except Exception:
-                        continue
-                    if turnover_pid != int(pid):
-                        continue
-                    raw_target = turnover.get("intended_target")
-                    if raw_target is None:
-                        raw_target = turnover.get("pass_target")
-                    try:
-                        intended_target = int(raw_target)
-                    except Exception:
-                        intended_target = None
-                    break
-
-            if intended_target is not None:
-                actions_taken_meta[str(pid)] = {
-                    "type": "PASS",
-                    "target": intended_target,
-                }
-            else:
-                actions_taken_meta[str(pid)] = {"type": "PASS"}
-
-    state_with_policy = {}
-    try:
-        state_with_policy = get_ui_game_state()
-        state_with_policy["actions_taken"] = actions_taken
-        state_with_policy["actions_taken_meta"] = actions_taken_meta
-        game_state.episode_states.append(dict(state_with_policy))
-    except Exception as e:
-        print(f"[get_full_game_state] Failed to capture episode state: {e}")
-
-    _capture_turn_start_snapshot()
-    if game_state.self_play_active and done:
-        game_state.self_play_active = False
-
-    return {
-        "status": "success",
-        "state": state_with_policy,
-        "actions_taken": actions_taken,
-        "actions_taken_meta": actions_taken_meta,
-        "step_rewards": {
-            "offense": float(step_rewards["offense"]),
-            "defense": float(step_rewards["defense"]),
-        },
-        "episode_rewards": {
-            "offense": float(game_state.episode_rewards["offense"]),
-            "defense": float(game_state.episode_rewards["defense"]),
-        },
-        "pre_step_state_values": {
-            "offensive_value": float(pre_step_offensive_value) if pre_step_offensive_value is not None else None,
-            "defensive_value": float(pre_step_defensive_value) if pre_step_defensive_value is not None else None,
-        },
-        "mcts": jsonable_encoder(mcts_results) if mcts_results else None,
-    }
+        return jsonable_encoder(
+            runtime.step(request, game_state),
+            custom_encoder={
+                np.ndarray: lambda value: value.tolist(),
+                np.generic: lambda value: value.item(),
+            },
+        )
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+    except Exception as err:
+        raise HTTPException(status_code=500, detail=f"JAX runtime step failed: {err}") from err
 
 
 @router.post("/api/action")
 def action(request: ActionRequest):
     # Backward-compatible alias
     return step(request)
-
-
-@router.post("/api/mcts_advise")
-def mcts_advise(request: MCTSAdviseRequest):
-    """Return an MCTS-recommended action without advancing the environment."""
-    if not game_state.env or game_state.obs is None:
-        raise HTTPException(status_code=400, detail="Game not initialized.")
-
-    try:
-        advice = _run_mcts_advisor(
-            player_id=request.player_id,
-            obs=game_state.obs,
-            env=game_state.env,
-            max_depth=request.max_depth,
-            time_budget_ms=request.time_budget_ms,
-            exploration_c=request.exploration_c,
-            use_priors=request.use_priors,
-        )
-        return {"status": "success", "advice": jsonable_encoder(advice)}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"MCTS failed: {e}")
 
 
 @router.post("/api/rebound_preview")
@@ -2075,190 +1332,27 @@ def set_multi_possession_limit(request: SetMultiPossessionLimitRequest):
 
 @router.post("/api/start_self_play")
 def start_self_play(request: StartSelfPlayRequest | None = None):
-    """Prepare deterministic self-play by resetting with current initial conditions and a fixed seed."""
-    request = request or StartSelfPlayRequest()
-    if getattr(game_state, "jax_runtime", None) is not None:
-        try:
-            return game_state.jax_runtime.start_self_play(request, game_state)
-        except ValueError as err:
-            raise HTTPException(status_code=400, detail=str(err))
-        except Exception as err:
-            import traceback
-
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail=f"JAX runtime self-play reset failed: {err}")
-
-    if not game_state.env:
-        raise HTTPException(status_code=400, detail="Game not initialized.")
-
-    env_read = env_view(game_state.env)
-    base_env = getattr(game_state.env, "unwrapped", game_state.env)
-    init_positions = [(int(q), int(r)) for (q, r) in env_read.positions]
-    init_ball_holder = (
-        int(env_read.ball_holder) if env_read.ball_holder is not None else None
-    )
-    init_shot_clock = int(env_read.shot_clock or 24)
-    template_metadata = None
-    template_positions, template_ball_holder, template_shot_clock, template_metadata = (
-        _resolve_self_play_start_template(request)
-    )
-    if template_positions:
-        init_positions = template_positions
-        if template_ball_holder is not None:
-            init_ball_holder = int(template_ball_holder)
-        if template_shot_clock is not None:
-            init_shot_clock = int(template_shot_clock)
-    preserved_intent_state = None
-    if bool(getattr(base_env, "intent_active", False)):
-        preserved_intent_state = {
-            "intent_index": int(getattr(base_env, "intent_index", 0) or 0),
-            "intent_age": int(getattr(base_env, "intent_age", 0) or 0),
-            "intent_commitment_remaining": int(
-                getattr(base_env, "intent_commitment_remaining", 0) or 0
-            ),
-        }
-
-    import numpy as _np
-
-    episode_seed = int(_np.random.SeedSequence().entropy % (2**32 - 1))
-
-    game_state.replay_seed = episode_seed
-    game_state.replay_initial_positions = init_positions
-    game_state.replay_ball_holder = init_ball_holder
-    game_state.replay_shot_clock = init_shot_clock
-    game_state.actions_log = []
-    game_state.self_play_active = True
-    game_state.frames = []
-    game_state.reward_history = []
-    game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
-    game_state.episode_states = []
-    if game_state.replay_offense_skills is None:
-        game_state.replay_offense_skills = {
-            "layup": list(game_state.env.offense_layup_pct_by_player),
-            "three_pt": list(game_state.env.offense_three_pt_pct_by_player),
-            "dunk": list(game_state.env.offense_dunk_pct_by_player),
-        }
-    if game_state.sampled_offense_skills is None and game_state.replay_offense_skills is not None:
-        game_state.sampled_offense_skills = copy.deepcopy(game_state.replay_offense_skills)
-
-    options = {
-        "initial_positions": init_positions,
-        "ball_holder": init_ball_holder,
-        "shot_clock": init_shot_clock,
-        "offense_skills": game_state.replay_offense_skills,
-    }
-    game_state.obs, _ = game_state.env.reset(seed=episode_seed, options=options)
-    game_state.prev_obs = None
-    game_state.selector_segment_index = 0
-    game_state.selector_last_boundary_reason = None
-    if preserved_intent_state is not None:
-        reset_base_env = getattr(game_state.env, "unwrapped", game_state.env)
-        setter = getattr(reset_base_env, "set_offense_intent_state", None)
-        if callable(setter):
-            setter(
-                int(preserved_intent_state["intent_index"]),
-                intent_active=True,
-                intent_age=int(preserved_intent_state["intent_age"]),
-                intent_commitment_remaining=int(
-                    preserved_intent_state["intent_commitment_remaining"]
-                ),
-            )
-        else:
-            reset_base_env.intent_active = True
-            reset_base_env.intent_index = int(preserved_intent_state["intent_index"])
-            reset_base_env.intent_age = int(preserved_intent_state["intent_age"])
-            reset_base_env.intent_commitment_remaining = int(
-                preserved_intent_state["intent_commitment_remaining"]
-            )
-        game_state.obs = rebuild_observation_from_env(
-            game_state.env,
-            current_obs=game_state.obs,
-        )
-        game_state.obs = validate_policy_observation_schema(
-            game_state.unified_policy,
-            game_state.env,
-            game_state.obs,
-            policy_label="unified_policy",
-        )
-    else:
-        _initialize_app_selector_runtime_for_episode()
-    _capture_turn_start_snapshot()
-
+    """Start self-play on the active JAX runtime."""
+    runtime = getattr(game_state, "jax_runtime", None)
+    if runtime is None:
+        raise HTTPException(status_code=400, detail="Game not initialized with a JAX checkpoint.")
     try:
-        frame = game_state.env.render()
-        if frame is not None:
-            game_state.frames.append(frame)
-    except Exception:
-        pass
-
-    initial_state = get_ui_game_state()
-    game_state.episode_states.append(initial_state)
-
-    return {
-        "status": "success",
-        "state": get_ui_game_state(),
-        "seed": episode_seed,
-        "start_template": template_metadata,
-    }
+        return runtime.start_self_play(request, game_state)
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+    except Exception as err:
+        raise HTTPException(status_code=500, detail=f"Failed to start JAX self-play: {err}") from err
 
 
 @router.post("/api/reset_turn_state")
 def reset_turn_state():
-    """Restore positions/ball holder/shot clock to the start-of-turn snapshot."""
-    if getattr(game_state, "jax_runtime", None) is not None:
-        try:
-            return game_state.jax_runtime.reset_turn_state(game_state)
-        except ValueError as err:
-            raise HTTPException(status_code=400, detail=str(err))
-        except Exception as err:
-            import traceback
-
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail=f"Failed to reset JAX turn: {err}")
-
-    if not game_state.env or game_state.obs is None:
-        raise HTTPException(status_code=400, detail="Game not initialized.")
-    if not game_state.turn_start_positions:
-        raise HTTPException(status_code=400, detail="No turn snapshot available.")
-
-    env = game_state.env
+    """Restore the active JAX runtime to the beginning of the turn."""
+    runtime = getattr(game_state, "jax_runtime", None)
+    if runtime is None:
+        raise HTTPException(status_code=400, detail="Game not initialized with a JAX checkpoint.")
     try:
-        for idx, pos in enumerate(game_state.turn_start_positions):
-            if idx < len(env.positions):
-                env.positions[idx] = (int(pos[0]), int(pos[1]))
-        env.ball_holder = (
-            int(game_state.turn_start_ball_holder)
-            if game_state.turn_start_ball_holder is not None
-            else None
-        )
-        if game_state.turn_start_shot_clock is not None:
-            env.shot_clock = int(game_state.turn_start_shot_clock)
-
-        role_value = (
-            float(np.asarray(game_state.obs.get("role_flag"), dtype=np.float32).reshape(-1)[0])
-            if game_state.obs is not None and game_state.obs.get("role_flag") is not None
-            else (1.0 if env.training_team == Team.OFFENSE else -1.0)
-        )
-        observer_is_offense = bool(role_value > 0.0)
-        if hasattr(env, "_build_observation_dict"):
-            new_obs_dict = env._build_observation_dict(observer_is_offense)
-            new_obs_dict["role_flag"] = np.array([role_value], dtype=np.float32)
-        else:
-            new_obs_dict = {
-                "obs": env._get_observation(),
-                "action_mask": env._get_action_masks(),
-                "role_flag": np.array([role_value], dtype=np.float32),
-                "skills": env._get_offense_skills_array(),
-            }
-        game_state.obs = new_obs_dict
-        game_state.prev_obs = None
-
-        return {
-            "status": "success",
-            "state": get_ui_game_state(),
-        }
-    except Exception as e:
-        import traceback
-
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to reset turn: {e}")
+        return runtime.reset_turn_state(game_state)
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+    except Exception as err:
+        raise HTTPException(status_code=500, detail=f"Failed to reset JAX turn state: {err}") from err

@@ -1,8 +1,4 @@
-"""Dependency-neutral BasketWorld domain types.
-
-This module intentionally imports no environment, rendering, training, or ML
-framework. JAX and legacy adapters may both depend on these stable values.
-"""
+"""Dependency-neutral BasketWorld domain types shared by the JAX stack."""
 
 from __future__ import annotations
 

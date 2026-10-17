@@ -6,7 +6,5 @@ imageio
 imageio-ffmpeg>=0.6.0
 pillow
 mlflow
-stable-baselines3
-torch
 boto3
 -e ../..

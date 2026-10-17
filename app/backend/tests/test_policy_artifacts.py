@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+from fastapi import HTTPException
+
 from app.backend.policies import get_unified_policy_path, list_policies_from_run
 
 
@@ -76,7 +79,7 @@ def test_get_unified_policy_path_prefers_tagged_latest_jax_checkpoint():
     assert local_path.endswith("update_0000100")
 
 
-def test_get_unified_policy_path_still_resolves_latest_sb3_zip():
+def test_list_policies_ignores_retired_zip_artifacts():
     client = _FakeMlflowClient(
         {
             "models": [
@@ -86,15 +89,10 @@ def test_get_unified_policy_path_still_resolves_latest_sb3_zip():
         }
     )
 
-    local_path = get_unified_policy_path(client, "run-2", None)
-
-    assert client.download_calls == [
-        ("run-2", "models/unified_policy_200.zip", "episodes/_policy_cache")
-    ]
-    assert local_path.endswith("unified_policy_200.zip")
+    assert list_policies_from_run(client, "run-2") == []
 
 
-def test_get_unified_policy_path_maps_sb3_checkpoint_name_to_jax_update():
+def test_get_unified_policy_path_rejects_retired_checkpoint_name():
     client = _FakeMlflowClient(
         {
             "models": [
@@ -104,12 +102,9 @@ def test_get_unified_policy_path_maps_sb3_checkpoint_name_to_jax_update():
         }
     )
 
-    local_path = get_unified_policy_path(client, "run-3", "unified_iter_200.zip")
-
-    assert client.download_calls == [
-        ("run-3", "models/update_0000200", "episodes/_policy_cache")
-    ]
-    assert local_path.endswith("update_0000200")
+    with pytest.raises(HTTPException, match="JAX checkpoint artifact not found"):
+        get_unified_policy_path(client, "run-3", "unified_iter_200.zip")
+    assert client.download_calls == []
 
 
 def test_get_unified_policy_path_maps_jax_update_alias_to_padded_artifact():
@@ -128,4 +123,3 @@ def test_get_unified_policy_path_maps_jax_update_alias_to_padded_artifact():
         ("run-4", "models/update_0000150", "episodes/_policy_cache")
     ]
     assert local_path.endswith("update_0000150")
-

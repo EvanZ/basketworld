@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import inspect
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,8 +9,8 @@ import pytest
 jax = pytest.importorskip("jax")
 import jax.numpy as jnp
 
-from basketworld.envs.basketworld_env_v2 import HexagonBasketballEnv, Team
-from basketworld_jax.config import TRAIN_FROZEN_VALUES
+from basketworld.domain import Team
+from basketworld_jax.config import JaxEnvironmentConfig, TRAIN_FROZEN_VALUES
 from basketworld_jax.eval import (
     can_run_native_jax_evaluation,
     run_native_jax_evaluation,
@@ -47,12 +47,7 @@ from basketworld_jax.train.main import (
 
 
 def _native_eval_env_params() -> dict:
-    signature_keys = set(inspect.signature(HexagonBasketballEnv.__init__).parameters)
-    params = {
-        key: value
-        for key, value in TRAIN_FROZEN_VALUES.items()
-        if key in signature_keys
-    }
+    params = asdict(JaxEnvironmentConfig.from_mapping(TRAIN_FROZEN_VALUES))
     params["training_team"] = Team.OFFENSE
     params["offensive_three_seconds_enabled"] = bool(
         TRAIN_FROZEN_VALUES.get("offensive_three_seconds", False)

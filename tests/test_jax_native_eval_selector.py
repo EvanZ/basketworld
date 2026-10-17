@@ -3,12 +3,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from basketworld.envs.basketworld_env_v2 import HexagonBasketballEnv, Team
+from basketworld.domain import Team
+from basketworld_jax.config import JaxEnvironmentConfig
 from basketworld_jax.env.minimal import (
     TOKEN_OBS_GLOBAL_DIM,
     TOKEN_OBS_PLAYER_DIM,
     build_action_masks_batch,
-    build_kernel_static_from_env,
+    build_kernel_static_from_config,
     build_policy_observation_batch_with_role_flag,
     reset_batch_minimal,
 )
@@ -20,7 +21,7 @@ from basketworld_jax.models import build_actor_critic_spec, init_actor_critic_pa
 
 
 def _make_intent_env():
-    return HexagonBasketballEnv(
+    return JaxEnvironmentConfig(
         players=3,
         court_rows=9,
         court_cols=8,
@@ -199,7 +200,7 @@ def test_native_eval_runner_applies_selector_at_episode_start():
     jnp = pytest.importorskip("jax.numpy")
 
     env = _make_intent_env()
-    static = build_kernel_static_from_env(env, jnp)
+    static = build_kernel_static_from_config(env, jnp)
     initial_state = reset_batch_minimal(
         static,
         jax.random.split(jax.random.PRNGKey(10), 4),
@@ -219,7 +220,7 @@ def test_native_eval_runner_applies_selector_at_episode_start():
         np.asarray(action_mask),
         hidden_dims=(),
         model_type="attention",
-        token_player_count=env.n_players,
+        token_player_count=env.players * 2,
         token_dim=TOKEN_OBS_PLAYER_DIM,
         global_dim=TOKEN_OBS_GLOBAL_DIM,
         attention_embed_dim=16,

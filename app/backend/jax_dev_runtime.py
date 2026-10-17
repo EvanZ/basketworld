@@ -557,11 +557,19 @@ class JaxDevRuntime:
         self.environment = self._build_environment_view()
 
         raw_model = unwrap_inference_model(unified_policy)
-        if raw_model is None or not hasattr(raw_model, "jax"):
+        if raw_model is None:
+            import jax
+            import jax.numpy as jnp
+
+            self.raw_model = None
+            self.jax = jax
+            self.jnp = jnp
+        elif not hasattr(raw_model, "jax"):
             raise TypeError("JAX dev runtime requires a loaded JAX inference model.")
-        self.raw_model = raw_model
-        self.jax = raw_model.jax
-        self.jnp = raw_model.jnp
+        else:
+            self.raw_model = raw_model
+            self.jax = raw_model.jax
+            self.jnp = raw_model.jnp
         self.static = build_kernel_static_from_config(self.environment_config, self.jnp)
         self._clearance_zone_cells_cache: tuple[tuple[int, int], ...] | None = None
         self._step_batch_runner = None
@@ -1701,9 +1709,6 @@ class JaxDevRuntime:
     def _step_locked(self, request: Any, game_state: Any) -> dict[str, Any]:
         if self.state is None:
             raise RuntimeError("JAX runtime is not initialized.")
-        if bool(getattr(request, "use_mcts", False)):
-            raise ValueError("MCTS is not supported by the JAX-native dev runtime.")
-
         requested_replay_session_id = getattr(request, "replay_session_id", None)
         active_replay_session_id = getattr(game_state, "replay_session_id", None)
         if requested_replay_session_id is not None and requested_replay_session_id != active_replay_session_id:
@@ -1883,7 +1888,6 @@ class JaxDevRuntime:
                 "offense": float(game_state.episode_rewards["offense"]),
                 "defense": float(game_state.episode_rewards["defense"]),
             },
-            "mcts": None,
             "selector_transition": selector_transition,
         }
         if not fast_mode:

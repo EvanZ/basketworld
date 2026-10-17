@@ -8,7 +8,7 @@ from typing import Any, Callable, Literal
 
 import numpy as np
 
-from basketworld.envs.core import geometry
+from basketworld import geometry
 
 ReboundKind = Literal["short", "normal", "long", "table"]
 ReboundRegion = Literal["weak", "same", "middle", "table"]

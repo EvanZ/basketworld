@@ -3,9 +3,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from basketworld.envs.basketworld_env_v2 import HexagonBasketballEnv, Team
+from basketworld.domain import Team
+from basketworld_jax.config import JaxEnvironmentConfig
 from basketworld_jax.env.minimal import (
-    build_kernel_static_from_env,
+    build_kernel_static_from_config,
     reset_batch_minimal,
     step_batch_minimal,
 )
@@ -34,7 +35,7 @@ def _make_intent_env(**overrides):
         "intent_visible_to_defense_prob": 1.0,
     }
     params.update(overrides)
-    return HexagonBasketballEnv(**params)
+    return JaxEnvironmentConfig(**params)
 
 
 def test_jax_reset_samples_intent_state_deterministically():
@@ -42,7 +43,7 @@ def test_jax_reset_samples_intent_state_deterministically():
     jnp = pytest.importorskip("jax.numpy")
 
     env = _make_intent_env()
-    static = build_kernel_static_from_env(env, jnp)
+    static = build_kernel_static_from_config(env, jnp)
     keys = jax.random.split(jax.random.PRNGKey(123), 8)
 
     state_a = reset_batch_minimal(static, keys, jax, jnp)
@@ -83,7 +84,7 @@ def test_jax_reset_zeroes_null_intent_commitment():
         defense_intent_null_prob=1.0,
         intent_visible_to_defense_prob=0.0,
     )
-    static = build_kernel_static_from_env(env, jnp)
+    static = build_kernel_static_from_config(env, jnp)
     state = reset_batch_minimal(static, jax.random.split(jax.random.PRNGKey(321), 4), jax, jnp)
 
     assert np.asarray(state.intent_active).tolist() == [0] * 4
@@ -97,9 +98,9 @@ def test_jax_step_advances_and_expires_intent_state():
     jnp = pytest.importorskip("jax.numpy")
 
     env = _make_intent_env(intent_commitment_steps=2)
-    static = build_kernel_static_from_env(env, jnp)
+    static = build_kernel_static_from_config(env, jnp)
     state = reset_batch_minimal(static, jax.random.split(jax.random.PRNGKey(456), 1), jax, jnp)
-    actions = jnp.zeros((1, env.n_players), dtype=jnp.int32)
+    actions = jnp.zeros((1, env.players * 2), dtype=jnp.int32)
 
     out = step_batch_minimal(
         static,

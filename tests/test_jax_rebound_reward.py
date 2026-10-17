@@ -6,20 +6,19 @@ import pytest
 jax = pytest.importorskip("jax")
 import jax.numpy as jnp
 
-from basketworld.envs.basketworld_env_v2 import ActionType, HexagonBasketballEnv
+from basketworld.domain import ActionType
+from basketworld_jax.config import JaxEnvironmentConfig
 from basketworld_jax.env.minimal import (
     REBOUND_CONTEST_MODE_LOCAL,
-    build_kernel_static_from_env,
-    snapshot_state_from_env,
-    stack_state_snapshots,
+    build_kernel_static_from_config,
+    reset_batch_minimal,
     step_batch_minimal,
 )
 
 
 def _reward_test_state(*, enabled: bool, once_per_possession: bool = True):
-    env = HexagonBasketballEnv(
+    config = JaxEnvironmentConfig(
         players=2,
-        render_mode=None,
         pass_mode="pointer_targeted",
         allow_dunks=False,
         layup_pct=0.0,
@@ -32,27 +31,26 @@ def _reward_test_state(*, enabled: bool, once_per_possession: bool = True):
         offensive_three_seconds_enabled=False,
         enable_phi_shaping=False,
         violation_reward=0.0,
+        rebound_target_temperature=1.0,
+        rebound_target_uniform_mix=0.0,
+        rebound_winner_distance_weight=1.0,
+        rebound_basket_position_weight=0.0,
+        rebound_winner_temperature=1.0,
+        rebound_skill_weight=0.0,
+        rebound_contest_mode="local_contest",
+        rebound_contest_radius=0,
+        offensive_rebound_shot_clock_reset=14,
+        enable_rebound_reward_redistribution=enabled,
+        offensive_rebound_reward_advance=0.4,
+        rebound_reward_once_per_possession=once_per_possession,
     )
-    env.rebound_target_temperature = 1.0
-    env.rebound_target_uniform_mix = 0.0
-    env.rebound_winner_distance_weight = 1.0
-    env.rebound_basket_position_weight = 0.0
-    env.rebound_winner_temperature = 1.0
-    env.rebound_skill_weight = 0.0
-    env.rebound_contest_mode = "local_contest"
-    env.rebound_contest_radius = 0
-    env.offensive_rebound_shot_clock_reset = 14
-    env.enable_rebound_reward_redistribution = enabled
-    env.offensive_rebound_reward_advance = 0.4
-    env.rebound_reward_once_per_possession = once_per_possession
-    env.reset(seed=19)
-    env.shot_clock = 24
-    env.step_count = 0
-    env.episode_ended = False
-    env._assist_candidate = None
-
-    static = build_kernel_static_from_env(env, xp=jnp)
-    state = stack_state_snapshots([snapshot_state_from_env(env)], xp=jnp)
+    static = build_kernel_static_from_config(config, xp=jnp)
+    state = reset_batch_minimal(
+        static,
+        jax.random.split(jax.random.PRNGKey(19), 1),
+        jax,
+        jnp,
+    )
     holder = int(np.asarray(state.ball_holder)[0])
     holder_position = np.asarray(state.positions)[0, holder]
     cell_coords = np.asarray(static.cell_coords)

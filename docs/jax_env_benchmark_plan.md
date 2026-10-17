@@ -1,5 +1,9 @@
 # JAX Batched Environment Benchmark Plan
 
+> **Historical benchmark record.** BasketWorld now supports only the JAX
+> environment, trainer, evaluation, inference, and checkpoint path. References
+> to SB3 below describe the retired baseline used for this investigation.
+
 ## Goal
 
 Estimate whether a batched JAX rewrite of the BasketWorld environment is worth pursuing, without changing the current SB3 training path.

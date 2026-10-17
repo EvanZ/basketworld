@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 
 from basketworld.domain import Team
-from train.config import get_parser
+from basketworld_jax.train.config import get_parser
 
 
 try:

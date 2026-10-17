@@ -10,17 +10,14 @@ description = "A grid-based basketball simulation for reinforcement learning"
 authors = [
     { name="Your Name", email="your@email.com" }
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 dependencies = [
-    "gymnasium==0.29.1",
     "numpy>=1.24",
     "matplotlib",
     "pillow",
     "imageio-ffmpeg>=0.6.0",
     "tqdm",
-    "torch>=2.0",
-    "torchvision",
-    "stable-baselines3==2.2.1",
+    "jax>=0.8.0",
     "flax>=0.12.6",
     "optax>=0.2.8",
     "orbax-checkpoint>=0.11.36",

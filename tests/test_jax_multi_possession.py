@@ -6,7 +6,8 @@ import pytest
 jax = pytest.importorskip("jax")
 import jax.numpy as jnp
 
-from basketworld.envs.basketworld_env_v2 import ActionType, HexagonBasketballEnv
+from basketworld.domain import ActionType
+from basketworld_jax.config import JaxEnvironmentConfig
 from basketworld_jax.train.main import parse_args, validate_train_args
 from basketworld_jax.train.runtime import (
     _build_spatial_step_metrics,
@@ -44,7 +45,7 @@ from basketworld_jax.env.minimal import (
     _prepare_check_positions_single,
     build_action_masks_batch,
     build_flat_observation_batch_with_role_flag,
-    build_kernel_static_from_env,
+    build_kernel_static_from_config,
     build_opponent_role_flags_batch,
     build_pass_steal_contributions_batch,
     build_spatial_diagnostics_batch,
@@ -74,9 +75,8 @@ def _multi_possession_static(
     check_setup_steps: int = 0,
     random_check_location: bool = False,
 ):
-    env = HexagonBasketballEnv(
+    config = JaxEnvironmentConfig(
         players=players,
-        render_mode=None,
         court_rows=court_rows,
         court_cols=court_cols,
         pass_mode="pointer_targeted",
@@ -93,14 +93,14 @@ def _multi_possession_static(
         illegal_defense_enabled=illegal_defense_enabled,
         offensive_three_seconds_enabled=offensive_three_seconds_enabled,
         enable_phi_shaping=False,
+        enable_multi_possession=True,
+        multi_possession_limit=possession_limit,
+        multi_possession_overtime_round_cap=overtime_round_cap,
+        check_clearance=check_clearance,
+        check_setup_steps=check_setup_steps,
+        random_check_location=random_check_location,
     )
-    env.enable_multi_possession = True
-    env.multi_possession_limit = possession_limit
-    env.multi_possession_overtime_round_cap = overtime_round_cap
-    env.check_clearance = check_clearance
-    env.check_setup_steps = check_setup_steps
-    env.random_check_location = random_check_location
-    return build_kernel_static_from_env(env, xp=jnp)
+    return build_kernel_static_from_config(config, xp=jnp)
 
 
 def _inbound_state(

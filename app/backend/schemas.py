@@ -116,22 +116,7 @@ class ActionRequest(BaseModel):
     # Fast self-play keeps the simulation authoritative while omitting the
     # per-step inspection payload used by the development controls.
     fast_mode: bool = False
-    use_mcts: bool | None = None
     team: str | None = None  # Optional override of training_team ("OFFENSE"/"DEFENSE")
-    mcts_player_id: int | None = None
-    mcts_player_ids: list[int] | None = None
-    mcts_max_depth: int | None = None
-    mcts_time_budget_ms: int | None = None
-    mcts_exploration_c: float | None = None
-    mcts_use_priors: bool | None = None
-
-
-class MCTSAdviseRequest(BaseModel):
-    player_id: int | None = None
-    max_depth: int | None = None
-    time_budget_ms: int | None = None
-    exploration_c: float | None = None
-    use_priors: bool | None = True
 
 
 class SetPhiParamsRequest(BaseModel):

@@ -1,5 +1,8 @@
 # Opponent Sampling Performance Comparison
 
+> **Historical SB3 performance note.** Its commands and source paths are
+> retired. Current training and opponent sampling are JAX-native.
+
 ## The Problem with Per-Episode Sampling
 
 Initial implementation: sample new opponent on every episode reset
@@ -186,4 +189,3 @@ Expected improvements:
 - ✅ No "late model loses to early model" anomalies
 - ✅ Smoother learning curves
 - ✅ Faster training time than per-episode approach
-

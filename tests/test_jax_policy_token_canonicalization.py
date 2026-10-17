@@ -6,11 +6,11 @@ import pytest
 jax = pytest.importorskip("jax")
 import jax.numpy as jnp
 
-from basketworld.envs.basketworld_env_v2 import HexagonBasketballEnv
+from basketworld_jax.config import JaxEnvironmentConfig
 from basketworld_jax.env.minimal import (
     TEAM_A,
     TEAM_B,
-    build_kernel_static_from_env,
+    build_kernel_static_from_config,
     build_token_observation_batch_with_role_flag,
     build_token_observation_components_batch,
     canonicalize_player_tokens_by_active_role,
@@ -23,13 +23,12 @@ from basketworld_jax.models.actor_critic import (
 
 
 def _static_and_state(*, offense_team: int):
-    env = HexagonBasketballEnv(
+    config = JaxEnvironmentConfig(
         players=2,
-        render_mode=None,
         pass_mode="pointer_targeted",
+        enable_multi_possession=True,
     )
-    env.enable_multi_possession = True
-    static = build_kernel_static_from_env(env, xp=jnp)
+    static = build_kernel_static_from_config(config, xp=jnp)
     state = reset_batch_minimal(
         static,
         jax.random.split(jax.random.PRNGKey(37), 1),

@@ -299,21 +299,6 @@ class JaxEnvironmentConfig:
     ) -> "JaxEnvironmentConfig":
         return cls.from_evaluation_request(required_params, env_params)
 
-    @classmethod
-    def from_legacy_env(cls, env: Any) -> "JaxEnvironmentConfig":
-        raw = {
-            field.name: getattr(env, field.name)
-            for field in fields(cls)
-            if hasattr(env, field.name)
-        }
-        raw.update(
-            court_rows=getattr(env, "court_height"),
-            court_cols=getattr(env, "court_width"),
-            players=getattr(env, "players_per_side"),
-            shot_clock=getattr(env, "shot_clock_steps"),
-        )
-        return cls.from_mapping(raw)
-
     def as_metadata(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["training_team"] = _team(self.training_team).name.lower()

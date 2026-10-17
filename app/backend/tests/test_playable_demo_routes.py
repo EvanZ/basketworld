@@ -1,3 +1,5 @@
+import pytest
+from fastapi import HTTPException
 from starlette.requests import Request
 from starlette.responses import Response
 
@@ -35,7 +37,7 @@ def _build_dummy_playable_state(*, demo_mode: bool = False) -> GameState:
         "difficulty": "demo" if demo_mode else "easy",
         "run_id": "demo-run" if demo_mode else "live-run",
         "checkpoint_index": 42,
-        "policy_name": "unified_iter_42.zip",
+        "policy_name": "update_0000042",
         "score": {"user": 0, "ai": 0},
         "possession_number": 1,
         "user_on_offense": True,
@@ -131,8 +133,7 @@ def test_playable_step_uses_policy_actions_for_demo_mode(monkeypatch):
 def test_playable_options_include_demo_config(monkeypatch):
     monkeypatch.setenv("BW_PLAYABLE_DEMO_ENABLED", "true")
     monkeypatch.setenv("BW_PLAYABLE_DEMO_RUN_ID", "demo-run-id")
-    monkeypatch.setenv("BW_PLAYABLE_DEMO_ALTERNATION_NUMBER", "75")
-    monkeypatch.delenv("BW_PLAYABLE_DEMO_CHECKPOINT", raising=False)
+    monkeypatch.setenv("BW_PLAYABLE_DEMO_CHECKPOINT", "75")
 
     body = playable_routes.get_playable_options()
     assert body["status"] == "success"
@@ -170,27 +171,14 @@ def test_playable_demo_takeover_turns_demo_into_live_game(monkeypatch):
     assert target_state.playable_session["demo_mode"] is False
 
 
-def test_reset_playable_possession_runs_selector_episode_init(monkeypatch):
+def test_reset_playable_possession_requires_jax_runtime(monkeypatch):
     target_state = _build_dummy_playable_state(demo_mode=False)
     target_state.user_team = None
-    captured = {"called": 0}
-
-    def fake_selector_init():
-        captured["called"] += 1
 
     monkeypatch.setattr(playable_routes, "game_state", target_state)
-    monkeypatch.setattr(playable_routes, "_capture_turn_start_snapshot", lambda: None)
-    monkeypatch.setattr(playable_routes, "get_ui_game_state", lambda: {"done": False})
-    monkeypatch.setattr(
-        playable_routes,
-        "_initialize_app_selector_runtime_for_episode",
-        fake_selector_init,
-    )
 
-    state = playable_routes._reset_playable_possession(target_state.playable_session)
-
-    assert state == {"done": False}
-    assert captured["called"] == 1
+    with pytest.raises(HTTPException, match="JAX runtime is not initialized"):
+        playable_routes._reset_playable_possession(target_state.playable_session)
 
 
 def test_reset_playable_possession_uses_jax_runtime_branch(monkeypatch):

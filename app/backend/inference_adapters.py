@@ -4,7 +4,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from basketworld.utils.action_resolution import get_policy_action_probabilities
 from basketworld_jax.inference import (
     load_inference_model,
     require_checkpoint_path,
@@ -18,11 +17,11 @@ class InferenceCapabilities:
     observation_panel: bool = True
     eval: bool = True
     playbook: bool = True
-    mcts: bool = True
+    mcts: bool = False
     attention: bool = True
     env_training_tabs: bool = True
     state_values: bool = True
-    q_values: bool = True
+    q_values: bool = False
     play_metadata: bool = True
     selector_distribution: bool = True
     per_intent_eval: bool = True
@@ -76,32 +75,6 @@ class InferencePolicyAdapter:
 
     def __getattr__(self, name: str):
         return getattr(self.raw_model, name)
-
-
-class SB3PPOInferenceAdapter(InferencePolicyAdapter):
-    def __init__(self, raw_model: Any) -> None:
-        super().__init__(
-            raw_model,
-            backend_kind="sb3",
-            capabilities=InferenceCapabilities(),
-        )
-
-    def predict(self, obs, deterministic: bool = False):
-        return self.raw_model.predict(obs, deterministic=deterministic)
-
-    def action_probabilities(self, obs):
-        return get_policy_action_probabilities(self.raw_model, obs)
-
-    def prepare_for_role(self, env, *, observer_is_offense: bool) -> None:
-        from basketworld.utils.intent_policy_sensitivity import (
-            sync_policy_runtime_intent_override_from_env,
-        )
-
-        sync_policy_runtime_intent_override_from_env(
-            self.raw_model,
-            env,
-            observer_is_offense=bool(observer_is_offense),
-        )
 
 
 class JAXInferenceAdapter(InferencePolicyAdapter):
@@ -260,22 +233,6 @@ def _jax_model_uses_selector(raw_model: Any, metadata: dict[str, Any] | None = N
     return bool(policy_spec.get("intent_selector_enabled", False))
 
 
-def load_sb3_policy_adapter(
-    path: str,
-    *,
-    device: str = "cpu",
-    custom_objects: dict[str, Any] | None = None,
-) -> SB3PPOInferenceAdapter:
-    from basketworld.utils.policy_loading import load_ppo_for_inference
-
-    model = load_ppo_for_inference(
-        path,
-        device=device,
-        custom_objects=custom_objects,
-    )
-    return SB3PPOInferenceAdapter(model)
-
-
 def load_jax_adapter(path: str) -> JAXInferenceAdapter:
     model = load_inference_model(path)
     return JAXInferenceAdapter(model)
@@ -307,16 +264,7 @@ def prepare_policy_for_role(policy_obj: Any, env, *, observer_is_offense: bool) 
     if hasattr(policy_obj, "prepare_for_role"):
         policy_obj.prepare_for_role(env, observer_is_offense=bool(observer_is_offense))
         return
-    from basketworld.utils.intent_policy_sensitivity import (
-        sync_policy_runtime_intent_override_from_env,
-    )
-
-    raw_model = unwrap_inference_model(policy_obj)
-    sync_policy_runtime_intent_override_from_env(
-        raw_model,
-        env,
-        observer_is_offense=bool(observer_is_offense),
-    )
+    raise TypeError("Inference policies must use the JAX adapter interface.")
 
 
 def policy_action_probabilities(policy_obj: Any, obs):
@@ -324,8 +272,7 @@ def policy_action_probabilities(policy_obj: Any, obs):
         return None
     if hasattr(policy_obj, "action_probabilities"):
         return policy_obj.action_probabilities(obs)
-    raw_model = unwrap_inference_model(policy_obj)
-    return get_policy_action_probabilities(raw_model, obs)
+    raise TypeError("Inference policies must use the JAX adapter interface.")
 
 
 def policy_observation_vector(policy_obj: Any, env, *, observer_is_offense: bool):
@@ -368,7 +315,7 @@ def policy_attention_payload(policy_obj: Any, env, *, observer_is_offense: bool)
 def get_policy_backend_kind(policy_obj: Any) -> str | None:
     if policy_obj is None:
         return None
-    return str(getattr(policy_obj, "backend_kind", "sb3"))
+    return str(getattr(policy_obj, "backend_kind", "jax"))
 
 
 def get_policy_capabilities(policy_obj: Any) -> dict[str, bool] | None:

@@ -5,7 +5,7 @@ import multiprocessing as mp
 from fastapi import APIRouter, HTTPException
 from fastapi.encoders import jsonable_encoder
 import numpy as np
-from basketworld.envs.basketworld_env_v2 import Team
+from basketworld.domain import Team
 from basketworld_jax.eval import can_run_native_jax_evaluation
 
 from app.backend.evaluation import (

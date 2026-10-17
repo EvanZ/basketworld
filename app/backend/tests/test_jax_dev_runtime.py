@@ -912,17 +912,23 @@ def test_replay_counterfactual_snapshot_route_uses_jax_runtime_snapshot(monkeypa
     assert runtime.last_step_output is not None
 
 
-def test_playbook_analysis_route_forces_jax_runtime_intent(monkeypatch):
+def test_playbook_analysis_route_dispatches_to_jax_batch(monkeypatch):
     runtime, game_state = _install_jax_runtime_session(monkeypatch)
     backend_state.capture_counterfactual_snapshot()
     calls: list[int] = []
-    original = runtime.set_offense_intent_state
 
-    def spy_set_offense_intent_state(**kwargs):
-        calls.append(int(kwargs["intent_index"]))
-        return original(**kwargs)
+    def fake_run_jax_playbook_batch(**kwargs):
+        intent_index = int(kwargs["intent_indices"][0])
+        calls.append(intent_index)
+        panel = admin_routes._init_playbook_panel_accumulator(kwargs["offense_ids"])
+        panel["num_rollouts"] = 1
+        return {intent_index: panel}, {
+            "used_jax_fast_path": True,
+            "compiled_batch_size": 1,
+        }
 
-    monkeypatch.setattr(runtime, "set_offense_intent_state", spy_set_offense_intent_state)
+    monkeypatch.setattr(admin_routes, "_can_run_jax_playbook_batch", lambda _runtime: True)
+    monkeypatch.setattr(admin_routes, "_run_jax_playbook_batch", fake_run_jax_playbook_batch)
 
     body = admin_routes.playbook_analysis_route(
         PlaybookAnalysisRequest(
@@ -937,6 +943,7 @@ def test_playbook_analysis_route_forces_jax_runtime_intent(monkeypatch):
 
     assert body["status"] == "success"
     assert body["used_parallel"] is False
+    assert body["used_jax_fast_path"] is True
     assert calls == [1]
     assert body["panels"][0]["intent_index"] == 1
     assert game_state.env is runtime.environment

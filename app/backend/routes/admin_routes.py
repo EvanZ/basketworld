@@ -1,36 +1,23 @@
 import copy
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import json
 import logging
 import math
-import multiprocessing as mp
 import os
 from pathlib import Path
-import queue
 from typing import List
 
 from fastapi import APIRouter, HTTPException
 from fastapi.encoders import jsonable_encoder
 import mlflow
 import numpy as np
-from stable_baselines3 import PPO
-from basketworld.envs.basketworld_env_v2 import Team
+from basketworld.domain import Team
 from basketworld.utils.start_templates import (
     load_start_template_library,
     resolve_start_template,
     validate_start_template_library,
 )
-from basketworld.utils.policies import PassBiasDualCriticPolicy, PassBiasMultiInputPolicy
-from basketworld.policies import SetAttentionDualCriticPolicy, SetAttentionExtractor
 from basketworld.utils.play_names import lookup_play_name
 
-import app.backend.evaluation as backend_evaluation
-from app.backend.observations import rebuild_observation_from_env
-from app.backend.rollout_runtime import (
-    apply_post_step_rollout_updates,
-    combine_team_actions,
-    predict_joint_policy_actions,
-)
 from app.backend.env_access import env_view
 from app.backend.inference_adapters import (
     get_policy_backend_kind,
@@ -845,204 +832,6 @@ def _build_playbook_ui_state(template_state: dict, env, action_results: dict | N
     state["pass_steal_probabilities"] = {}
     state["ball_handler_shot_probability"] = None
     return state
-
-
-def _build_playbook_worker_obs(env, user_team) -> dict:
-    worker_state = backend_evaluation._worker_state
-    _Team = worker_state["Team"]
-    role_value = (
-        worker_state.get("role_flag_offense", 1.0)
-        if user_team == _Team.OFFENSE
-        else worker_state.get("role_flag_defense", -1.0)
-    )
-    return rebuild_observation_from_env(env, role_flag_value=float(role_value))
-
-
-def _run_playbook_batch_worker(args: tuple) -> dict:
-    (
-        rollout_specs,
-        base_env,
-        base_ui_state,
-        user_team_name,
-        offense_ids,
-        commitment_steps,
-        max_steps,
-        run_to_end,
-        player_deterministic,
-        opponent_deterministic,
-    ) = args
-
-    worker_state = backend_evaluation._worker_state
-    _np = worker_state["np"]
-    _Team = worker_state["Team"]
-    training_params = worker_state.get("training_params", {}) or {}
-    unified_policy = worker_state["unified_policy"]
-    opponent_policy = worker_state["opponent_policy"]
-    progress_queue = worker_state.get("progress_queue")
-    user_team = _Team.OFFENSE if user_team_name == "OFFENSE" else _Team.DEFENSE
-
-    try:
-        import torch as _torch
-    except Exception:
-        _torch = None
-
-    payload: dict[int, dict] = {}
-
-    for _, intent_index, rollout_seed in rollout_specs:
-        if _torch is not None:
-            try:
-                _torch.manual_seed(int(rollout_seed))
-            except Exception:
-                pass
-        try:
-            _np.random.seed(int(rollout_seed))
-        except Exception:
-            pass
-
-        env_copy = copy.deepcopy(base_env)
-        env = getattr(env_copy, "unwrapped", env_copy)
-        env.training_team = user_team
-        try:
-            env._rng = _np.random.default_rng(int(rollout_seed))
-        except Exception:
-            pass
-
-        env.intent_active = True
-        env.intent_index = int(intent_index)
-        env.intent_age = 0
-        env.intent_commitment_remaining = int(commitment_steps)
-
-        obs = _build_playbook_worker_obs(env, user_team)
-        selector_segment_index = 0
-        panel = payload.setdefault(int(intent_index), _init_playbook_panel_accumulator(offense_ids))
-        initial_ui_state = _build_playbook_ui_state(base_ui_state, env)
-        if panel.get("base_state") is None:
-            panel["base_state"] = copy.deepcopy(initial_ui_state)
-
-        rollout_state = _build_playbook_rollout_state(env)
-        passes_count, shots_count, initial_shot_attempts = _count_rollout_state(
-            rollout_state,
-            offense_ids,
-            panel["player_heatmaps"],
-            panel["ball_heatmap"],
-            panel["shot_heatmap"],
-            panel["player_shot_heatmaps"],
-            panel["player_shot_stats"],
-            panel["pass_links"],
-            panel["pass_path_segments"],
-        )
-        first_shot_step: int | None = 0 if shots_count > 0 else None
-        rollout_shots_by_player = {
-            int(pid): int(count) for pid, count in (initial_shot_attempts or {}).items()
-        }
-        rollout_steps = 0
-        done = bool(env_view(env).episode_ended)
-
-        while not done and (run_to_end or rollout_steps < max_steps):
-            rollout_actions = predict_joint_policy_actions(
-                unified_policy=unified_policy,
-                opponent_policy=opponent_policy if opponent_policy is not None else unified_policy,
-                obs=obs,
-                env=env,
-                player_deterministic=player_deterministic,
-                opponent_deterministic=opponent_deterministic,
-                role_flag_offense=float(worker_state.get("role_flag_offense", 1.0)),
-                role_flag_defense=float(worker_state.get("role_flag_defense", -1.0)),
-            )
-            full_action = combine_team_actions(
-                env=env,
-                user_team=user_team,
-                resolved_unified=rollout_actions["resolved_unified"],
-                resolved_opponent=rollout_actions["resolved_opponent"],
-            )
-
-            obs, _, terminated, truncated, info = env.step(full_action)
-            action_results = info.get("action_results", {}) if info else {}
-            if not action_results:
-                action_results = info.get("last_action_results", {}) if info else {}
-            if not action_results:
-                action_results = getattr(env, "last_action_results", {}) or {}
-            done = bool(terminated or truncated)
-            post_step = apply_post_step_rollout_updates(
-                env=env,
-                next_obs=obs,
-                info=info if isinstance(info, dict) else None,
-                done=done,
-                training_params=training_params,
-                unified_policy=unified_policy,
-                opponent_policy=opponent_policy,
-                user_team=user_team,
-                role_flag_offense=float(worker_state.get("role_flag_offense", 1.0)),
-                role_flag_defense=float(worker_state.get("role_flag_defense", -1.0)),
-                selector_segment_index=selector_segment_index,
-            )
-            obs = post_step["obs"]
-            selector_segment_index = int(post_step["selector_segment_index"])
-
-            next_rollout_state = _build_playbook_rollout_state(env, action_results)
-            _count_rollout_transition(
-                rollout_state,
-                next_rollout_state,
-                offense_ids,
-                panel["player_path_segments"],
-                panel["ball_path_segments"],
-            )
-            more_passes, more_shots, state_shot_attempts = _count_rollout_state(
-                next_rollout_state,
-                offense_ids,
-                panel["player_heatmaps"],
-                panel["ball_heatmap"],
-                panel["shot_heatmap"],
-                panel["player_shot_heatmaps"],
-                panel["player_shot_stats"],
-                panel["pass_links"],
-                panel["pass_path_segments"],
-            )
-            if first_shot_step is None and int(more_shots) > 0:
-                first_shot_step = int(rollout_steps) + 1
-            for shooter, count in (state_shot_attempts or {}).items():
-                rollout_shots_by_player[int(shooter)] = int(
-                    rollout_shots_by_player.get(int(shooter), 0)
-                ) + int(count or 0)
-            passes_count += more_passes
-            shots_count += more_shots
-            rollout_steps += 1
-            rollout_state = next_rollout_state
-
-        panel["rollout_lengths_sum"] += int(rollout_steps)
-        panel["rollout_passes_sum"] += int(passes_count)
-        panel["rollout_shots_sum"] += int(shots_count)
-        if first_shot_step is not None:
-            panel["rollouts_with_shot"] += 1
-            panel["first_shot_step_sum"] += int(first_shot_step)
-        panel["terminated_rollouts"] += int(bool(done))
-        if bool(done):
-            panel["terminated_rollout_steps_sum"] += int(rollout_steps)
-        if rollout_shots_by_player:
-            primary_shooter = min(
-                rollout_shots_by_player.items(),
-                key=lambda item: (-int(item[1]), int(item[0])),
-            )[0]
-            _increment_count(panel["primary_shooter_counts"], str(primary_shooter), 1)
-        panel["num_rollouts"] += 1
-        terminal_key, turnover_reason = _classify_playbook_terminal_outcome(
-            rollout_state,
-            done=bool(done),
-            shot_clock=getattr(env, "shot_clock", None),
-        )
-        _increment_count(panel["terminal_outcomes"], terminal_key, 1)
-        if turnover_reason:
-            _increment_count(panel["turnover_reasons"], turnover_reason, 1)
-
-        if progress_queue is not None:
-            try:
-                progress_queue.put_nowait(1)
-            except queue.Full:
-                pass
-            except Exception:
-                pass
-
-    return payload
 
 
 def _run_jax_playbook_batch(
@@ -1981,16 +1770,11 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
     playbook_training_params = copy.deepcopy(training_params) if isinstance(training_params, dict) else {}
     playbook_training_params["intent_selector_multiselect_enabled"] = False
     jax_runtime = getattr(game_state, "jax_runtime", None)
-    can_parallelize = bool(
-        jax_runtime is None
-        and game_state.env_required_params is not None
-        and game_state.unified_policy_path is not None
-        and game_state.user_team is not None
-        and total_rollouts > 1
-    )
-    num_workers = None
-    if can_parallelize and total_rollouts >= 8:
-        num_workers = max(2, min(mp.cpu_count(), 16, total_rollouts))
+    if jax_runtime is None or not _can_run_jax_playbook_batch(jax_runtime):
+        raise HTTPException(
+            status_code=400,
+            detail="Playbook analysis requires a compatible JAX checkpoint.",
+        )
 
     live_restore_state = _capture_restorable_backend_state()
     original_counterfactual_snapshot = copy.deepcopy(game_state.counterfactual_snapshot)
@@ -2015,266 +1799,43 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
             for intent_index in intent_indices
         }
 
-        jax_fast_path_meta: dict[str, object] = {}
-        if jax_runtime is not None and _can_run_jax_playbook_batch(jax_runtime):
-            _raise_if_playbook_cancelled()
-            jax_snapshot = (base_state or {}).get("jax_runtime") if isinstance(base_state, dict) else None
-            base_jax_state = (jax_snapshot or {}).get("state") if isinstance(jax_snapshot, dict) else None
-            if base_jax_state is None:
-                raise RuntimeError("JAX Playbook fast path could not find a captured JAX state.")
-            panel_accumulators, jax_fast_path_meta = _run_jax_playbook_batch(
-                jax_runtime=jax_runtime,
-                base_jax_state=base_jax_state,
-                base_ui_state=base_ui_state,
-                intent_indices=intent_indices,
-                num_rollouts=int(num_rollouts),
-                commitment_steps=int(commitment_steps),
-                max_steps=int(max_steps),
-                run_to_end=bool(run_to_end),
-                player_deterministic=bool(req.player_deterministic),
-                opponent_deterministic=bool(req.opponent_deterministic),
-                user_team=game_state.user_team,
-                offense_ids=offense_ids,
-                play_name_map=get_current_play_name_map(int(num_intents)),
-                selector_multiselect_enabled=bool(jax_runtime._selector_multiselect_enabled(game_state)),
-                selector_alpha=float(jax_runtime._selector_alpha_eps(game_state)[0]),
-                selector_eps=float(jax_runtime._selector_alpha_eps(game_state)[1]),
-                selector_min_play_steps=max(
-                    1,
-                    int(
+        _raise_if_playbook_cancelled()
+        jax_snapshot = (base_state or {}).get("jax_runtime") if isinstance(base_state, dict) else None
+        base_jax_state = (jax_snapshot or {}).get("state") if isinstance(jax_snapshot, dict) else None
+        if base_jax_state is None:
+            raise RuntimeError("JAX Playbook fast path could not find a captured JAX state.")
+        panel_accumulators, jax_fast_path_meta = _run_jax_playbook_batch(
+            jax_runtime=jax_runtime,
+            base_jax_state=base_jax_state,
+            base_ui_state=base_ui_state,
+            intent_indices=intent_indices,
+            num_rollouts=int(num_rollouts),
+            commitment_steps=int(commitment_steps),
+            max_steps=int(max_steps),
+            run_to_end=bool(run_to_end),
+            player_deterministic=bool(req.player_deterministic),
+            opponent_deterministic=bool(req.opponent_deterministic),
+            user_team=game_state.user_team,
+            offense_ids=offense_ids,
+            play_name_map=get_current_play_name_map(int(num_intents)),
+            selector_multiselect_enabled=bool(jax_runtime._selector_multiselect_enabled(game_state)),
+            selector_alpha=float(jax_runtime._selector_alpha_eps(game_state)[0]),
+            selector_eps=float(jax_runtime._selector_alpha_eps(game_state)[1]),
+            selector_min_play_steps=max(
+                1,
+                int(
+                    (jax_runtime._selector_training_params(game_state) or {}).get(
+                        "intent_selector_min_play_steps",
                         (jax_runtime._selector_training_params(game_state) or {}).get(
-                            "intent_selector_min_play_steps",
-                            (jax_runtime._selector_training_params(game_state) or {}).get(
-                                "jax/intent_selector_min_play_steps",
-                                3,
-                            ),
-                        )
-                        or 3
-                    ),
+                            "jax/intent_selector_min_play_steps", 3
+                        ),
+                    )
+                    or 3
                 ),
-            )
-            _raise_if_playbook_cancelled()
-            update_playbook_progress(total_rollouts, total_rollouts)
-        elif num_workers is not None:
-            _raise_if_playbook_cancelled()
-            parallel_base_env = copy.deepcopy(getattr(base_state["env"], "unwrapped", base_state["env"]))
-            rollout_specs = [
-                (int(order), int(intent_index), int(np.random.randint(0, 2**31 - 1)))
-                for order, intent_index in enumerate(
-                    [
-                        int(intent_index)
-                        for intent_index in intent_indices
-                        for _ in range(num_rollouts)
-                    ]
-                )
-            ]
-            target_batches = max(1, num_workers * 4)
-            batch_size = max(1, (len(rollout_specs) + target_batches - 1) // target_batches)
-            batches = []
-            for idx in range(0, len(rollout_specs), batch_size):
-                batch_specs = rollout_specs[idx : idx + batch_size]
-                if not batch_specs:
-                    continue
-                batches.append(
-                    (
-                        batch_specs,
-                        parallel_base_env,
-                        base_ui_state,
-                        str(game_state.user_team.name),
-                        offense_ids,
-                        int(commitment_steps),
-                        int(max_steps),
-                        bool(run_to_end),
-                        bool(req.player_deterministic),
-                        bool(req.opponent_deterministic),
-                    )
-                )
-
-            ctx = mp.get_context("spawn")
-            progress_queue = ctx.Queue()
-            completed = 0
-            payloads: list[dict] = []
-
-            with ProcessPoolExecutor(
-                max_workers=num_workers,
-                mp_context=ctx,
-                initializer=backend_evaluation._init_evaluation_worker,
-                initargs=(
-                    game_state.env_required_params,
-                    game_state.env_optional_params,
-                    playbook_training_params,
-                    game_state.unified_policy_path,
-                    game_state.opponent_policy_path,
-                    game_state.user_team.name,
-                    game_state.role_flag_offense,
-                    game_state.role_flag_defense,
-                    "learned_sample",
-                    progress_queue,
-                ),
-            ) as executor:
-                pending = {
-                    executor.submit(_run_playbook_batch_worker, batch)
-                    for batch in batches
-                }
-                while pending:
-                    if playbook_cancel_requested():
-                        for future in pending:
-                            future.cancel()
-                        raise _PlaybookCancelled("Playbook analysis cancelled.")
-                    done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
-                    while True:
-                        try:
-                            completed += int(progress_queue.get_nowait())
-                        except queue.Empty:
-                            break
-                        except Exception:
-                            break
-                    update_playbook_progress(min(completed, total_rollouts), total_rollouts)
-                    if not done:
-                        continue
-                    for future in done:
-                        payloads.append(future.result())
-
-                while True:
-                    try:
-                        completed += int(progress_queue.get_nowait())
-                    except queue.Empty:
-                        break
-                    except Exception:
-                        break
-
-            update_playbook_progress(total_rollouts, total_rollouts)
-            for payload in payloads:
-                for intent_index, partial in (payload or {}).items():
-                    _merge_playbook_panel_accumulator(
-                        panel_accumulators[int(intent_index)],
-                        partial or {},
-                    )
-        else:
-            game_state.mlflow_training_params = playbook_training_params
-            completed = 0
-            for intent_index in intent_indices:
-                _raise_if_playbook_cancelled()
-                panel = panel_accumulators[int(intent_index)]
-                for _ in range(num_rollouts):
-                    _raise_if_playbook_cancelled()
-                    _restore_restorable_backend_state(base_state)
-                    game_state.counterfactual_snapshot = copy.deepcopy(original_counterfactual_snapshot)
-
-                    jax_runtime = getattr(game_state, "jax_runtime", None)
-                    if jax_runtime is not None:
-                        jax_runtime.set_offense_intent_state(
-                            active=True,
-                            intent_index=int(intent_index),
-                            intent_age=0,
-                            intent_commitment_remaining=int(commitment_steps),
-                            game_state=game_state,
-                        )
-                    else:
-                        base_env = _base_env()
-                        base_env.intent_active = True
-                        base_env.intent_index = int(intent_index)
-                        base_env.intent_age = 0
-                        base_env.intent_commitment_remaining = int(commitment_steps)
-                        _rebuild_cached_obs()
-                    initial_state = copy.deepcopy(get_ui_game_state())
-                    if panel.get("base_state") is None:
-                        panel["base_state"] = copy.deepcopy(initial_state)
-
-                    rollout_state = _build_playbook_rollout_state(game_state.env)
-                    passes_count, shots_count, initial_shot_attempts = _count_rollout_state(
-                        rollout_state,
-                        offense_ids,
-                        panel["player_heatmaps"],
-                        panel["ball_heatmap"],
-                        panel["shot_heatmap"],
-                        panel["player_shot_heatmaps"],
-                        panel["player_shot_stats"],
-                        panel["pass_links"],
-                        panel["pass_path_segments"],
-                    )
-                    first_shot_step: int | None = 0 if shots_count > 0 else None
-                    rollout_shots_by_player = {
-                        int(pid): int(count)
-                        for pid, count in (initial_shot_attempts or {}).items()
-                    }
-                    rollout_steps = 0
-                    done = bool(env_view(game_state.env).episode_ended)
-
-                    while not done and (run_to_end or rollout_steps < max_steps):
-                        _raise_if_playbook_cancelled()
-                        step_body = step_route(
-                            ActionRequest(
-                                actions={},
-                                player_deterministic=bool(req.player_deterministic),
-                                opponent_deterministic=bool(req.opponent_deterministic),
-                            )
-                        )
-                        next_state = step_body.get("state")
-                        if not next_state:
-                            raise RuntimeError("Playbook analysis step did not return a state.")
-                        next_rollout_state = _build_playbook_rollout_state(
-                            game_state.env,
-                            next_state.get("last_action_results") or {},
-                        )
-                        _count_rollout_transition(
-                            rollout_state,
-                            next_rollout_state,
-                            offense_ids,
-                            panel["player_path_segments"],
-                            panel["ball_path_segments"],
-                        )
-                        more_passes, more_shots, state_shot_attempts = _count_rollout_state(
-                            next_rollout_state,
-                            offense_ids,
-                            panel["player_heatmaps"],
-                            panel["ball_heatmap"],
-                            panel["shot_heatmap"],
-                            panel["player_shot_heatmaps"],
-                            panel["player_shot_stats"],
-                            panel["pass_links"],
-                            panel["pass_path_segments"],
-                        )
-                        if first_shot_step is None and int(more_shots) > 0:
-                            first_shot_step = int(rollout_steps) + 1
-                        for shooter, count in (state_shot_attempts or {}).items():
-                            rollout_shots_by_player[int(shooter)] = int(
-                                rollout_shots_by_player.get(int(shooter), 0)
-                            ) + int(count or 0)
-                        passes_count += more_passes
-                        shots_count += more_shots
-                        rollout_steps += 1
-                        done = bool(next_state.get("done")) or bool(env_view(game_state.env).episode_ended)
-                        rollout_state = next_rollout_state
-
-                    panel["rollout_lengths_sum"] += int(rollout_steps)
-                    panel["rollout_passes_sum"] += int(passes_count)
-                    panel["rollout_shots_sum"] += int(shots_count)
-                    if first_shot_step is not None:
-                        panel["rollouts_with_shot"] += 1
-                        panel["first_shot_step_sum"] += int(first_shot_step)
-                    panel["terminated_rollouts"] += int(bool(done))
-                    if bool(done):
-                        panel["terminated_rollout_steps_sum"] += int(rollout_steps)
-                    if rollout_shots_by_player:
-                        primary_shooter = min(
-                            rollout_shots_by_player.items(),
-                            key=lambda item: (-int(item[1]), int(item[0])),
-                        )[0]
-                        _increment_count(
-                            panel["primary_shooter_counts"], str(primary_shooter), 1
-                        )
-                    panel["num_rollouts"] += 1
-                    terminal_key, turnover_reason = _classify_playbook_terminal_outcome(
-                        rollout_state,
-                        done=bool(done),
-                        shot_clock=getattr(game_state.env, "shot_clock", None),
-                    )
-                    _increment_count(panel["terminal_outcomes"], terminal_key, 1)
-                    if turnover_reason:
-                        _increment_count(panel["turnover_reasons"], turnover_reason, 1)
-                    completed += 1
-                    update_playbook_progress(completed, total_rollouts)
+            ),
+        )
+        _raise_if_playbook_cancelled()
+        update_playbook_progress(total_rollouts, total_rollouts)
 
         panels = []
         play_name_map = get_current_play_name_map(int(num_intents))
@@ -2385,8 +1946,8 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
             "offense_ids": offense_ids,
             "used_jax_fast_path": bool(jax_fast_path_meta.get("used_jax_fast_path", False)),
             "jax_fast_path": jax_fast_path_meta,
-            "used_parallel": bool(num_workers is not None),
-            "num_workers": int(num_workers or 1),
+            "used_parallel": False,
+            "num_workers": 1,
             "play_name_map": play_name_map,
             "panels": panels,
         }, custom_encoder=_NUMPY_SAFE_ENCODER)
@@ -2402,8 +1963,8 @@ def playbook_analysis_route(req: PlaybookAnalysisRequest):
             "offense_ids": offense_ids,
             "used_jax_fast_path": False,
             "jax_fast_path": {},
-            "used_parallel": bool(num_workers is not None),
-            "num_workers": int(num_workers or 1),
+            "used_parallel": False,
+            "num_workers": 1,
             "play_name_map": get_current_play_name_map(int(num_intents)),
             "panels": [],
         }, custom_encoder=_NUMPY_SAFE_ENCODER)
@@ -3220,13 +2781,6 @@ def swap_policies(req: SwapPoliciesRequest):
         raise HTTPException(status_code=400, detail="No policy requested for swap.")
 
     client = mlflow.tracking.MlflowClient()
-    custom_objects = {
-        "PassBiasDualCriticPolicy": PassBiasDualCriticPolicy,
-        "PassBiasMultiInputPolicy": PassBiasMultiInputPolicy,
-        "SetAttentionDualCriticPolicy": SetAttentionDualCriticPolicy,
-        "SetAttentionExtractor": SetAttentionExtractor,
-    }
-
     def _apply_pass_mode(policy_obj) -> None:
         if policy_obj is None:
             return
@@ -3268,7 +2822,6 @@ def swap_policies(req: SwapPoliciesRequest):
             game_state.unified_policy = load_inference_policy(
                 user_path,
                 device="cpu",
-                custom_objects=custom_objects,
             )
             _apply_pass_mode(game_state.unified_policy)
             game_state.unified_policy_key = os.path.basename(user_path)

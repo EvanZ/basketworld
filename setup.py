@@ -8,13 +8,13 @@ setup(
     description="A grid-based 3v3 basketball simulation for reinforcement learning research.",
     packages=find_packages(),
     install_requires=[
-        "gymnasium==0.29.1",
         "numpy>=1.24",
         "matplotlib",
         "tqdm",
-        "torch>=2.0",
-        "torchvision",
-        "stable-baselines3==2.2.1",
+        "jax>=0.8.0",
+        "flax>=0.12.6",
+        "optax>=0.2.8",
+        "orbax-checkpoint>=0.11.36",
         "pytest",
         "black",
         "isort"
@@ -24,5 +24,5 @@ setup(
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
-    python_requires='>=3.8',
+    python_requires='>=3.11',
 )

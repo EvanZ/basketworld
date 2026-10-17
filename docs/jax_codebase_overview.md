@@ -1,5 +1,9 @@
 # JAX Codebase Overview
 
+> BasketWorld supports only the JAX/Flax/Optax/Orbax stack. References to SB3
+> and PyTorch below explain the historical architecture that JAX replaced; that
+> source and its checkpoint loaders are no longer part of the application.
+
 This document is a study guide for the JAX stack. It focuses on how the current SB3/Python/Torch training architecture was transformed into the JAX/Flax/Optax/Orbax path, and where to look when studying model architecture, training, inference, and evaluation.
 
 ## Mental Model

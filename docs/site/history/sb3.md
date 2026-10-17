@@ -1,11 +1,11 @@
 # Historical SB3 architecture
 
-!!! warning "Legacy path"
+!!! warning "Historical record"
 
-    The Stable-Baselines3 stack is retained for historical checkpoints,
-    behavior references, and parity testing. New training work should use
-    `basketworld_jax`. This page describes the old system; it is not a
-    maintained start-to-finish training tutorial.
+    The Stable-Baselines3 source and checkpoint loaders have been removed.
+    BasketWorld supports JAX training, inference, evaluation, analytics, and
+    interactive play only. This page records the retired architecture and its
+    file names; none of its commands or paths are runnable.
 
 Before the JAX migration, BasketWorld training combined a Python Gymnasium
 environment, process-based vector environments, Stable-Baselines3 PPO, custom
@@ -143,6 +143,5 @@ The main benefits are:
 - checkpoint metadata that reconstructs model and environment shapes;
 - one source of JAX environment semantics for training and native evaluation.
 
-The SB3 implementation remains valuable as the origin of many mechanics and as
-a comparison target. It should not be used to infer current JAX behavior when
-the JAX kernel or tests differ.
+This history explains the origin of several mechanics. Current behavior is
+defined by the JAX kernel and its tests.

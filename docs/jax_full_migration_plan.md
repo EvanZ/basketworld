@@ -1,5 +1,9 @@
 # JAX / Flax / Optax Full Migration Plan
 
+> **Historical migration record.** The cutover is complete: BasketWorld supports
+> only the JAX/Flax/Optax/Orbax stack. The SB3/PyTorch source and checkpoint
+> loaders described during the migration have been removed.
+
 ## Goal
 
 Replace the current rollout-critical Torch/SB3 stack with a JAX-native training and inference stack that is fast enough, operationally usable, and incrementally extensible back toward current BasketWorld capabilities.

@@ -1,5 +1,8 @@
 # N-Player Curriculum Implementation Plan
 
+> **Historical SB3 design document.** Its commands and source paths are retired.
+> Use `python -m basketworld_jax.train.cli` for supported training.
+
 ## Goal
 
 Support a curriculum that trains across increasing players-per-side in one workflow, e.g.:

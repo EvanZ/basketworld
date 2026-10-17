@@ -195,7 +195,7 @@ def get_parser() -> argparse.ArgumentParser:
         type=int,
         nargs="+",
         default=None,
-        help="The size of the neural network layers (e.g., 128 128). Default is SB3's default.",
+        help="The size of the neural network layers (e.g., 128 128).",
     )
     parser.add_argument(
         "--net-arch-pi",
@@ -383,12 +383,6 @@ def get_parser() -> argparse.ArgumentParser:
         type=str,
         default="",
         help="Existing MLflow run ID to reopen when resuming an app-managed worker.",
-    )
-    parser.add_argument(
-        "--mlflow-sb3-log-every-writes",
-        type=int,
-        default=10,
-        help="Log SB3 scalar dumps to MLflow every N logger writes (default: 10).",
     )
     parser.add_argument(
         "--mlflow-episode-log-every-rollouts",
@@ -890,9 +884,9 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--intent-selector-mode",
         dest="intent_selector_mode",
-        choices=["callback", "integrated"],
-        default="callback",
-        help="Selector implementation path: legacy callback prototype or integrated PPO path.",
+        choices=["integrated"],
+        default="integrated",
+        help="Selector implementation path.",
     )
     parser.add_argument(
         "--intent-selector-hidden-dim",

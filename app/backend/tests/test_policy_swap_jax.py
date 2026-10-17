@@ -88,8 +88,7 @@ def test_swap_policies_uses_inference_loader_for_jax_checkpoint(monkeypatch):
     ]
     assert len(load_calls) == 1
     assert load_calls[0][0] == "/tmp/update_0000100"
-    assert load_calls[0][1]["device"] == "cpu"
-    assert "custom_objects" in load_calls[0][1]
+    assert load_calls[0][1] == {"device": "cpu"}
 
 
 def test_swap_policies_no_change_still_syncs_jax_runtime(monkeypatch):

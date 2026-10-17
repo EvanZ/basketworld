@@ -8,8 +8,8 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from basketworld.envs.basketworld_env_v2 import Team
-from train.config import get_parser
+from basketworld.domain import Team
+from basketworld_jax.train.config import get_parser
 
 
 BENCHMARK_ONLY_KEYS = {
@@ -24,7 +24,6 @@ BENCHMARK_ONLY_KEYS = {
     "num_envs",
     "output_json",
     "profile_top_k",
-    "runner",
     "sample_reset_seed",
     "seed",
     "training_team",
@@ -111,17 +110,6 @@ def build_benchmark_parser(description: str) -> argparse.ArgumentParser:
         type=int,
         default=10,
         help="Number of profile sections to keep in ranked output.",
-    )
-    parser.add_argument(
-        "--runner",
-        choices=["sequential", "dummy_vec", "subproc_vec"],
-        default="sequential",
-        help=(
-            "Execution path to benchmark. "
-            "'sequential' steps wrapped envs in-process one at a time; "
-            "'dummy_vec' uses SB3 DummyVecEnv; "
-            "'subproc_vec' uses SB3 SubprocVecEnv like the current training stack."
-        ),
     )
     parser.add_argument(
         "--no-progress",

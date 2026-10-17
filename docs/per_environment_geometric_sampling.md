@@ -1,5 +1,8 @@
 # Per-Environment Geometric Sampling
 
+> **Historical SB3 implementation note.** Its commands and source paths are
+> retired. Current training and opponent sampling are JAX-native.
+
 ## Final Implementation
 
 After testing different approaches, we've settled on **per-environment geometric sampling** as the optimal balance between diversity, performance, and control.
@@ -273,4 +276,3 @@ If 10 unique opponents across 16 workers:
 2. **Performance-weighted**: Sample "challenging" opponents more often
 3. **Stratified sampling**: Ensure representation from each quintile of history
 4. **Dynamic K**: Increase pool size as training progresses
-

@@ -32,7 +32,6 @@ _BOUND_GAME_STATE_MODULES = (
     "app.backend.routes.playable_routes",
     "app.backend.routes.lifecycle_routes",
     "app.backend.observations",
-    "app.backend.mcts",
     "app.backend.routes.media_routes",
 )
 _BOUND_GAME_STATE_LOCK = threading.RLock()
@@ -199,4 +198,3 @@ def bind_game_state(target_state: GameState) -> Iterator[None]:
 
 
 playable_session_store = PlayableSessionStore()
-

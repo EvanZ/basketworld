@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
-from basketworld.envs.basketworld_env_v2 import Team
+from basketworld.domain import Team
 from app.backend.playable_analytics import playable_analytics_emitter
 from app.backend.playable_session_store import (
     PLAYABLE_SESSION_HEADER,
@@ -17,9 +17,6 @@ from app.backend.playable_session_store import (
     playable_session_store,
 )
 from app.backend.routes.lifecycle_routes import init_game as init_game_route
-from app.backend.routes.lifecycle_routes import (
-    _initialize_app_selector_runtime_for_episode,
-)
 from app.backend.routes.lifecycle_routes import step as lifecycle_step
 from app.backend.schemas import (
     ActionRequest,
@@ -46,7 +43,6 @@ PLAYABLE_MAX_PERIOD_MINUTES = 60
 PLAYABLE_CLOCK_TICK_SECONDS = 1
 PLAYABLE_DEMO_ENABLED_ENV = "BW_PLAYABLE_DEMO_ENABLED"
 PLAYABLE_DEMO_RUN_ID_ENV = "BW_PLAYABLE_DEMO_RUN_ID"
-PLAYABLE_DEMO_ALTERNATION_ENV = "BW_PLAYABLE_DEMO_ALTERNATION_NUMBER"
 PLAYABLE_DEMO_CHECKPOINT_ENV = "BW_PLAYABLE_DEMO_CHECKPOINT"
 PLAYABLE_DEMO_POLICY_NAME_ENV = "BW_PLAYABLE_DEMO_POLICY_NAME"
 PLAYABLE_DEMO_PERIOD_MODE_ENV = "BW_PLAYABLE_DEMO_PERIOD_MODE"
@@ -209,9 +205,7 @@ def _build_playable_config_info(session: dict[str, Any]) -> dict[str, Any]:
 
 def _build_playable_demo_config() -> dict[str, Any]:
     run_id = str(os.getenv(PLAYABLE_DEMO_RUN_ID_ENV) or "").strip()
-    checkpoint = _to_int(os.getenv(PLAYABLE_DEMO_ALTERNATION_ENV))
-    if checkpoint is None:
-        checkpoint = _to_int(os.getenv(PLAYABLE_DEMO_CHECKPOINT_ENV))
+    checkpoint = _to_int(os.getenv(PLAYABLE_DEMO_CHECKPOINT_ENV))
 
     raw_enabled = str(os.getenv(PLAYABLE_DEMO_ENABLED_ENV) or "").strip()
     if not raw_enabled:
@@ -235,13 +229,10 @@ def _build_playable_demo_config() -> dict[str, Any]:
     if enabled and not run_id:
         reason = f"Missing {PLAYABLE_DEMO_RUN_ID_ENV}"
     elif enabled and checkpoint is None:
-        reason = (
-            f"Missing {PLAYABLE_DEMO_ALTERNATION_ENV}"
-            f" (or {PLAYABLE_DEMO_CHECKPOINT_ENV})"
-        )
+        reason = f"Missing {PLAYABLE_DEMO_CHECKPOINT_ENV}"
 
     policy_name_override = str(os.getenv(PLAYABLE_DEMO_POLICY_NAME_ENV) or "").strip()
-    default_policy_name = f"unified_iter_{int(checkpoint)}.zip" if checkpoint is not None else ""
+    default_policy_name = f"update_{int(checkpoint):07d}" if checkpoint is not None else ""
 
     return {
         "enabled": bool(enabled),
@@ -513,7 +504,7 @@ def _get_playable_matrix_from_json() -> dict[int, dict[str, dict[str, Any]]]:
             matrix[players][diff_key] = {
                 "run_id": run_id,
                 "checkpoint_index": int(checkpoint),
-                "policy_name": policy_name or f"unified_iter_{int(checkpoint)}.zip",
+                "policy_name": policy_name or f"update_{int(checkpoint):07d}",
                 "available": True,
             }
     return matrix
@@ -541,7 +532,7 @@ def _load_playable_matrix() -> dict[int, dict[str, dict[str, Any]]]:
                 matrix[players][diff] = {
                     "run_id": run_id,
                     "checkpoint_index": int(checkpoint),
-                    "policy_name": policy_name or f"unified_iter_{int(checkpoint)}.zip",
+                    "policy_name": policy_name or f"update_{int(checkpoint):07d}",
                     "available": True,
                 }
             elif run_id or checkpoint is not None:
@@ -844,37 +835,19 @@ def _reset_playable_possession(session: dict[str, Any]) -> dict[str, Any]:
     )
 
     jax_runtime = getattr(game_state, "jax_runtime", None)
-    if jax_runtime is not None:
-        state = jax_runtime.reset_playable_possession(
-            game_state=game_state,
-            user_team=current_team,
-            offense_skills=offense_skill_set if has_expected_skill_len else None,
-            shot_clock=24,
-        )
-        game_state.sampled_offense_skills = (
-            copy.deepcopy(offense_skill_set)
-            if has_expected_skill_len
-            else _read_env_offense_skills()
-        )
-        game_state.episode_states.append(copy.deepcopy(state))
-        return state
-
-    reset_options: dict[str, Any] = {"shot_clock": 24}
-    if has_expected_skill_len:
-        reset_options["offense_skills"] = offense_skill_set
-
-    game_state.obs, _ = env.reset(options=reset_options)
-    game_state.prev_obs = None
-    _initialize_app_selector_runtime_for_episode()
-    _capture_turn_start_snapshot()
-
+    if jax_runtime is None:
+        raise HTTPException(status_code=400, detail="JAX runtime is not initialized.")
+    state = jax_runtime.reset_playable_possession(
+        game_state=game_state,
+        user_team=current_team,
+        offense_skills=offense_skill_set if has_expected_skill_len else None,
+        shot_clock=24,
+    )
     game_state.sampled_offense_skills = (
         copy.deepcopy(offense_skill_set)
         if has_expected_skill_len
         else _read_env_offense_skills()
     )
-
-    state = get_ui_game_state()
     game_state.episode_states.append(copy.deepcopy(state))
     return state
 
@@ -1293,7 +1266,6 @@ def playable_step(
                 actions=user_actions,
                 player_deterministic=not auto_user_actions,
                 opponent_deterministic=False,
-                use_mcts=False,
             )
         )
 

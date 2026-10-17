@@ -6,11 +6,10 @@ action at each simulation step, the environment resolves the joint action, and
 the episode ends on a made basket, turnover, defensive rebound, rule violation,
 or shot-clock expiration. An offensive rebound can extend the possession.
 
-The primary implementation is the batched JAX stack in `basketworld_jax/`. It
+The only supported implementation is the batched JAX stack in `basketworld_jax/`. It
 contains the environment kernel, Flax actor-critic, custom PPO runtime, intent
-learning, evaluation, and Orbax checkpoints. The older Python/Gymnasium and
-Stable-Baselines3 implementation remains in `basketworld/` and `train/` for
-legacy checkpoints, parity tests, and historical context.
+learning, evaluation, and Orbax checkpoints. Retired architectures are described
+only as historical context; their code and checkpoint loaders are not supported.
 
 !!! note "Scope"
 

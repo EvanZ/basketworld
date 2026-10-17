@@ -1,5 +1,8 @@
 # Per-Episode Opponent Sampling
 
+> **Historical SB3 implementation note.** Its commands and checkpoint format are
+> retired. The supported opponent-sampling implementation is JAX-native.
+
 ## Problem
 
 When training with self-play and sampling opponents only **once per alternation**, the agent trains against the same opponent for potentially millions of timesteps. This leads to:
@@ -211,4 +214,3 @@ Potential improvements:
 - OpenAI Five: Used opponent pools of 5-10 past checkpoints
 - AlphaStar: Maintained league of diverse opponents
 - Dota 2 AI: "Past Self Play" with rolling window of historical agents
-

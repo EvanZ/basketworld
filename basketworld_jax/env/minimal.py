@@ -1543,11 +1543,6 @@ def build_kernel_static_from_config(
     return _build_kernel_static_from_source(build_static_environment(config), xp)
 
 
-def build_kernel_static_from_env(env, xp) -> KernelStatic:
-    """Temporary compatibility adapter for parity tests and unmigrated callers."""
-    return _build_kernel_static_from_source(env, xp)
-
-
 def _build_kernel_static_from_source(env, xp) -> KernelStatic:
     episode_end_mode_name = str(
         getattr(env, "episode_end_mode", "possessions") or "possessions"

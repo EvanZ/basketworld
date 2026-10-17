@@ -3,10 +3,10 @@
 ## Joint action space
 
 The environment receives one discrete action for every player. With \(2N\)
-players, the Gymnasium representation is:
+players, a batched action tensor has shape:
 
 ```python
-spaces.MultiDiscrete([14] * (2 * players_per_side))
+(batch, 2 * players_per_side)
 ```
 
 All choices describe the same simulation interval. They are not executed as

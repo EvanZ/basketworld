@@ -59,7 +59,7 @@ up freely but cannot pick up until the countdown ends.
 - **Continue** extends a completed run from its latest checkpoint in the same MLflow run. The update target changes, but checkpoint-compatible training settings do not.
 - **Stop** sends SIGTERM to the verified worker process group. It is distinct from pause and does not promise a fresh checkpoint. A stopped run can be deliberately recovered from its last validated checkpoint.
 
-Every durable checkpoint records its Git commit, tracked-worktree cleanliness, and (when dirty) a SHA-256 fingerprint of the tracked diff. The trainer app compares that record with the current checkout before Resume, Recover, or Continue. An exact match proceeds normally; a mismatch, unavailable Git metadata, or a legacy checkpoint requires explicit confirmation. This provenance is diagnostic only—it does not guarantee dependency or runtime compatibility.
+Every durable JAX checkpoint records its Git commit, tracked-worktree cleanliness, and (when dirty) a SHA-256 fingerprint of the tracked diff. The trainer app compares that record with the current checkout before Resume, Recover, or Continue. An exact match proceeds normally; a mismatch or unavailable Git metadata requires explicit confirmation. Non-JAX checkpoints are rejected. This provenance is diagnostic only—it does not guarantee dependency or runtime compatibility.
 
 For check-based made-basket restarts, the trainer configuration exposes **Pre-check setup steps**, **Check pickup seconds**, and **Check-clearance rings**. New configurations use five seconds for setup and five seconds for pickup. A nonzero clearance uses a deterministic eligible pickup anchor outside the clearance arc by default; **Randomize check location** is an opt-in that instead samples an eligible tile. In either mode, the protected disk, plus one inbounds ring, must fit on the court. During setup, the offense may position freely but cannot pick up; defenders outside the disk cannot enter it, and defenders inside must use unoccupied outward moves whenever available. The defense receives the entire setup period to clear, and only a defender remaining inside at the final setup boundary is penalized. During pickup, defenders cannot enter the disk until the offense collects the ball. A defensive violation awards the offense one point and restarts the same possession with a defensive technical. Nonzero-clearance policies use the check-clearance observation schema and should train from scratch.
 
@@ -108,7 +108,7 @@ families so MLflow does not create hundreds of charts or exhaust browser local
 storage. Set the profile to `full` when a diagnostic run needs every scalar;
 the profile never changes training logic or the JSON/checkpoint artifacts.
 
-The application schema excludes legacy SB3/shared-parser arguments that the JAX
+The application schema excludes retired arguments that the JAX
 trainer does not consume. For example, use `rollout_horizon` rather than
 `n_steps`, `policy_update_epochs` rather than `n_epochs`, `kernel_batch_size`
 rather than `num_envs`, and the JAX evaluation cadence fields rather than

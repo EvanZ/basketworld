@@ -6,85 +6,51 @@ from app.backend.schemas import ActionRequest
 from app.backend.state import game_state
 
 
-class DummyEnv:
-    def __init__(self, n_players: int = 2):
-        self.n_players = n_players
-        self.offense_ids = list(range(n_players // 2))
-        self.defense_ids = list(range(n_players // 2, n_players))
-        self.training_team = None
-        self.ball_holder = 0
-        self.shot_clock = 24
-        self.pass_mode = "directional"
-        self.pointer_targets = {}
+class DummyJaxRuntime:
+    def __init__(self):
+        self.requests = []
 
-    def set_pointer_pass_targets(self, targets):
-        self.pointer_targets = dict(targets or {})
-
-    def step(self, actions):
-        # Return numpy-heavy structures to exercise JSON encoding
-        obs = {
-            "obs": np.array([[1, 2], [3, 4]]),
-            "action_mask": np.ones((self.n_players, len(lifecycle_routes.ActionType))),
+    def step(self, request, state):
+        self.requests.append((request, state))
+        first_action = request.actions.get("0")
+        metadata = first_action if isinstance(first_action, dict) else {"action": first_action}
+        return {
+            "status": "success",
+            "state": {"positions": np.asarray([[1, 2], [3, 4]])},
+            "actions_taken": {"0": "PASS_0" if metadata.get("type") == "PASS" else "NOOP"},
+            "actions_taken_meta": {"0": metadata},
+            "step_rewards": {"offense": np.float32(0.1), "defense": np.float32(-0.1)},
+            "episode_rewards": {"offense": np.float32(0.1), "defense": np.float32(-0.1)},
         }
-        reward = [0.1] * self.n_players
-        done = False
-        info = {"phi_ep_by_player": np.array([0.5] * self.n_players)}
-        return obs, reward, done, False, info
 
 
 @pytest.fixture(autouse=True)
-def setup_dummy_env():
-    # Reset game_state to a minimal dummy env before each test
-    game_state.env = DummyEnv(n_players=2)
-    game_state.obs = {
-        "obs": np.zeros((2, 2)),
-        "action_mask": np.ones((2, len(lifecycle_routes.ActionType))),
-    }
-    game_state.prev_obs = None
-    game_state.reward_history = []
-    game_state.episode_rewards = {"offense": 0.0, "defense": 0.0}
-    game_state.frames = []
-    game_state.actions_log = []
-    yield
-    # Teardown: clear env
-    game_state.env = None
-    game_state.obs = None
+def setup_jax_runtime():
+    runtime = DummyJaxRuntime()
+    game_state.jax_runtime = runtime
+    yield runtime
+    game_state.jax_runtime = None
 
 
-def test_step_route_handles_legacy_action_payloads_and_serializes_response():
+def test_step_route_dispatches_action_payload_and_serializes_response(setup_jax_runtime):
     body = lifecycle_routes.step(
-        ActionRequest(
-            actions={
-                "0": {"action": 0},
-                "1": 1,
-            },
-            team="OFFENSE",
-        )
+        ActionRequest(actions={"0": {"action": 0}, "1": 1}, team="OFFENSE")
     )
 
     assert body["status"] == "success"
-    assert "state" in body and isinstance(body["state"], dict)
-    assert "episode_rewards" in body and isinstance(body["episode_rewards"], dict)
-    # Step rewards/episode rewards should be JSON-friendly
+    assert body["state"]["positions"] == [[1, 2], [3, 4]]
     assert isinstance(body["step_rewards"]["offense"], float)
-    assert isinstance(body["step_rewards"]["defense"], float)
+    assert setup_jax_runtime.requests[0][0].actions["0"] == {"action": 0}
 
 
-def test_step_route_accepts_structured_pointer_pass_payload():
-    game_state.env.pass_mode = "pointer_targeted"
-
+def test_step_route_preserves_structured_pointer_pass_payload(setup_jax_runtime):
     body = lifecycle_routes.step(
-        ActionRequest(
-            actions={
-                "0": {"type": "PASS", "target": 1},
-                "1": 0,
-            },
-            team="OFFENSE",
-        )
+        ActionRequest(actions={"0": {"type": "PASS", "target": 1}, "1": 0})
     )
 
-    assert body["status"] == "success"
-    assert body["actions_taken"]["0"].startswith("PASS")
-    assert body["actions_taken_meta"]["0"]["type"] == "PASS"
-    assert body["actions_taken_meta"]["0"]["target"] == 1
-    assert game_state.env.pointer_targets.get(0) == 1
+    assert body["actions_taken"]["0"] == "PASS_0"
+    assert body["actions_taken_meta"]["0"] == {"type": "PASS", "target": 1}
+    assert setup_jax_runtime.requests[0][0].actions["0"] == {
+        "type": "PASS",
+        "target": 1,
+    }

@@ -44,11 +44,9 @@ three-point and clearance regions, lane masks, inbound/check positions, player
 indices, template arrays, and all rule constants without constructing a Gym
 environment.
 
-`build_kernel_static_from_env(...)` remains temporarily as a parity adapter for
-tests and interactive callers covered by #71. Native deploy, historical
-opponent, fixed-pool, Skill Ratings, and checkpoint inference construction use
-`build_kernel_static_from_config(...)`. Issue #72 removes the adapter and
-retired runtime after the interactive migration.
+Training, native evaluation, historical-opponent evaluation, fixed-pool studies,
+Skill Ratings, inference, and the interactive backend all construct static state
+through `build_kernel_static_from_config(...)`.
 
 ## Evaluation and inference
 
@@ -75,15 +73,12 @@ same JAX-native seeded reset path. Training does not construct
 Stable-Baselines3.
 
 The JAX trainer owns `episode_end_mode`, `game_clock_seconds`,
-`overtime_seconds`, and `game_clock_max_total_steps`. The legacy Gym
-constructor no longer accepts or validates those fields.
+`overtime_seconds`, and `game_clock_max_total_steps`.
 
 ## Compatibility policy
 
 JAX checkpoints are the only supported checkpoint format. Configuration and
 MLflow metadata names remain stable unless a versioned migration explicitly
 changes them. Additive multi-possession checkpoint schemas 2, 3, and 4 are
-normalized to runtime schema 4; check-clearance schema 5 remains strict. During
-the unwind, deterministic tests compare the JAX-owned static output against the
-legacy implementation; the legacy implementation is a temporary oracle, not a
-supported final runtime.
+normalized to runtime schema 4; check-clearance schema 5 remains strict. No
+Python/Gym environment or non-JAX checkpoint path remains as a runtime oracle.

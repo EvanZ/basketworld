@@ -9,7 +9,6 @@ from basketworld_jax.inference import UnsupportedCheckpointFormatError
 from app.backend.inference_adapters import (
     InferencePolicyAdapter,
     JAXInferenceAdapter,
-    SB3PPOInferenceAdapter,
     get_policy_backend_kind,
     get_policy_capabilities,
     get_policy_metadata,
@@ -49,8 +48,11 @@ class _FakeJAXRawModel:
             }
         }
         self.attention_payload_calls = []
+        self.policy = _FakePolicyModule()
+        self.predict_calls = []
 
     def predict(self, obs, deterministic: bool = False):
+        self.predict_calls.append((obs, bool(deterministic)))
         return [0], None
 
     def action_probabilities(self, obs):
@@ -90,30 +92,30 @@ class _FakeCustomAdapter(InferencePolicyAdapter):
         self.prepare_calls.append((env, bool(observer_is_offense)))
 
 
-def test_sb3_adapter_delegates_predict_and_pass_mode():
-    raw_model = _FakeRawModel()
-    adapter = SB3PPOInferenceAdapter(raw_model)
+def test_jax_adapter_delegates_predict_and_pass_mode():
+    raw_model = _FakeJAXRawModel("mlp")
+    adapter = JAXInferenceAdapter(raw_model)
 
     actions, _ = adapter.predict({"obs": [0]}, deterministic=True)
     adapter.set_pass_mode("directional")
 
-    assert actions == [1, 2, 3]
+    assert actions == [0]
     assert raw_model.predict_calls == [({"obs": [0]}, True)]
     assert raw_model.policy.pass_mode == "directional"
 
 
 def test_adapter_unwrap_and_capabilities_helpers():
-    raw_model = _FakeRawModel()
-    adapter = SB3PPOInferenceAdapter(raw_model)
+    raw_model = _FakeJAXRawModel("mlp")
+    adapter = JAXInferenceAdapter(raw_model)
 
     assert unwrap_inference_model(adapter) is raw_model
     assert unwrap_policy_module(adapter) is raw_model.policy
-    assert get_policy_backend_kind(adapter) == "sb3"
+    assert get_policy_backend_kind(adapter) == "jax"
 
     capabilities = get_policy_capabilities(adapter)
     assert capabilities is not None
     assert capabilities["player_controls"] is True
-    assert capabilities["attention"] is True
+    assert capabilities["attention"] is False
 
 
 def test_jax_adapter_enables_attention_only_for_attention_checkpoints():

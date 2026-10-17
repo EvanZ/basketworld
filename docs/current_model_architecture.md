@@ -1,5 +1,9 @@
 # Current Model Architecture
 
+> **Historical SB3 architecture.** The files linked below were removed when the
+> application became JAX-only. See [JAX Codebase Overview](jax_codebase_overview.md)
+> for the supported architecture.
+
 This document describes the current `set_obs + integrated selector + step discriminator` stack at a high level and then zooms into each major section.
 
 The diagrams below match the implementation in:

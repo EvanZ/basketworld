@@ -6,7 +6,7 @@ import pytest
 jax = pytest.importorskip("jax")
 import jax.numpy as jnp
 
-from basketworld.envs.basketworld_env_v2 import ActionType
+from basketworld.domain import ActionType
 from basketworld_jax.env.minimal import (
     GAME_PHASE_AWAITING_INBOUND,
     GAME_PHASE_LIVE,
