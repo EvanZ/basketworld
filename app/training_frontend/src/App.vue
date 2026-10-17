@@ -19,11 +19,6 @@ import {
   parseHistoricalEvalUpdates,
 } from './configEditing'
 import { launchGitCommit, launchWorktreeState } from './runProvenance'
-import {
-  episodeEndMode,
-  modeConfigFieldIsVisible,
-  withModeConfigValue,
-} from './gameModeConfig'
 
 const defaultConfig = () => ({
   name: `halfcourt-${new Date().toISOString().slice(0, 10)}`,
@@ -43,18 +38,8 @@ const defaultConfig = () => ({
   check_clearance: 0,
   random_check_location: false,
   multi_possession_use_inbounds: true,
-  overrides: {
-    episode_end_mode: 'possessions',
-    game_clock_seconds: 300,
-    overtime_seconds: 120,
-  },
+  overrides: {},
 })
-
-const GAME_MODE_SECTION_FIELDS = new Set([
-  'episode_end_mode',
-  'game_clock_seconds',
-  'overtime_seconds',
-])
 
 const PIN_STORAGE_KEY = 'basketworld.training.pinned-configs.v1'
 const PIN_MIGRATION_KEY = 'basketworld.training.pinned-configs.migration.v1'
@@ -239,27 +224,16 @@ const canStop = computed(() => ['starting', 'running', 'pausing'].includes(selec
 const provenanceComparison = computed(() => selected.value?.provenance_comparison || null)
 const filteredConfigSchema = computed(() => {
   const query = configSearch.value.trim().toLowerCase()
-  const mode = episodeEndMode(config.value)
   return configSchema.value.filter((field) => {
     if (field.frozen && !showFrozenConfigs.value) return false
     if (field.internal && !showInternalConfigs.value) return false
-    if (GAME_MODE_SECTION_FIELDS.has(field.name)) return false
-    if (!modeConfigFieldIsVisible(field.name, mode)) return false
     return !query || [field.name, field.help, field.category, field.type]
       .some((value) => String(value || '').toLowerCase().includes(query))
   })
 })
 const pinnedConfigFields = computed(() => pinnedConfigNames.value
   .map((name) => configSchema.value.find((field) => field.name === name))
-  .filter((field) => Boolean(field)
-    && !GAME_MODE_SECTION_FIELDS.has(field.name)
-    && modeConfigFieldIsVisible(field.name, episodeEndMode(config.value))))
-const selectedEpisodeEndMode = computed(() => episodeEndMode(config.value))
-const gameModeFields = computed(() => Object.fromEntries(
-  [...GAME_MODE_SECTION_FIELDS]
-    .map((name) => [name, configSchema.value.find((field) => field.name === name)])
-    .filter(([, field]) => Boolean(field)),
-))
+  .filter(Boolean))
 const filteredRunConfig = computed(() => {
   const query = runConfigSearch.value.trim().toLowerCase()
   const fields = selected.value?.resolved_config || []
@@ -562,13 +536,6 @@ function fieldLabel(field) {
     overtime_seconds: 'Overtime duration (seconds)',
   }
   return labels[field.name] || field.name.replaceAll('_', ' ')
-}
-
-function setGameModeValue(name, rawValue) {
-  const field = gameModeFields.value[name]
-  if (!field) return
-  const value = parseConfigFieldValue(field, rawValue)
-  config.value = withModeConfigValue(config.value, name, value)
 }
 
 function fieldIsEditable(field) {
@@ -954,61 +921,6 @@ onBeforeUnmount(() => {
             </p>
           </section>
           <label class="wide"><span class="label-title">MLflow tracking URI <button type="button" class="info-button" :title="'Address of the MLflow tracking server used for parameters, metrics, and artifacts.\n\nType: str\nDefault: http://localhost:5000'">i</button></span><input v-model="config.mlflow_tracking_uri" required maxlength="2048" placeholder="http://localhost:5000" /></label>
-          <section class="game-mode-config wide" aria-labelledby="game-mode-heading">
-            <div class="game-mode-heading">
-              <div>
-                <strong id="game-mode-heading">Training game mode</strong>
-                <small><code>episode_end_mode</code> · choose Game clock to configure regulation and overtime.</small>
-              </div>
-              <div class="mode-selector" role="radiogroup" aria-label="Training game mode">
-                <label :class="{ active: selectedEpisodeEndMode === 'possessions' }">
-                  <input
-                    type="radio"
-                    name="episode-end-mode"
-                    value="possessions"
-                    :checked="selectedEpisodeEndMode === 'possessions'"
-                    @change="setGameModeValue('episode_end_mode', 'possessions')"
-                  />
-                  Possessions
-                </label>
-                <label :class="{ active: selectedEpisodeEndMode === 'game_clock' }">
-                  <input
-                    type="radio"
-                    name="episode-end-mode"
-                    value="game_clock"
-                    :checked="selectedEpisodeEndMode === 'game_clock'"
-                    @change="setGameModeValue('episode_end_mode', 'game_clock')"
-                  />
-                  Game clock
-                </label>
-              </div>
-            </div>
-            <div v-if="selectedEpisodeEndMode === 'game_clock'" class="game-clock-fields">
-              <label v-if="gameModeFields.game_clock_seconds">
-                <span class="label-title">Regulation duration <button type="button" class="info-button" :title="configHelp('game_clock_seconds')">i</button></span>
-                <input
-                  type="number"
-                  min="1"
-                  :value="configFieldValue(gameModeFields.game_clock_seconds)"
-                  @input="setGameModeValue('game_clock_seconds', $event.target.value)"
-                />
-                <small>Default 5:00</small>
-              </label>
-              <label v-if="gameModeFields.overtime_seconds">
-                <span class="label-title">Overtime duration <button type="button" class="info-button" :title="configHelp('overtime_seconds')">i</button></span>
-                <input
-                  type="number"
-                  min="1"
-                  :value="configFieldValue(gameModeFields.overtime_seconds)"
-                  @input="setGameModeValue('overtime_seconds', $event.target.value)"
-                />
-                <small>Default 2:00 · fixed for every overtime</small>
-              </label>
-            </div>
-            <p v-else class="game-mode-note">
-              Possession mode is selected. Possession limit, curriculum, and possession-overtime settings are available below.
-            </p>
-          </section>
           <section class="pinned-configs wide">
             <div class="pinned-heading">
               <div><strong>Pinned configs</strong><small>Keep frequently used settings at the top of the form.</small></div>
