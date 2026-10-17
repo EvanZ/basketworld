@@ -957,10 +957,10 @@ onBeforeUnmount(() => {
           <section class="game-mode-config wide" aria-labelledby="game-mode-heading">
             <div class="game-mode-heading">
               <div>
-                <strong id="game-mode-heading">Episode format</strong>
-                <small>Applies when this new run starts. Switching keeps each mode's saved values.</small>
+                <strong id="game-mode-heading">Training game mode</strong>
+                <small><code>episode_end_mode</code> · choose Game clock to configure regulation and overtime.</small>
               </div>
-              <div class="mode-selector" role="radiogroup" aria-label="Episode format">
+              <div class="mode-selector" role="radiogroup" aria-label="Training game mode">
                 <label :class="{ active: selectedEpisodeEndMode === 'possessions' }">
                   <input
                     type="radio"
@@ -1006,7 +1006,7 @@ onBeforeUnmount(() => {
               </label>
             </div>
             <p v-else class="game-mode-note">
-              Possession limit, curriculum, and possession-overtime settings are available below.
+              Possession mode is selected. Possession limit, curriculum, and possession-overtime settings are available below.
             </p>
           </section>
           <section class="pinned-configs wide">

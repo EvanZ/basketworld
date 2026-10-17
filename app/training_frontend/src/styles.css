@@ -58,6 +58,7 @@ button.ghost { background: transparent; }
 .game-mode-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
 .game-mode-heading > div:first-child { display: grid; gap: 3px; }
 .game-mode-heading small, .game-mode-note, .game-clock-fields small { margin: 0; color: #8ba2be; font-size: 11px; }
+.game-mode-heading code { color: #9de9ff; font: inherit; }
 .mode-selector { display: inline-flex; padding: 3px; border: 1px solid #2a4a68; border-radius: 9px; background: #08182a; }
 .mode-selector label { display: block; padding: 7px 11px; border-radius: 6px; color: #8ba2be; cursor: pointer; }
 .mode-selector label.active { color: #06111e; background: #45d6ff; font-weight: 800; }
