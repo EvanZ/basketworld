@@ -103,7 +103,7 @@ def summarize_clock_metrics(
         },
         "denominators": {
             "offensive_efficiency": "completed offensive possessions",
-            "pace": "elapsed game-clock minutes, including overtime and stopped phases",
+            "pace": "elapsed game-clock minutes, including overtime and check pickup, excluding check setup and inbounds",
             "possession_duration": "completed possessions, measured in elapsed game-clock seconds",
             "per_game": "games in this completion group",
             "zero_denominator_value": 0.0,

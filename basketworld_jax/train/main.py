@@ -4701,13 +4701,17 @@ def _historical_episode_rows(
                 elapsed_game_clock_seconds[episode_index]
             ),
             "terminal_overtime_periods": (
-                int(overtime_round[episode_index]) if completed else 0
+                int(overtime_round[episode_index])
             ),
             "terminal_game_clock_seconds_remaining": (
-                int(game_clock_remaining[episode_index]) if completed else 0
+                int(game_clock_remaining[episode_index])
             ),
         }
         for key in HISTORICAL_MATCH_DIAGNOSTIC_KEYS:
+            # Final-state values also describe safety and horizon cutoffs.
+            # Completed-game-only counters must not overwrite them with zero.
+            if key in row:
+                continue
             values = diagnostic_arrays.get(key)
             if values is None:
                 row[key] = 0.0 if key in HISTORICAL_MATCH_FLOAT_DIAGNOSTIC_KEYS else 0

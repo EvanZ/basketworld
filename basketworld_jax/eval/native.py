@@ -1647,6 +1647,9 @@ def _build_native_eval_runner(
                     env_out.state.team_b_completed_possessions.astype(jnp.int32)
                 ),
                 "overtime_round": env_out.state.overtime_round.astype(jnp.int32),
+                "game_clock_remaining": env_out.state.game_clock_remaining.astype(
+                    jnp.int32
+                ),
                 "overtime_possessions_completed": (
                     env_out.state.overtime_possessions_completed.astype(jnp.int32)
                 ),
@@ -1893,15 +1896,12 @@ def _episode_stats_from_trace(
         "overtime_period_start_count": np.asarray(
             trace.get("overtime_period_started", np.zeros_like(done_trace))
         )[:, :take].sum(axis=0),
-        "terminal_overtime_periods": np.asarray(
-            trace.get("terminal_overtime_periods", np.zeros_like(done_trace))
-        )[:, :take].sum(axis=0),
-        "terminal_game_clock_seconds_remaining": np.asarray(
-            trace.get(
-                "terminal_game_clock_seconds_remaining",
-                np.zeros_like(done_trace),
-            )
-        )[:, :take].sum(axis=0),
+        # Read the post-step state at completion or cutoff. Terminal-event
+        # counters omit unfinished games, including safety/horizon truncations.
+        "terminal_overtime_periods": _final_trace_value("overtime_round", np.int32),
+        "terminal_game_clock_seconds_remaining": _final_trace_value(
+            "game_clock_remaining", np.int32
+        ),
         "terminal_completed_possessions": np.asarray(
             trace.get("terminal_completed_possessions", np.zeros_like(done_trace))
         )[:, :take].sum(axis=0),
