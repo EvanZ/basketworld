@@ -37,19 +37,21 @@ const defaultConfig = () => ({
   check_setup_steps: 5,
   check_clearance: 0,
   random_check_location: false,
+  require_all_offense_clear: false,
   multi_possession_use_inbounds: true,
   overrides: {},
 })
 
 const PIN_STORAGE_KEY = 'basketworld.training.pinned-configs.v1'
 const PIN_MIGRATION_KEY = 'basketworld.training.pinned-configs.migration.v1'
-const PIN_MIGRATION_VERSION = 'check-clearance-curriculum-v3'
+const PIN_MIGRATION_VERSION = 'team-offense-clearance-v4'
 const MIGRATED_PINNED_FIELDS = [
   'entropy_decay_updates',
   'shot_contest_skill_mean',
   'shot_contest_skill_std',
   'shot_contest_skill_effect_weight',
   'random_check_location',
+  'require_all_offense_clear',
 ]
 const METRIC_STORAGE_KEY = 'basketworld.training.sparkline-metrics.v1'
 const MAX_SELECTED_METRICS = 16
@@ -81,6 +83,7 @@ const DEFAULT_PINNED_FIELDS = [
   'check_setup_steps',
   'check_clearance',
   'random_check_location',
+  'require_all_offense_clear',
   'multi_possession_use_inbounds',
 ]
 const APP_CONFIG_KEYS = {
@@ -100,6 +103,7 @@ const APP_CONFIG_KEYS = {
   check_setup_steps: 'check_setup_steps',
   check_clearance: 'check_clearance',
   random_check_location: 'random_check_location',
+  require_all_offense_clear: 'require_all_offense_clear',
 }
 
 function loadPinnedConfigNames() {
@@ -291,6 +295,7 @@ const applicationConfigValues = computed(() => ({
   check_setup_steps: config.value.check_setup_steps,
   check_clearance: config.value.check_clearance,
   random_check_location: config.value.random_check_location,
+  require_all_offense_clear: config.value.require_all_offense_clear,
 }))
 
 function formatDate(value) {
@@ -490,6 +495,9 @@ function checkRuleNote(name) {
   if (name === 'check_clearance') {
     return 'A positive radius requires an eligible outside-arc pickup tile. Its protected disk and one extra inbounds ring must fit on the court. During setup, defenders outside cannot enter it and defenders inside must move outward when an unoccupied outward move exists; the offense may position freely.'
   }
+  if (name === 'require_all_offense_clear') {
+    return 'Each offensive player must clear the arc once per possession. Early shooting causes a turnover and one opponent point. Clearance survives cuts back inside and offensive rebounds; handling and passing remain allowed.'
+  }
   if (name === 'random_check_location') {
     return 'When enabled, each nonzero-clearance check samples uniformly from safe locations. When disabled, every check uses one deterministic safe anchor while retaining the same clearance rule.'
   }
@@ -530,6 +538,7 @@ function fieldLabel(field) {
     check_setup_steps: 'Pre-check setup steps',
     check_clearance: 'Check-clearance rings',
     random_check_location: 'Randomize check location',
+    require_all_offense_clear: 'Require all offense to clear the arc',
     multi_possession_use_inbounds: 'Use inbounds for dead-ball restarts',
     episode_end_mode: 'Episode format',
     game_clock_seconds: 'Regulation duration (seconds)',

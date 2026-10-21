@@ -40,6 +40,7 @@ from basketworld_jax.provenance import (
 )
 from basketworld_jax.env import (
     CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION,
+    TEAM_CLEARANCE_OBSERVATION_SCHEMA_VERSION,
     GAME_CLOCK_SCORE_DIFFERENCE_NORMALIZATION,
     GAME_CLOCK_TIME_NORMALIZATION_SECONDS,
     MULTI_POSSESSION_SCHEMA_VERSION,
@@ -286,6 +287,7 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "check_deadline_steps",
         "check_setup_steps",
         "check_clearance",
+        "require_all_offense_clear",
         "random_check_location",
     }
 )
@@ -429,6 +431,7 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "check_deadline_steps",
     "check_setup_steps",
     "check_clearance",
+    "require_all_offense_clear",
     "random_check_location",
 )
 
@@ -1313,6 +1316,16 @@ def build_train_parser():
         ),
     )
     parser.add_argument(
+        "--require-all-offense-clear",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Require every offensive player to clear the arc once per possession. "
+            "Shooting before team and ball clearance causes a turnover and one "
+            "opponent point. Handling and passing remain allowed. Requires multi-possession."
+        ),
+    )
+    parser.add_argument(
         "--random-check-location",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1705,6 +1718,12 @@ def _values_match(actual: Any, expected: Any) -> bool:
 
 
 def validate_train_args(args) -> None:
+    if bool(getattr(args, "require_all_offense_clear", False)) and not bool(
+        getattr(args, "enable_multi_possession", False)
+    ):
+        raise SystemExit(
+            "--require-all-offense-clear requires --enable-multi-possession."
+        )
     if bool(getattr(args, "run_fixed_pool_study", False)):
         if bool(getattr(args, "run_train_loop", False)):
             raise SystemExit(
@@ -2286,9 +2305,13 @@ def _jax_env_config_from_args(args) -> dict[str, Any]:
     config["multi_possession_limit"] = _multi_possession_final_limit(args)
     config["multi_possession_schema_version"] = (
         (
-            CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION
-            if int(getattr(args, "check_clearance", 0)) > 0
-            else MULTI_POSSESSION_SCHEMA_VERSION
+            TEAM_CLEARANCE_OBSERVATION_SCHEMA_VERSION
+            if bool(getattr(args, "require_all_offense_clear", False))
+            else (
+                CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION
+                if int(getattr(args, "check_clearance", 0)) > 0
+                else MULTI_POSSESSION_SCHEMA_VERSION
+            )
         )
         if bool(getattr(args, "enable_multi_possession", False)) else 1
     )
@@ -2336,6 +2359,7 @@ _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
     "check_deadline_steps": 5,
     "check_setup_steps": 0,
     "check_clearance": 0,
+    "require_all_offense_clear": False,
     "random_check_location": False,
     "pressure_skill_mean": 0.0,
     "pressure_skill_std": 0.0,
@@ -2359,7 +2383,9 @@ def _compatible_env_config_for_resume(
     out = dict(actual or {})
     for key in _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS:
         if key not in out and key in expected:
-            if key == "made_basket_restart_mode":
+            if key == "require_all_offense_clear":
+                out[key] = False
+            elif key == "made_basket_restart_mode":
                 out[key] = (
                     "baseline_inbound"
                     if bool(out.get("multi_possession_use_inbounds", True))
@@ -2760,15 +2786,19 @@ def _build_policy_spec(
         getattr(args, "rebound_target_observation_features", True)
     )
     multi_possession_features = bool(getattr(args, "enable_multi_possession", False))
-    check_clearance_features = (
-        multi_possession_features
-        and int(getattr(args, "check_clearance", 0)) > 0
+    check_clearance_features = multi_possession_features and (
+        int(getattr(args, "check_clearance", 0)) > 0
+        or bool(getattr(args, "require_all_offense_clear", False))
+    )
+    team_clearance_features = multi_possession_features and bool(
+        getattr(args, "require_all_offense_clear", False)
     )
     token_dim, global_dim = token_observation_dims(
         rebound_win_prob_features,
         rebound_target_observation_features,
         multi_possession_features,
         check_clearance_features,
+        team_clearance_features,
     )
     return build_actor_critic_spec(
         flat_obs_np,
@@ -2810,9 +2840,13 @@ def _build_policy_spec(
         multi_possession_features=multi_possession_features,
         observation_schema_version=(
             (
-                CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION
-                if check_clearance_features
-                else MULTI_POSSESSION_SCHEMA_VERSION
+                TEAM_CLEARANCE_OBSERVATION_SCHEMA_VERSION
+                if team_clearance_features
+                else (
+                    CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION
+                    if check_clearance_features
+                    else MULTI_POSSESSION_SCHEMA_VERSION
+                )
             )
             if multi_possession_features else 1
         ),
@@ -2901,6 +2935,10 @@ def _checkpoint_observation_metadata(
             spec.rebound_target_observation_features
         ),
         multi_possession_features=bool(spec.multi_possession_features),
+        team_clearance_features=(
+            int(spec.observation_schema_version)
+            >= TEAM_CLEARANCE_OBSERVATION_SCHEMA_VERSION
+        ),
         check_clearance_features=(
             int(spec.observation_schema_version)
             >= CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION
@@ -3028,6 +3066,33 @@ def _validate_resume_checkpoint_payload(
         args=args,
         context="Resume checkpoint",
     )
+    if bool(getattr(args, "require_all_offense_clear", False)):
+        for name in ("current_state", "eval_initial_state"):
+            states = payload.get(name, {})
+            entries = (
+                states.values()
+                if isinstance(states, dict) and "positions" not in states
+                else (states,)
+            )
+            for state in entries:
+                flags = (
+                    state.get("offense_clearance")
+                    if isinstance(state, dict)
+                    else getattr(state, "offense_clearance", None)
+                )
+                positions = (
+                    state.get("positions")
+                    if isinstance(state, dict)
+                    else getattr(state, "positions", None)
+                )
+                if (
+                    flags is None
+                    or positions is None
+                    or np.shape(flags) != np.shape(positions)[:-1]
+                ):
+                    raise SystemExit(
+                        f"Resume checkpoint {name} is missing per-player offense clearance state."
+                    )
     expected_trainer_config = asdict(trainer_config)
     actual_trainer_config = dict(payload.get("trainer_config", {}))
     compatible_keys = [
@@ -4071,6 +4136,9 @@ def _log_mlflow_params(
         ),
         "jax/multi_possession_overtime_round_cap": int(
             getattr(args, "multi_possession_overtime_round_cap", 0)
+        ),
+        "jax/require_all_offense_clear": bool(
+            getattr(args, "require_all_offense_clear", False)
         ),
         "jax/check_clearance": int(getattr(args, "check_clearance", 0)),
         "jax/check_setup_steps": int(getattr(args, "check_setup_steps", 0)),
@@ -5275,6 +5343,9 @@ def _run_historical_match_evaluation(
         horizon=int(getattr(args, "historical_eval_horizon", 1024)),
     )
     summary["environment_contract"] = {
+        "require_all_offense_clear": bool(
+            getattr(args, "require_all_offense_clear", False)
+        ),
         "episode_end_mode": str(
             getattr(args, "episode_end_mode", "possessions") or "possessions"
         ),
@@ -7287,9 +7358,15 @@ def run_training_loop(args) -> dict[str, Any]:
             getattr(args, "rebound_target_observation_features", True)
         ),
         multi_possession_features=bool(getattr(args, "enable_multi_possession", False)),
+        team_clearance_features=(
+            bool(getattr(args, "require_all_offense_clear", False))
+        ),
         check_clearance_features=(
             bool(getattr(args, "enable_multi_possession", False))
-            and int(getattr(args, "check_clearance", 0)) > 0
+            and (
+                int(getattr(args, "check_clearance", 0)) > 0
+                or bool(getattr(args, "require_all_offense_clear", False))
+            )
         ),
     )
     action_masks = build_action_masks_batch(static, current_states["offense"], jnp)[
@@ -9608,9 +9685,15 @@ def run_train_scaffold(args) -> dict[str, Any]:
             getattr(args, "rebound_target_observation_features", True)
         ),
         multi_possession_features=bool(getattr(args, "enable_multi_possession", False)),
+        team_clearance_features=(
+            bool(getattr(args, "require_all_offense_clear", False))
+        ),
         check_clearance_features=(
             bool(getattr(args, "enable_multi_possession", False))
-            and int(getattr(args, "check_clearance", 0)) > 0
+            and (
+                int(getattr(args, "check_clearance", 0)) > 0
+                or bool(getattr(args, "require_all_offense_clear", False))
+            )
         ),
     )
     policy_intent_context = build_policy_intent_context_batch(static, state, jnp)

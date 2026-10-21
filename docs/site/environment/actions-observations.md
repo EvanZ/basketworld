@@ -296,3 +296,28 @@ existing latent player skills. Schema version 5 adds the positive
 check-clearance geometry and context fields. Checkpoint loading preserves the
 saved schema and rejects incompatible policy input dimensions rather than
 silently changing an older policy's observation meaning.
+
+### Optional team arc clearance (schema 6)
+
+With `require_all_offense_clear=true`, the policy receives schema 6: the schema-5
+features plus one `offense_cleared` value per player and one global
+`clearance_ready_to_shoot` value. The check-area features are retained even when
+`check_clearance=0`, so this option has one explicit observation layout. The
+player flag is zero for defenders; offensive flags latch when a player visits
+the existing arc-clearance region during setup, pickup, or live play. The global
+flag requires every offensive player cleared, ball clearance satisfied, and live
+play. It describes clearance readiness, not whether a particular player holds
+the ball. New possessions reset the flags; offensive rebounds and same-possession
+restarts preserve them.
+
+SHOOT remains available under existing holder/phase restrictions. Shooting before
+both clearance requirements pass causes a turnover and awards exactly one point
+to the opponent. Shots resolve before movement; a final player's crossing takes
+effect at the next decision. Handling, passing, catching, and rebounding remain
+allowed. Setup duration and clock semantics are unchanged.
+
+This option is disabled by default. Disabled runs keep their existing observation
+schema and ball-clearance violation consequences. Enabled runs train from scratch;
+checkpoint resume restores the setting and latched flags. The trainer and native,
+historical, and interactive evaluation use the same rule. Existing pace metrics
+measure its effect without introducing a time-to-clearance metric.

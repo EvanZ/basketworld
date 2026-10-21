@@ -44,6 +44,7 @@ def token_observation_dims(
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
     check_clearance_features: bool = False,
+    team_clearance_features: bool = False,
 ) -> tuple[int, int]:
     """Return player/global token dimensions for the selected observation schema."""
     player_dim = TOKEN_OBS_PLAYER_DIM
@@ -60,6 +61,9 @@ def token_observation_dims(
     if bool(check_clearance_features):
         player_dim += TOKEN_OBS_CHECK_CLEARANCE_PLAYER_DIM
         global_dim += TOKEN_OBS_CHECK_CLEARANCE_GLOBAL_DIM
+    if team_clearance_features:
+        player_dim += 1
+        global_dim += 1
     return player_dim, global_dim
 
 
@@ -68,6 +72,7 @@ def token_observation_labels(
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
     check_clearance_features: bool = False,
+    team_clearance_features: bool = False,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Return the ordered labels for the selected token-observation schema."""
     player_labels = [
@@ -144,6 +149,9 @@ def token_observation_labels(
                 "check_timer_remaining_fixed_norm",
             )
         )
+    if team_clearance_features:
+        player_labels.append("offense_cleared")
+        global_labels.append("clearance_ready_to_shoot")
     return tuple(player_labels), tuple(global_labels)
 TURNOVER_REASON_NONE = 0
 TURNOVER_REASON_PASS_OUT_OF_BOUNDS = 1
@@ -204,6 +212,7 @@ MULTI_POSSESSION_REWARD_MODE_IDS = {
 }
 MULTI_POSSESSION_SCHEMA_VERSION = 4
 CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION = 5
+TEAM_CLEARANCE_OBSERVATION_SCHEMA_VERSION = 6
 MADE_BASKET_RESTART_BASELINE_INBOUND = 0
 MADE_BASKET_RESTART_CHECK = 1
 MADE_BASKET_RESTART_DIRECT_HANDOFF = 2
@@ -433,6 +442,7 @@ class KernelStatic(NamedTuple):
     check_anchor_position: Any
     random_check_location: Any
     check_clearance: Any
+    require_all_offense_clear: Any
     check_deadline_steps: Any
     check_setup_steps: Any
 
@@ -523,6 +533,7 @@ class KernelState(NamedTuple):
     check_steps_remaining: Any
     check_steps_elapsed: Any
     clearance_achieved: Any
+    offense_clearance: Any
 
 
 class StepBatchOutput(NamedTuple):
@@ -1319,6 +1330,18 @@ def stack_state_snapshots(
             ),
             dtype=xp.int32,
         ),
+        offense_clearance=xp.asarray(
+            np.stack(
+                [
+                    np.asarray(
+                        item.get("offense_clearance", np.zeros(len(item["positions"]))),
+                        dtype=np.int8,
+                    )
+                    for item in snapshots
+                ]
+            ),
+            dtype=xp.int8,
+        ),
         clearance_achieved=xp.asarray(
             np.asarray([int(item.get("clearance_achieved", 1)) for item in snapshots], dtype=np.int8),
             dtype=xp.int8,
@@ -2051,11 +2074,18 @@ def _build_kernel_static_from_source(env, xp) -> KernelStatic:
                     env,
                     "multi_possession_schema_version",
                     (
-                        CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION
-                        if check_clearance > 0
-                        else MULTI_POSSESSION_SCHEMA_VERSION
-                    )
-                    if bool(getattr(env, "enable_multi_possession", False)) else 1,
+                        (
+                            TEAM_CLEARANCE_OBSERVATION_SCHEMA_VERSION
+                            if bool(getattr(env, "require_all_offense_clear", False))
+                            else (
+                                CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION
+                                if check_clearance > 0
+                                else MULTI_POSSESSION_SCHEMA_VERSION
+                            )
+                        )
+                        if bool(getattr(env, "enable_multi_possession", False))
+                        else 1
+                    ),
                 )
             ),
             dtype=xp.int32,
@@ -2097,6 +2127,9 @@ def _build_kernel_static_from_source(env, xp) -> KernelStatic:
         random_check_location=xp.asarray(
             bool(getattr(env, "random_check_location", False)),
             dtype=xp.bool_,
+        ),
+        require_all_offense_clear=xp.asarray(
+            bool(getattr(env, "require_all_offense_clear", False)), dtype=xp.bool_
         ),
         check_clearance=xp.asarray(check_clearance, dtype=xp.int32),
         check_deadline_steps=xp.asarray(
@@ -3936,6 +3969,47 @@ def build_check_clearance_observation_features_batch(
     return inside[..., None], globals_vec
 
 
+def initialize_team_clearance_batch(static, state, jnp):
+    """Reinitialize an enabled opening after evaluation changes starter/layout.
+
+    This is for fresh evaluation states only, never for restoring latched
+    history. Disabled checkpoints retain their existing reset behavior.
+    """
+    cell_idx, found = _lookup_cell_indices(static.cell_coords, state.positions, jnp)
+    outside = static.clearance_by_cell[
+        jnp.clip(cell_idx, 0, static.clearance_by_cell.shape[0] - 1)
+    ].astype(jnp.bool_) & found
+    flags = outside & (_active_role_encoding_batch(static, state, jnp) > 0)
+    holder = jnp.clip(state.ball_holder, 0, state.positions.shape[1] - 1)
+    ball_clear = (state.ball_holder >= 0) & jnp.take_along_axis(
+        flags, holder[:, None], axis=1
+    )[:, 0]
+    return state._replace(
+        offense_clearance=jnp.where(
+            static.require_all_offense_clear, flags, state.offense_clearance
+        ).astype(jnp.int8),
+        clearance_achieved=jnp.where(
+            static.require_all_offense_clear, ball_clear, state.clearance_achieved
+        ).astype(jnp.int8),
+    )
+
+
+def build_team_clearance_observation_features_batch(static, state, jnp):
+    offense = _active_role_encoding_batch(static, state, jnp) > 0
+    team_clear = jnp.all(
+        (~offense) | state.offense_clearance.astype(jnp.bool_), axis=-1
+    )
+    ready = (
+        team_clear
+        & state.clearance_achieved.astype(jnp.bool_)
+        & (state.game_phase == GAME_PHASE_LIVE)
+    )
+    return (
+        state.offense_clearance.astype(jnp.float32)[..., None],
+        ready.astype(jnp.float32)[:, None],
+    )
+
+
 def build_flat_observation_batch_with_role_flag(
     static: KernelStatic,
     state: KernelState,
@@ -3946,6 +4020,7 @@ def build_flat_observation_batch_with_role_flag(
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
     check_clearance_features: bool = False,
+    team_clearance_features: bool = False,
 ):
     batch_size = state.positions.shape[0]
     role_flag = _broadcast_role_flag_batch(role_flag_value, batch_size, jnp)[:, None]
@@ -3992,6 +4067,11 @@ def build_flat_observation_batch_with_role_flag(
                     clearance_globals,
                 ]
             )
+    if team_clearance_features:
+        team_players, team_globals = build_team_clearance_observation_features_batch(
+            static, state, jnp
+        )
+        parts.extend([team_players.reshape(batch_size, -1), team_globals])
     parts.extend(
         [
             role_flag,
@@ -4010,6 +4090,7 @@ def build_flat_observation_batch(
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
     check_clearance_features: bool = False,
+    team_clearance_features: bool = False,
 ):
     return build_flat_observation_batch_with_role_flag(
         static,
@@ -4020,6 +4101,7 @@ def build_flat_observation_batch(
         rebound_target_observation_features=rebound_target_observation_features,
         multi_possession_features=multi_possession_features,
         check_clearance_features=check_clearance_features,
+        team_clearance_features=team_clearance_features,
     )
 
 
@@ -4052,6 +4134,7 @@ def build_token_observation_components_batch(
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
     check_clearance_features: bool = False,
+    team_clearance_features: bool = False,
 ):
     """Build set-observation components matching the production token layout."""
     batch_size, n_players, _ = state.positions.shape
@@ -4220,6 +4303,12 @@ def build_token_observation_components_batch(
             )
             players = jnp.concatenate([players, clearance_players], axis=-1)
             globals_vec = jnp.concatenate([globals_vec, clearance_globals], axis=-1)
+    if team_clearance_features:
+        team_players, team_globals = build_team_clearance_observation_features_batch(
+            static, state, jnp
+        )
+        players = jnp.concatenate([players, team_players], axis=-1)
+        globals_vec = jnp.concatenate([globals_vec, team_globals], axis=-1)
     role_flag = _broadcast_role_flag_batch(role_flag_value, batch_size, jnp)[:, None]
     return players, globals_vec, role_flag
 
@@ -4262,6 +4351,7 @@ def build_token_observation_batch_with_role_flag(
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
     check_clearance_features: bool = False,
+    team_clearance_features: bool = False,
 ):
     players, globals_vec, role_flag = build_token_observation_components_batch(
         static,
@@ -4272,6 +4362,7 @@ def build_token_observation_batch_with_role_flag(
         rebound_target_observation_features=rebound_target_observation_features,
         multi_possession_features=multi_possession_features,
         check_clearance_features=check_clearance_features,
+        team_clearance_features=team_clearance_features,
     )
     players = canonicalize_player_tokens_by_active_role(
         static,
@@ -4298,6 +4389,7 @@ def build_token_observation_batch(
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
     check_clearance_features: bool = False,
+    team_clearance_features: bool = False,
 ):
     return build_token_observation_batch_with_role_flag(
         static,
@@ -4308,6 +4400,7 @@ def build_token_observation_batch(
         rebound_target_observation_features=rebound_target_observation_features,
         multi_possession_features=multi_possession_features,
         check_clearance_features=check_clearance_features,
+        team_clearance_features=team_clearance_features,
     )
 
 
@@ -4322,6 +4415,7 @@ def build_policy_observation_batch_with_role_flag(
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
     check_clearance_features: bool = False,
+    team_clearance_features: bool = False,
 ):
     if str(model_type) == "attention":
         return build_token_observation_batch_with_role_flag(
@@ -4333,6 +4427,7 @@ def build_policy_observation_batch_with_role_flag(
             rebound_target_observation_features=rebound_target_observation_features,
             multi_possession_features=multi_possession_features,
             check_clearance_features=check_clearance_features,
+            team_clearance_features=team_clearance_features,
         )
     return build_flat_observation_batch_with_role_flag(
         static,
@@ -4343,6 +4438,7 @@ def build_policy_observation_batch_with_role_flag(
         rebound_target_observation_features=rebound_target_observation_features,
         multi_possession_features=multi_possession_features,
         check_clearance_features=check_clearance_features,
+        team_clearance_features=team_clearance_features,
     )
 
 
@@ -4356,6 +4452,7 @@ def build_policy_observation_batch(
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
     check_clearance_features: bool = False,
+    team_clearance_features: bool = False,
 ):
     return build_policy_observation_batch_with_role_flag(
         static,
@@ -4367,6 +4464,7 @@ def build_policy_observation_batch(
         rebound_target_observation_features=rebound_target_observation_features,
         multi_possession_features=multi_possession_features,
         check_clearance_features=check_clearance_features,
+        team_clearance_features=team_clearance_features,
     )
 
 
@@ -5018,6 +5116,33 @@ def _holder_controls_three_point_single(
     )
 
 
+def _offense_clearance_at_positions_single(static, state, jnp):
+    cell_idx, found = _lookup_cell_indices(static.cell_coords, state.positions, jnp)
+    outside = (
+        static.clearance_by_cell[
+            jnp.clip(cell_idx, 0, static.clearance_by_cell.shape[0] - 1)
+        ].astype(jnp.bool_)
+        & found
+    )
+    offense = _active_role_encoding_single(static, state, jnp) > 0
+    return (outside & offense & static.require_all_offense_clear).astype(jnp.int8)
+
+
+def _latch_offense_clearance_single(static, state, jnp):
+    return _replace_state(
+        state,
+        offense_clearance=(
+            state.offense_clearance
+            | _offense_clearance_at_positions_single(static, state, jnp)
+        ).astype(jnp.int8),
+    )
+
+
+def _team_clearance_satisfied_single(static, state, jnp):
+    offense = _active_role_encoding_single(static, state, jnp) > 0
+    return jnp.all((~offense) | state.offense_clearance.astype(jnp.bool_))
+
+
 def _apply_clearance_for_current_holder_single(
     static: KernelStatic,
     state: KernelState,
@@ -5500,6 +5625,14 @@ def _finalize_possession_single(
         ),
         episode_ended=jnp.where(game_done, jnp.asarray(1, dtype=jnp.int8), state.episode_ended),
     )
+    next_state = _replace_state(
+        next_state,
+        offense_clearance=jnp.where(
+            advance,
+            _offense_clearance_at_positions_single(static, next_state, jnp),
+            state.offense_clearance,
+        ),
+    )
     completed_possession_live_steps = jnp.where(
         advance,
         state.live_possession_steps.astype(jnp.int32),
@@ -5803,6 +5936,9 @@ def _start_timed_overtime_single(
     return _replace_state(
         overtime_state,
         clearance_achieved=holder_cleared.astype(jnp.int8),
+        offense_clearance=_offense_clearance_at_positions_single(
+            static, overtime_state, jnp
+        ),
     )
 
 
@@ -6916,7 +7052,17 @@ def _step_single_minimal(
             clearance_violation = (
                 is_shot
                 & static.enable_multi_possession.astype(jnp.bool_)
-                & (~shot_clock_state.clearance_achieved.astype(jnp.bool_))
+                & (
+                    (~shot_clock_state.clearance_achieved.astype(jnp.bool_))
+                    | (
+                        static.require_all_offense_clear
+                        & (
+                            ~_team_clearance_satisfied_single(
+                                static, shot_clock_state, jnp
+                            )
+                        )
+                    )
+                )
             )
             is_pass = holder_has_ball & (holder_action >= PASS_ACTION_START) & (holder_action < PASS_ACTION_END)
             pass_attempt = is_pass.astype(jnp.int8)
@@ -7173,6 +7319,21 @@ def _step_single_minimal(
                 static,
                 final_state,
                 jnp,
+            )
+            clearance_penalty = (
+                clearance_violation & static.require_all_offense_clear
+            ).astype(jnp.float32)
+            opponent_is_a = state.offense_team == TEAM_B
+            final_state = _replace_state(
+                final_state,
+                team_a_score=final_state.team_a_score
+                + clearance_penalty * opponent_is_a,
+                team_b_score=final_state.team_b_score
+                + clearance_penalty * (~opponent_is_a),
+                offense_score=final_state.offense_score
+                + clearance_penalty * opponent_is_a,
+                defense_score=final_state.defense_score
+                + clearance_penalty * (~opponent_is_a),
             )
             shooter_is_team_a = static.role_encoding[shot_shooter] > 0.0
             scored_points = shot_value * shot_success.astype(jnp.float32)
@@ -7509,12 +7670,21 @@ def _step_single_minimal(
                 final_state,
                 defensive_lane_violation,
                 defensive_lane_violation_player,
-            ) = _apply_defensive_lane_rule_single(
-                static,
-                final_state,
-                shot_active=shot_active,
-                jax=jax,
-                jnp=jnp,
+            ) = jax.lax.cond(
+                clearance_violation & static.require_all_offense_clear,
+                lambda _: (
+                    final_state,
+                    jnp.asarray(False),
+                    no_player,
+                ),
+                lambda _: _apply_defensive_lane_rule_single(
+                    static,
+                    final_state,
+                    shot_active=shot_active,
+                    jax=jax,
+                    jnp=jnp,
+                ),
+                operand=None,
             )
             per_team_violation = static.violation_reward / static.offense_ids.shape[0]
             rewards = rewards + (
@@ -7803,6 +7973,14 @@ def _step_single_minimal(
             operand=None,
         ),
         operand=None,
+    )
+    raw_output = raw_output._replace(
+        state=jax.lax.cond(
+            state.episode_ended.astype(jnp.bool_),
+            lambda _: raw_output.state,
+            lambda _: _latch_offense_clearance_single(static, raw_output.state, jnp),
+            operand=None,
+        )
     )
     clock_output = (
         _apply_game_clock_single(static, state, raw_output, jax, jnp)
@@ -8562,6 +8740,7 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         # This is finalized below from the jump-ball winner's actual cell.
         # Keep the provisional value valid for the legacy mode as well.
         clearance_achieved=jnp.asarray(1, dtype=jnp.int8),
+        offense_clearance=jnp.zeros((positions.shape[0],), dtype=jnp.int8),
     )
     # Opening possession follows the same clearance invariant as a live
     # change of possession: the jump-ball winner must clear if they control
@@ -8575,6 +8754,9 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
     )
     return _replace_state(
         initial_state,
+        offense_clearance=_offense_clearance_at_positions_single(
+            static, initial_state, jnp
+        ),
         clearance_achieved=jnp.where(
             static.enable_multi_possession.astype(jnp.bool_),
             opening_holder_cleared.astype(jnp.int8),

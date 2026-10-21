@@ -605,12 +605,20 @@ def test_native_multi_possession_evaluation_pairs_starters_and_separates_cutoffs
             assert episode["game"]["result"] is None
 
 
-def test_game_clock_native_and_historical_evaluation_emit_clock_diagnostics(tmp_path):
+@pytest.mark.parametrize("team_clearance", [False, True])
+def test_game_clock_native_and_historical_evaluation_emit_clock_diagnostics(
+    tmp_path, team_clearance
+):
     checkpoint_dir = tmp_path / "clock_eval_ckpts"
     args = parse_args(
         [
             "--run-train-loop",
             "--enable-multi-possession",
+            (
+                "--require-all-offense-clear"
+                if team_clearance
+                else "--no-require-all-offense-clear"
+            ),
             "--episode-end-mode",
             "game_clock",
             "--game-clock-seconds",
@@ -652,6 +660,10 @@ def test_game_clock_native_and_historical_evaluation_emit_clock_diagnostics(tmp_
     training_result = run_training_loop(args)
     historical = training_result["historical_eval_history"][0]
     assert historical["environment_contract"]["episode_end_mode"] == "game_clock"
+    assert (
+        historical["environment_contract"]["require_all_offense_clear"]
+        is team_clearance
+    )
     assert historical["completed_episode_count"] + historical["truncated_episode_count"] == 2
     assert "clock_metrics_completed_games" in historical
     assert "clock_metrics_truncated_games" in historical
@@ -665,6 +677,7 @@ def test_game_clock_native_and_historical_evaluation_emit_clock_diagnostics(tmp_
         {
             "players": 2,
             "enable_multi_possession": True,
+            "require_all_offense_clear": team_clearance,
             "episode_end_mode": "game_clock",
             "game_clock_seconds": 4,
             "overtime_seconds": 2,
@@ -687,6 +700,7 @@ def test_game_clock_native_and_historical_evaluation_emit_clock_diagnostics(tmp_
     )
     summary = native["eval_diagnostics"]["jax_native_summary"]
     assert summary["environment_contract"]["episode_end_mode"] == "game_clock"
+    assert summary["environment_contract"]["require_all_offense_clear"] is team_clearance
     assert summary["horizon"] == 40
     assert summary["completed_games"] + summary["incomplete_games"] == 2
     assert (

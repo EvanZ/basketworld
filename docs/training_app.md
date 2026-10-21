@@ -123,3 +123,32 @@ after this feature include `metadata/resolved_training_config.json` and can be
 reconstructed exactly. Older runs are reconstructed from their logged MLflow
 parameters; the UI reports how many fields were recovered so a partial legacy
 import is never presented as exact.
+
+### Optional team arc clearance
+
+**Require all offense to clear the arc** is a visible trainer boolean, disabled by
+default (`--require-all-offense-clear` / `--no-require-all-offense-clear` in the
+JAX CLI). It applies in both possession and game-clock episodes. Each offensive
+player must visit the existing arc-clearance region once per possession; players
+already there count immediately. Flags accumulate during setup, pickup, and live
+play. Players may cut back inside after clearing, and may handle, pass, catch,
+and rebound before clearing. Offensive rebounds and same-possession restarts
+preserve clearance; a new possession initializes fresh flags.
+
+SHOOT remains selectable. If either team clearance or the existing ball-clearance
+requirement is unmet, attempting to shoot causes a violation, turnover, and
+**one point for the opponent**, with no shot resolved. Shooting resolves before
+movement, so the final teammate's crossing only permits a valid shot at the next
+decision. Setup deadlines and clocks do not wait for clearance.
+
+The setting is saved with runs, copies, and checkpoints. Enabled runs use
+observation schema 6 and must train from scratch; resuming preserves partially
+completed player clearance. Existing runs default to the option off and retain
+their original behavior. The Observations tab shows `offense_cleared` per player
+(defenders are zero) and `clearance_ready_to_shoot` for the team. The board shows
+**Team Clearance Required** while the live offense has uncleared players.
+
+This rule differs from ball-handler clearance and from `check_clearance`, which
+protects the check-ball area from defenders. It may slow possessions and increase
+the coordination needed to get a shot. Use the existing pace metrics to assess
+that effect; no new time-to-clearance metric is added.

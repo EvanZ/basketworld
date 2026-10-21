@@ -196,6 +196,7 @@ class JaxEnvironmentConfig:
     inbound_deadline_steps: int = 5
     check_deadline_steps: int = 5
     check_setup_steps: int = 0
+    require_all_offense_clear: bool = False
     check_clearance: int = 0
     random_check_location: bool = False
 
@@ -221,6 +222,10 @@ class JaxEnvironmentConfig:
             raise ValueError("episode_end_mode must be 'possessions' or 'game_clock'.")
         if mode == "game_clock" and not bool(self.enable_multi_possession):
             raise ValueError("game_clock episode mode requires enable_multi_possession.")
+        if self.require_all_offense_clear and not self.enable_multi_possession:
+            raise ValueError(
+                "require_all_offense_clear requires enable_multi_possession."
+            )
         if int(self.check_clearance) < 0:
             raise ValueError("check_clearance must be >= 0.")
         if int(self.check_clearance) > 0 and int(self.check_setup_steps) < 1:
@@ -334,9 +339,15 @@ class JaxStaticEnvironment:
         self.multi_possession_schema_version = (
             int(config.multi_possession_schema_version)
             if config.multi_possession_schema_version is not None
-            else (5 if int(config.check_clearance) > 0 else 4)
-            if bool(config.enable_multi_possession)
-            else 1
+            else (
+                (
+                    6
+                    if config.require_all_offense_clear
+                    else 5 if int(config.check_clearance) > 0 else 4
+                )
+                if bool(config.enable_multi_possession)
+                else 1
+            )
         )
         self.made_basket_restart_mode = config.made_basket_restart_mode or (
             "baseline_inbound"
@@ -416,9 +427,13 @@ def normalize_runtime_environment_config(
     """Map supported additive checkpoint schemas to the current JAX runtime."""
     if not bool(config.enable_multi_possession):
         return config
-    runtime_schema = 5 if int(config.check_clearance) > 0 else 4
+    runtime_schema = (
+        6
+        if config.require_all_offense_clear
+        else 5 if int(config.check_clearance) > 0 else 4
+    )
     saved_schema = config.multi_possession_schema_version
-    compatible = {5} if runtime_schema == 5 else {2, 3, 4}
+    compatible = {runtime_schema} if runtime_schema >= 5 else {2, 3, 4}
     if saved_schema is not None and int(saved_schema) not in compatible:
         raise ValueError(
             "Unsupported JAX environment observation schema "

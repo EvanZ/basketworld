@@ -114,6 +114,7 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "check_deadline_steps",
     "check_setup_steps",
     "check_clearance",
+    "require_all_offense_clear",
     "random_check_location",
     "episode_end_mode",
     "game_clock_seconds",
@@ -164,6 +165,7 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "check_setup_steps": 0,
     "check_clearance": 0,
     "random_check_location": False,
+    "require_all_offense_clear": False,
     "episode_end_mode": "possessions",
     "game_clock_seconds": 300,
     "overtime_seconds": 120,
@@ -212,6 +214,7 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "check_setup_steps": "int",
     "check_clearance": "int",
     "random_check_location": "bool",
+    "require_all_offense_clear": "bool",
     "episode_end_mode": "str",
     "game_clock_seconds": "int",
     "overtime_seconds": "int",
@@ -1487,6 +1490,9 @@ class JaxDevRuntime:
             rebound_win_prob_features=bool(getattr(self.raw_model.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(self.raw_model.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(self.raw_model.spec, "multi_possession_features", False)),
+            team_clearance_features=(
+                int(getattr(self.raw_model.spec, "observation_schema_version", 1)) >= 6
+            ),
             check_clearance_features=(
                 int(getattr(self.raw_model.spec, "observation_schema_version", 1)) >= 5
             ),
@@ -1502,6 +1508,9 @@ class JaxDevRuntime:
             ),
             rebound_target_observation_features=bool(getattr(self.raw_model.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(self.raw_model.spec, "multi_possession_features", False)),
+            team_clearance_features=(
+                int(getattr(self.raw_model.spec, "observation_schema_version", 1)) >= 6
+            ),
             check_clearance_features=(
                 int(getattr(self.raw_model.spec, "observation_schema_version", 1)) >= 5
             ),
@@ -1557,6 +1566,9 @@ class JaxDevRuntime:
             rebound_win_prob_features=bool(getattr(raw.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(raw.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(raw.spec, "multi_possession_features", False)),
+            team_clearance_features=(
+                int(getattr(raw.spec, "observation_schema_version", 1)) >= 6
+            ),
             check_clearance_features=(
                 int(getattr(raw.spec, "observation_schema_version", 1)) >= 5
             ),
@@ -3083,6 +3095,9 @@ class JaxDevRuntime:
             multi_possession_features=bool(
                 getattr(selector_model.spec, "multi_possession_features", False)
             ),
+            team_clearance_features=(
+                int(getattr(selector_model.spec, "observation_schema_version", 1)) >= 6
+            ),
             check_clearance_features=(
                 int(getattr(selector_model.spec, "observation_schema_version", 1)) >= 5
             ),
@@ -3611,6 +3626,36 @@ class JaxDevRuntime:
         }
         return self._fast_episode_metadata_cache
 
+    def _team_clearance_fields(self, host=None) -> dict[str, Any]:
+        if host is None:
+            host = self.jax.device_get(
+                {
+                    name: _field0(self.state, name)
+                    for name in (
+                        "offense_clearance",
+                        "offense_team",
+                        "clearance_achieved",
+                        "game_phase",
+                    )
+                }
+            )
+        enabled = bool(self.environment_config.require_all_offense_clear)
+        flags = np.asarray(host["offense_clearance"], dtype=bool).reshape(-1)
+        team = int(np.asarray(host["offense_team"]).item())
+        ids = np.asarray(
+            self.static.offense_ids if team == TEAM_A else self.static.defense_ids
+        )
+        team_ready = not enabled or bool(np.all(flags[ids]))
+        live = int(np.asarray(host["game_phase"]).item()) == GAME_PHASE_LIVE
+        return {
+            "require_all_offense_clear": enabled,
+            "offense_clearance": flags.tolist(),
+            "team_clearance_required": enabled and not team_ready,
+            "clearance_ready_to_shoot": team_ready
+            and bool(np.asarray(host["clearance_achieved"]).item())
+            and live,
+        }
+
     def _fast_game_state(
         self,
         game_state: Any,
@@ -3677,6 +3722,7 @@ class JaxDevRuntime:
             ),
             "check_steps_remaining": _field0(self.state, "check_steps_remaining"),
             "clearance_achieved": _field0(self.state, "clearance_achieved"),
+            "offense_clearance": _field0(self.state, "offense_clearance"),
             "offense_lane_steps": _field0(self.state, "offense_lane_steps"),
             "defense_lane_steps": _field0(self.state, "defense_lane_steps"),
             # Play-call state is only a handful of scalars. Keep it in the
@@ -3936,6 +3982,7 @@ class JaxDevRuntime:
                 0,
             ),
             "legal_inbound_entry_positions": legal_inbound_entry_positions,
+            **self._team_clearance_fields(host),
             "clearance_achieved": clearance_achieved,
             "clearance_required": bool(
                 self.multi_possession_enabled
@@ -4108,6 +4155,9 @@ class JaxDevRuntime:
             ),
             rebound_target_observation_features=rebound_target_observation_features,
             multi_possession_features=self.multi_possession_enabled,
+            team_clearance_features=(
+                int(getattr(self.raw_model.spec, "observation_schema_version", 1)) >= 6
+            ),
             check_clearance_features=(
                 int(getattr(self.raw_model.spec, "observation_schema_version", 1)) >= 5
             ),
@@ -4337,6 +4387,7 @@ class JaxDevRuntime:
                 0,
             ),
             "legal_inbound_entry_positions": legal_inbound_entry_positions,
+            **self._team_clearance_fields(),
             "clearance_achieved": bool(_as_bool(_field0(self.state, "clearance_achieved"))),
             "clearance_required": bool(
                 self.multi_possession_enabled

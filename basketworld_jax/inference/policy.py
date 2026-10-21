@@ -143,24 +143,40 @@ class JAXInferenceModel:
             runtime_schema = int(
                 self.environment_config.multi_possession_schema_version
                 or (
-                    CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION
-                    if int(self.environment_config.check_clearance) > 0
-                    else MULTI_POSSESSION_SCHEMA_VERSION
+                    6
+                    if self.environment_config.require_all_offense_clear
+                    else (
+                        CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION
+                        if int(self.environment_config.check_clearance) > 0
+                        else MULTI_POSSESSION_SCHEMA_VERSION
+                    )
                 )
             )
             checkpoint_schema = int(
                 getattr(self.spec, "observation_schema_version", 1)
             )
             compatible = (
-                {int(CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION)}
-                if int(self.environment_config.check_clearance) > 0
-                else {2, 3, int(MULTI_POSSESSION_SCHEMA_VERSION)}
+                {6}
+                if self.environment_config.require_all_offense_clear
+                else (
+                    {int(CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION)}
+                    if int(self.environment_config.check_clearance) > 0
+                    else {2, 3, int(MULTI_POSSESSION_SCHEMA_VERSION)}
+                )
             )
-            if runtime_schema != (
-                int(CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION)
-                if int(self.environment_config.check_clearance) > 0
-                else int(MULTI_POSSESSION_SCHEMA_VERSION)
-            ) or checkpoint_schema not in compatible:
+            if (
+                runtime_schema
+                != (
+                    6
+                    if self.environment_config.require_all_offense_clear
+                    else (
+                        int(CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION)
+                        if int(self.environment_config.check_clearance) > 0
+                        else int(MULTI_POSSESSION_SCHEMA_VERSION)
+                    )
+                )
+                or checkpoint_schema not in compatible
+            ):
                 raise ValueError(
                     "JAX checkpoint policy_spec and environment metadata use "
                     "incompatible observation schemas "
@@ -289,7 +305,10 @@ class JAXInferenceModel:
         )
         arrays = tuple(np.asarray(snapshot[key]).tobytes() for key in array_keys)
         scalars = tuple(snapshot[key] for key in scalar_keys)
-        return (id(source), bool(observer_is_offense), arrays, scalars)
+        clearance = np.asarray(
+            snapshot.get("offense_clearance", []), dtype=np.int8
+        ).tobytes()
+        return (id(source), bool(observer_is_offense), arrays, scalars, clearance)
 
     def _snapshot_from_source(self, source) -> dict[str, Any]:
         if isinstance(source, Mapping):
@@ -328,6 +347,9 @@ class JAXInferenceModel:
             rebound_win_prob_features=bool(getattr(self.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(self.spec, "multi_possession_features", False)),
+            team_clearance_features=(
+                int(getattr(self.spec, "observation_schema_version", 1)) >= 6
+            ),
             check_clearance_features=(
                 int(getattr(self.spec, "observation_schema_version", 1)) >= 5
             ),
@@ -365,6 +387,9 @@ class JAXInferenceModel:
             rebound_win_prob_features=bool(getattr(self.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(self.spec, "multi_possession_features", False)),
+            team_clearance_features=(
+                int(getattr(self.spec, "observation_schema_version", 1)) >= 6
+            ),
             check_clearance_features=(
                 int(getattr(self.spec, "observation_schema_version", 1)) >= 5
             ),
@@ -392,6 +417,9 @@ class JAXInferenceModel:
             ),
             rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(self.spec, "multi_possession_features", False)),
+            team_clearance_features=(
+                int(getattr(self.spec, "observation_schema_version", 1)) >= 6
+            ),
             check_clearance_features=(
                 int(getattr(self.spec, "observation_schema_version", 1)) >= 5
             ),
@@ -503,6 +531,9 @@ class JAXInferenceModel:
             rebound_win_prob_features=bool(getattr(self.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(self.spec, "multi_possession_features", False)),
+            team_clearance_features=(
+                int(getattr(self.spec, "observation_schema_version", 1)) >= 6
+            ),
             check_clearance_features=(
                 int(getattr(self.spec, "observation_schema_version", 1)) >= 5
             ),

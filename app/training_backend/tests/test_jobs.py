@@ -290,3 +290,30 @@ def test_job_manager_recovers_stopped_run_from_validated_checkpoint(tmp_path):
     recovery = next(event for event in events if event["event_type"] == "stopped_recovery_requested")
     assert recovery["payload"]["checkpoint_path"] == str(checkpoint)
     assert recovery["payload"]["provenance_confirmation"]["confirmed"] is True
+
+
+def test_resume_preflight_defaults_missing_team_clearance_to_false(tmp_path):
+    settings = Settings(
+        repo_root=tmp_path / "repo", data_dir=tmp_path / "data",
+        database_path=tmp_path / "data" / "training.duckdb",
+        cors_origins=(), poll_interval_seconds=0.01,
+    )
+    settings.ensure_directories()
+    manager = JobManager(settings, TrainingRepository(settings.database_path))
+    config = TrainingRunConfig()
+    run_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    preview = manager.preview(config, run_id=run_id)
+    checkpoint = tmp_path / "checkpoint"
+    _write_minimal_checkpoint_metadata(checkpoint)
+    metadata_path = checkpoint / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    saved = manager._resolved_config_from_preview(preview)
+    saved.pop("require_all_offense_clear")
+    metadata["resolved_training_config"] = saved
+    metadata_path.write_text(json.dumps(metadata))
+    manager._preflight_resume(checkpoint=str(checkpoint), preview=preview)
+    enabled_preview = manager.preview(
+        config.model_copy(update={"require_all_offense_clear": True}), run_id=run_id
+    )
+    with pytest.raises(RuntimeError, match="require_all_offense_clear"):
+        manager._preflight_resume(checkpoint=str(checkpoint), preview=enabled_preview)

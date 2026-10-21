@@ -300,3 +300,19 @@ def test_display_command_shell_quotes_environment_and_arguments():
     assert "MLFLOW_TRACKING_URI=http://localhost:5000" in command
     assert "PYTHONPATH='/repo path'" in command
     assert "--name 'a run; safe'" in command
+
+
+def test_team_clearance_visible_config_round_trips_into_copy_and_resume_command(tmp_path):
+    config = TrainingRunConfig(require_all_offense_clear=True)
+    saved = TrainingRunConfig.model_validate_json(config.model_dump_json())
+    for candidate, checkpoint in ((saved, None), (saved.model_copy(), "/tmp/checkpoint")):
+        preview = build_halfcourt_multi_possession_preview(
+            config=candidate,
+            run_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            repo_root=tmp_path,
+            data_dir=tmp_path / "data",
+            resume_checkpoint=checkpoint,
+        )
+        assert "--require-all-offense-clear" in preview.argv
+        assert "--no-require-all-offense-clear" not in preview.argv
+    assert not TrainingRunConfig.model_validate({}).require_all_offense_clear

@@ -539,6 +539,8 @@ class JobManager:
 
         saved_config = metadata.get("resolved_training_config")
         if isinstance(saved_config, dict):
+            saved_config = dict(saved_config)
+            saved_config.setdefault("require_all_offense_clear", False)
             expected_config = self._resolved_config_from_preview(preview)
             changed = [
                 key

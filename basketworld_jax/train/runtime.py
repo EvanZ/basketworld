@@ -1365,6 +1365,7 @@ def _truncation_bootstrap_values(
         multi_possession_features=bool(
             getattr(spec, "multi_possession_features", False)
         ),
+        team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
         check_clearance_features=(
             int(getattr(spec, "observation_schema_version", 1)) >= 5
         ),
@@ -1510,6 +1511,7 @@ def build_compiled_rollout_runner(
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -1834,6 +1836,7 @@ def build_compiled_rollout_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -1976,6 +1979,7 @@ def build_compiled_frozen_opponent_rollout_runner(
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -2011,6 +2015,7 @@ def build_compiled_frozen_opponent_rollout_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -2409,6 +2414,7 @@ def build_compiled_frozen_opponent_rollout_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -2556,6 +2562,7 @@ def build_compiled_grouped_opponent_rollout_runner(
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -2587,6 +2594,7 @@ def build_compiled_grouped_opponent_rollout_runner(
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -2954,6 +2962,7 @@ def build_compiled_grouped_opponent_rollout_runner(
             rebound_win_prob_features=bool(spec.rebound_win_prob_features),
             rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -3038,6 +3047,7 @@ def build_compiled_eval_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -3076,6 +3086,7 @@ def build_compiled_eval_runner(
                     multi_possession_features=bool(
                         getattr(spec, "multi_possession_features", False)
                     ),
+                    team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                     check_clearance_features=(
                         int(getattr(spec, "observation_schema_version", 1)) >= 5
                     ),
@@ -3249,6 +3260,7 @@ def build_compiled_frozen_opponent_eval_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -3282,6 +3294,7 @@ def build_compiled_frozen_opponent_eval_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -3326,6 +3339,7 @@ def build_compiled_frozen_opponent_eval_runner(
                     multi_possession_features=bool(
                         getattr(spec, "multi_possession_features", False)
                     ),
+                    team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                     check_clearance_features=(
                         int(getattr(spec, "observation_schema_version", 1)) >= 5
                     ),
@@ -3356,6 +3370,7 @@ def build_compiled_frozen_opponent_eval_runner(
                     multi_possession_features=bool(
                         getattr(spec, "multi_possession_features", False)
                     ),
+                    team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                     check_clearance_features=(
                         int(getattr(spec, "observation_schema_version", 1)) >= 5
                     ),
@@ -3829,6 +3844,7 @@ def build_compiled_historical_match_eval_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -3863,6 +3879,7 @@ def build_compiled_historical_match_eval_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -3901,6 +3918,7 @@ def build_compiled_historical_match_eval_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -3918,6 +3936,7 @@ def build_compiled_historical_match_eval_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -4189,6 +4208,7 @@ def build_compiled_grouped_opponent_eval_runner(
                     multi_possession_features=bool(
                         getattr(spec, "multi_possession_features", False)
                     ),
+                    team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                     check_clearance_features=(
                         int(getattr(spec, "observation_schema_version", 1)) >= 5
                     ),
@@ -4245,6 +4265,7 @@ def build_compiled_grouped_opponent_eval_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -4294,6 +4315,7 @@ def build_compiled_grouped_opponent_eval_runner(
                     multi_possession_features=bool(
                         getattr(spec, "multi_possession_features", False)
                     ),
+                    team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                     check_clearance_features=(
                         int(getattr(spec, "observation_schema_version", 1)) >= 5
                     ),
@@ -4323,6 +4345,7 @@ def build_compiled_grouped_opponent_eval_runner(
                     multi_possession_features=bool(
                         getattr(spec, "multi_possession_features", False)
                     ),
+                    team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                     check_clearance_features=(
                         int(getattr(spec, "observation_schema_version", 1)) >= 5
                     ),
@@ -4492,6 +4515,7 @@ def build_compiled_deploy_eval_runner(
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -4525,6 +4549,7 @@ def build_compiled_deploy_eval_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -4560,6 +4585,7 @@ def build_compiled_deploy_eval_runner(
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -4573,6 +4599,7 @@ def build_compiled_deploy_eval_runner(
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),

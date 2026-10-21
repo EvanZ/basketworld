@@ -2399,7 +2399,7 @@ const clearanceRequiredBannerVisible = computed(() => {
   const state = currentGameState.value;
   return Boolean(
     multiPossessionScoreboard.value
-    && state?.clearance_required
+    && (state?.clearance_required || state?.team_clearance_required)
     && state?.game_phase === 'live',
   );
 });
@@ -6260,7 +6260,7 @@ onBeforeUnmount(() => {
         role="status"
         aria-live="polite"
       >
-        Clearance Required
+        {{ currentGameState?.team_clearance_required ? 'Team Clearance Required' : 'Clearance Required' }}
       </div>
       <div
         v-if="visibleShotAttemptBanner"

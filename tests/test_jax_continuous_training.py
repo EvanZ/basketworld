@@ -300,7 +300,13 @@ def test_fresh_launcher_keeps_the_agreed_budget_and_has_no_continuation_dependen
     assert "--frozen-opponent-checkpoint" not in script
 
 
-def test_short_fresh_multi_possession_training_continues_and_resumes(tmp_path):
+@pytest.mark.parametrize(
+    "team_clearance,mode",
+    [(False, "possessions"), (True, "possessions"), (True, "game_clock")],
+)
+def test_short_fresh_multi_possession_training_continues_and_resumes(
+    tmp_path, team_clearance, mode
+):
     checkpoint_dir = tmp_path / "continuous_ckpts"
     common_args = [
         "--run-train-loop",
@@ -329,6 +335,9 @@ def test_short_fresh_multi_possession_training_continues_and_resumes(tmp_path):
         "1",
         "--no-progress",
     ]
+    common_args.extend(["--episode-end-mode", mode])
+    if team_clearance:
+        common_args.extend(["--require-all-offense-clear", "--players", "2"])
     first_args = parse_args([*common_args, "--num-updates", "1"])
     validate_train_args(first_args)
     first_result = run_training_loop(first_args)
@@ -354,6 +363,9 @@ def test_short_fresh_multi_possession_training_continues_and_resumes(tmp_path):
     latest = checkpoint_dir / "latest"
     payload = load_checkpoint(latest)
     assert payload["update_index"] == 1
+    assert payload["env_config"]["require_all_offense_clear"] is team_clearance
+    if team_clearance:
+        assert payload["policy_spec"]["observation_schema_version"] == 6
     assert set(payload["current_state"]) == {"offense", "defense"}
     assert payload["opponent_pool_state"]["enabled"] is True
     assert len(payload["opponent_pool_state"]["candidate_infos"]) == 1
@@ -366,6 +378,7 @@ def test_short_fresh_multi_possession_training_continues_and_resumes(tmp_path):
             "shot_clock",
             "offense_team",
             "clearance_achieved",
+            "offense_clearance",
         }.issubset(state)
         assert int(np.asarray(state["step_count"])[0]) == 1
         assert int(np.asarray(state["completed_possessions"])[0]) < 25

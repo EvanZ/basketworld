@@ -2363,3 +2363,40 @@ def test_jax_dev_runtime_matches_native_kernel_for_seeded_multi_possession_actio
         np.asarray(runtime.state.team_b_score), np.asarray(expected.state.team_b_score)
     )
     assert response["state"]["offense_team"] == "team_b"
+
+
+def test_team_clearance_observations_and_fast_state_round_trip():
+    runtime = _make_runtime(
+        env_params={
+            "enable_multi_possession": True,
+            "require_all_offense_clear": True,
+        }
+    )
+    runtime.raw_model.spec = SimpleNamespace(
+        model_type="mlp",
+        rebound_win_prob_features=False,
+        rebound_target_observation_features=True,
+        multi_possession_features=True,
+        observation_schema_version=6,
+        attention_num_cls_tokens=0,
+        num_intents=8,
+        intent_selector_enabled=False,
+    )
+    team = int(np.asarray(runtime.state.offense_team)[0])
+    ids = runtime.static.offense_ids if team == TEAM_A else runtime.static.defense_ids
+    flags = jnp.zeros_like(runtime.state.offense_clearance).at[0, ids[0]].set(1)
+    runtime.state = runtime.state._replace(offense_clearance=flags)
+    snapshot = runtime.capture_snapshot()
+    runtime.state = runtime.state._replace(offense_clearance=jnp.zeros_like(flags))
+    runtime.restore_snapshot(snapshot)
+    np.testing.assert_array_equal(runtime.state.offense_clearance, flags)
+    game_state = GameState()
+    full = runtime.get_full_game_state(game_state)
+    fast = runtime.get_full_game_state(game_state, compact=True)
+    for body in (full, fast):
+        assert body["require_all_offense_clear"] is True
+        assert body["offense_clearance"] == np.asarray(flags[0], dtype=bool).tolist()
+        assert body["team_clearance_required"] is True
+        assert body["clearance_ready_to_shoot"] is False
+    assert full["obs_tokens"]["players_labels"][-1] == "offense_cleared"
+    assert full["obs_tokens"]["globals_labels"][-1] == "clearance_ready_to_shoot"

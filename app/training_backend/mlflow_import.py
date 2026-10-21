@@ -88,6 +88,7 @@ def config_from_mlflow_values(
         "check_setup_steps": "check_setup_steps",
         "check_clearance": "check_clearance",
         "random_check_location": "random_check_location",
+        "require_all_offense_clear": "require_all_offense_clear",
         "multi_possession_use_inbounds": "multi_possession_use_inbounds",
     }
     for source, target in application_field_mapping.items():

@@ -42,6 +42,7 @@ from basketworld_jax.env.minimal import (
     TURNOVER_REASON_SHOT_CLOCK,
     assemble_full_actions_jax,
     build_action_masks_batch,
+    initialize_team_clearance_batch,
     build_kernel_static_from_config,
     build_pass_steal_probabilities_batch,
     build_spatial_diagnostics_batch,
@@ -224,6 +225,7 @@ _JAX_EVALUATION_CONTRACT_FIELDS = (
     "multi_possession_use_inbounds",
     "made_basket_restart_mode",
     "check_clearance",
+    "require_all_offense_clear",
     "episode_end_mode",
     "game_clock_seconds",
     "overtime_seconds",
@@ -1322,6 +1324,9 @@ def _build_native_eval_runner(
                 multi_possession_features=bool(
                     getattr(team_a_spec, "multi_possession_features", False)
                 ),
+                team_clearance_features=(
+                    int(getattr(team_a_spec, "observation_schema_version", 1)) >= 6
+                ),
                 check_clearance_features=(
                     int(getattr(team_a_spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -1356,6 +1361,9 @@ def _build_native_eval_runner(
                 multi_possession_features=bool(
                     getattr(team_a_spec, "multi_possession_features", False)
                 ),
+                team_clearance_features=(
+                    int(getattr(team_a_spec, "observation_schema_version", 1)) >= 6
+                ),
                 check_clearance_features=(
                     int(getattr(team_a_spec, "observation_schema_version", 1)) >= 5
                 ),
@@ -1379,6 +1387,9 @@ def _build_native_eval_runner(
                 ),
                 multi_possession_features=bool(
                     getattr(team_b_spec, "multi_possession_features", False)
+                ),
+                team_clearance_features=(
+                    int(getattr(team_b_spec, "observation_schema_version", 1)) >= 6
                 ),
                 check_clearance_features=(
                     int(getattr(team_b_spec, "observation_schema_version", 1)) >= 5
@@ -2078,12 +2089,13 @@ def _apply_paired_starting_teams(static, state, *, episode_offset: int, jnp):
         static.defense_ids[None, :],
     )
     paired_holder = jnp.take_along_axis(starter_ids, holder_slot[:, None], axis=1)[:, 0]
-    return state._replace(
+    state = state._replace(
         offense_team=desired_starters,
         starting_offense_team=desired_starters,
         ball_holder=paired_holder.astype(jnp.int32),
         overtime_pair_inversion=desired_starters.astype(jnp.int8),
     )
+    return initialize_team_clearance_batch(static, state, jnp)
 
 
 def _apply_scheduled_starting_teams(static, state, starting_team_codes, *, jnp):
@@ -2109,11 +2121,12 @@ def _apply_scheduled_starting_teams(static, state, starting_team_codes, *, jnp):
     scheduled_holder = jnp.take_along_axis(starter_ids, holder_slot[:, None], axis=1)[
         :, 0
     ]
-    return state._replace(
+    state = state._replace(
         offense_team=desired_starters,
         starting_offense_team=desired_starters,
         ball_holder=scheduled_holder.astype(jnp.int32),
     )
+    return initialize_team_clearance_batch(static, state, jnp)
 
 
 def _empty_value_diagnostics() -> dict[str, float | int]:
@@ -3200,15 +3213,26 @@ def run_native_jax_evaluation(
     static_check_clearance = int(
         np.asarray(jax.device_get(static.check_clearance), dtype=np.int32).reshape(-1)[0]
     )
+    team_clearance_enabled = bool(
+        np.asarray(jax.device_get(static.require_all_offense_clear)).item()
+    )
     expected_environment_schema = (
-        clearance_schema
-        if static_check_clearance > 0
-        else int(MULTI_POSSESSION_SCHEMA_VERSION)
+        6
+        if team_clearance_enabled
+        else (
+            clearance_schema
+            if static_check_clearance > 0
+            else int(MULTI_POSSESSION_SCHEMA_VERSION)
+        )
     )
     compatible_checkpoint_schemas = (
-        {clearance_schema}
-        if static_check_clearance > 0
-        else legacy_checkpoint_schemas
+        {6}
+        if team_clearance_enabled
+        else (
+            {clearance_schema}
+            if static_check_clearance > 0
+            else legacy_checkpoint_schemas
+        )
     )
     if static_multi and (
         not checkpoint_schema_versions.issubset(compatible_checkpoint_schemas)
