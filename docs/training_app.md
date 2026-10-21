@@ -101,6 +101,23 @@ configured update, preserving the original behavior. When it is set, entropy
 reaches the end coefficient at that update and remains there for the rest of
 the run.
 
+Use `jax/train/policy_entropy` to monitor mean action-policy entropy in nats.
+It averages legal-action-masked entropy across the controlled players and
+eligible training transitions, weighting minibatches by their eligible sample
+counts. Forced actions contribute zero; this is not normalized by the number
+of legal actions. With no eligible samples the reported value is zero.
+It is measured after optimizer steps (the last PPO epoch), so minibatched
+training aggregates measurements from the successive updated policies.
+
+The existing `jax/train/entropy_bonus` retains its historical loss normalization;
+it is not the ordinary sample mean when using minibatches or completed-episode
+weighting. Neither that metric nor the training objective has changed.
+`entropy_coef` remains the weight applied to the legacy entropy loss term.
+The new metric is available in both logging profiles and the Run detail metric
+picker after it is first logged. Pause and then Resume launches a new worker
+that picks up this code and continues the same MLflow run; confirm the source
+provenance change if prompted. Historical points are not rewritten or backfilled.
+
 The default `mlflow_metric_profile=core` logs a compact set of aggregate PPO,
 episode, spatial, intent, selector, opponent-pool, and deploy-evaluation metrics.
 It intentionally omits per-intent, per-action, raw-count, and duplicate metric

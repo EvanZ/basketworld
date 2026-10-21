@@ -5425,6 +5425,13 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
         )
         value_loss = _masked_mean(jnp.square(forward_out["values"] - batch.returns))
         entropy_bonus = _masked_mean(jnp.mean(masked_out["entropy"], axis=-1))
+        # Report mean action entropy independently of the legacy loss scaling.
+        # A minibatch retains the full PPO batch's loss denominator, so its
+        # entropy_bonus is a contribution to that objective, not a sample mean.
+        entropy_weight = jnp.sum(loss_weights)
+        policy_entropy = jnp.sum(
+            jnp.mean(masked_out["entropy"], axis=-1) * loss_weights
+        ) / jnp.maximum(entropy_weight, 1.0)
         approx_kl = _masked_mean((ratio - 1.0) - log_ratio)
         clip_fraction = _masked_mean((jnp.abs(ratio - 1.0) > clip_range).astype(jnp.float32))
         mean_abs_log_ratio = _masked_mean(jnp.abs(log_ratio))
@@ -5505,6 +5512,7 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
             "policy_loss": policy_loss,
             "value_loss": value_loss,
             "entropy_bonus": entropy_bonus,
+            "policy_entropy": policy_entropy,
             "entropy_coef": entropy_coef,
             "approx_kl": approx_kl,
             "clip_fraction": clip_fraction,
@@ -5590,10 +5598,17 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
         return new_params, new_opt_state, metrics
 
     def _mean_metrics(metric_steps):
-        return {
+        metrics = {
             name: jnp.mean(values)
             for name, values in metric_steps.items()
         }
+        # Minibatches can contain different numbers of eligible transitions.
+        # Weight the reported entropy by those counts, including empty batches.
+        weights = metric_steps["ppo_loss_weight_sum"]
+        metrics["policy_entropy"] = jnp.sum(
+            metric_steps["policy_entropy"] * weights
+        ) / jnp.maximum(jnp.sum(weights), 1.0)
+        return metrics
 
     def _take_minibatch(batch: PPOBatch, indices):
         return PPOBatch(
