@@ -33,9 +33,29 @@ h2 { margin-bottom: 5px; }
 button.primary, button.ghost, .actions button { border: 1px solid #2e4a70; border-radius: 8px; padding: 9px 14px; color: #dce9ff; background: #152540; }
 button.primary { color: #04111e; border-color: #45d6ff; background: #45d6ff; font-weight: 800; }
 button.ghost { background: transparent; }
-.run-row { width: 100%; padding: 16px 22px; border: 0; border-top: 1px solid #172641; color: inherit; background: transparent; display: grid; grid-template-columns: 12px minmax(220px, 1fr) 110px 260px; gap: 18px; align-items: center; text-align: left; }
+.run-filters { display: flex; align-items: center; gap: 18px; padding: 14px 22px; border-bottom: 1px solid #20304b; }
+.run-filters label { display: flex; align-items: center; gap: 10px; }
+.run-filters select { width: 170px; }
+.run-filters > span { color: #8495b2; font-size: 12px; }
+.run-row { width: 100%; padding: 16px 22px; border: 0; border-top: 1px solid #172641; color: inherit; background: transparent; display: grid; grid-template-columns: 12px minmax(180px, 1fr) 100px minmax(130px, 180px) repeat(2, minmax(130px, 150px)); gap: 18px; align-items: center; text-align: left; }
 .run-row:hover { background: #13213a; }
-.run-name { display: grid; gap: 3px; }.run-name small { color: #798ba8; }
+.run-name { display: grid; gap: 3px; min-width: 0; overflow-wrap: anywhere; }.run-name small { color: #798ba8; }
+.run-elo-badge { justify-self: start; margin-top: 4px; padding: 3px 8px; border-radius: 999px; background: #202d43; color: #9cacc7; font-size: 11px; font-variant-numeric: tabular-nums; }
+.run-elo-badge.ready { background: #183d38; color: #80dfc2; }
+.run-elo-badge.unavailable { background: #443323; color: #e8bd83; }
+.run-timing { display: grid; gap: 3px; font-variant-numeric: tabular-nums; }
+.run-timing small { color: #798ba8; font-size: 11px; }
+.run-timing strong { font-size: 14px; white-space: nowrap; }
+.run-identifiers { grid-column: 2 / -1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 18px; cursor: text; user-select: text; }
+.run-identifiers > span { display: grid; gap: 4px; min-width: 0; }
+.run-identifiers small { color: #798ba8; font-size: 11px; }
+.run-identifiers code { color: #9cacc7; font-size: 12px; overflow-wrap: anywhere; }
+@media (max-width: 1400px) {
+  .run-row { grid-template-columns: 12px minmax(180px, 1fr) 110px 180px; }
+  .run-timing { grid-row: 2; }
+  .run-elapsed { grid-column: 2; }
+  .run-remaining { grid-column: 3 / 5; }
+}
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #64748b; }
 .status-dot.running, .status-dot.starting { background: #2dd4bf; box-shadow: 0 0 12px #2dd4bf; }
 .status-dot.paused, .status-dot.pausing { background: #fbbf24; }.status-dot.failed { background: #fb7185; }

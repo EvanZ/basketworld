@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
@@ -166,8 +167,16 @@ def create_run(request: RunCreateRequest) -> TrainingRun:
 @app.get("/api/v1/runs", response_model=list[TrainingRun])
 def list_runs(limit: int = Query(default=100, ge=1, le=1000)) -> list[TrainingRun]:
     manager.poll()
+    runs = repository.list_runs(limit=limit)
+    timing_events = repository.timing_events_by_run([run["id"] for run in runs])
+    now = datetime.now(timezone.utc)
     return [
-        TrainingRun.model_validate(run) for run in repository.list_runs(limit=limit)
+        TrainingRun.model_validate({
+            **run,
+            "training_elapsed_seconds": active_training_seconds(timing_events[run["id"]], now=now),
+            "elo_badge": _run_elo_badge(run),
+        })
+        for run in runs
     ]
 
 
@@ -185,7 +194,9 @@ def get_run(run_id: str) -> RunDetail:
                 run["command"], run["environment"]
             ),
             "resolved_config": resolve_run_config_schema(tuple(run["command"])),
-            "training_elapsed_seconds": active_training_seconds(events),
+            "training_elapsed_seconds": active_training_seconds(
+                repository.timing_events_by_run([run_id])[run_id]
+            ),
             "provenance_comparison": manager.provenance_comparison(run),
         }
     )
@@ -238,7 +249,10 @@ def get_run_metric_histories(
     response_model=HistoricalEloSummary,
 )
 def get_run_historical_elo(run_id: str) -> HistoricalEloSummary:
-    run = _run_or_404(run_id)
+    return _run_historical_elo_summary(_run_or_404(run_id))
+
+
+def _run_historical_elo_summary(run: dict) -> HistoricalEloSummary:
     run_root = Path(run["status_file"]).resolve().parent
     allowed_root = (settings.data_dir / "runs").resolve()
     if not run_root.is_relative_to(allowed_root):
@@ -254,6 +268,24 @@ def get_run_historical_elo(run_id: str) -> HistoricalEloSummary:
             detail=f"Unable to calculate historical-evaluation Elo: {exc}",
         ) from exc
     return HistoricalEloSummary.model_validate(summary)
+
+
+def _run_elo_badge(run: dict) -> dict:
+    try:
+        summary = _run_historical_elo_summary(run)
+        latest = summary.latest
+        return {
+            "status": summary.status,
+            "rating": latest["elo_rating"] if latest else None,
+            "update": latest["update"] if latest else None,
+            "warnings": summary.warnings,
+        }
+    except Exception as exc:
+        # A missing/corrupt evaluation must not hide the other experiments.
+        return {
+            "status": "unavailable",
+            "error": str(exc.detail if isinstance(exc, HTTPException) else exc),
+        }
 
 
 @app.get("/api/v1/runs/{run_id}/logs", response_class=PlainTextResponse)
@@ -295,7 +327,9 @@ def resume_run(
     return _action(
         run_id,
         lambda value: manager.resume(
-            value, confirm_provenance_mismatch=request.confirm_provenance_mismatch
+            value,
+            confirm_provenance_mismatch=request.confirm_provenance_mismatch,
+            additional_historical_eval_updates=request.additional_historical_eval_updates,
         ),
         "Training resumed.",
     )

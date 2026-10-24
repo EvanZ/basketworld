@@ -2886,6 +2886,50 @@ def test_core_mlflow_deploy_metric_filter_keeps_compact_aggregates():
     assert _filter_mlflow_deploy_metrics(metrics, profile="full") == metrics
 
 
+@pytest.mark.parametrize("has_completed_games", [True, False])
+def test_core_deploy_pace_retains_completed_game_clock_metrics(has_completed_games):
+    totals = {field: np.zeros(4, dtype=np.float32) for field in DeployEvalTotals._fields}
+    totals.update(
+        elapsed_game_clock_seconds=np.asarray([300.0, 420.0, 60.0, 90.0]),
+        team_a_completed_offensive_possessions=np.asarray([10.0, 26.0, 100.0, 100.0]),
+        team_b_completed_offensive_possessions=np.asarray([9.0, 15.0, 100.0, 100.0]),
+        terminal_overtime_periods=np.asarray([0.0, 1.0, 0.0, 0.0]),
+    )
+    output = DeployEvalOutput(
+        final_state=SimpleNamespace(
+            episode_ended=np.asarray([has_completed_games, has_completed_games, True, False]),
+            episode_truncated=np.asarray([False, False, True, False]),
+            offense_score=np.zeros(4),
+            defense_score=np.zeros(4),
+            overtime_round=np.asarray([0, 1, 0, 0]),
+        ),
+        totals=DeployEvalTotals(**totals),
+        rebound_diagnostic_totals=ReboundDiagnosticTotals(
+            **{field: 0.0 for field in ReboundDiagnosticTotals._fields}
+        ),
+    )
+    summary = summarize_deploy_eval_outputs([output], batch_size=4)
+    filtered = _filter_mlflow_deploy_metrics(summary)
+    assert filtered["clock_team_a_pace_completed_offensive_possessions_per_game_minute"] == pytest.approx(
+        3.0 if has_completed_games else 0.0
+    )
+    assert filtered["clock_team_b_pace_completed_offensive_possessions_per_game_minute"] == pytest.approx(
+        2.0 if has_completed_games else 0.0
+    )
+    assert filtered["clock_elapsed_game_clock_seconds_completed_games"] == (
+        720.0 if has_completed_games else 0.0
+    )
+    assert filtered["clock_elapsed_game_clock_seconds_truncated_games"] == (
+        150.0 if has_completed_games else 870.0
+    )
+    assert filtered["completed_episode_count"] == (2 if has_completed_games else 0)
+    assert filtered["safety_truncated_episode_count"] == 1
+    assert filtered["horizon_truncated_episode_count"] == (1 if has_completed_games else 3)
+    assert {key: value for key, value in filtered.items() if key.startswith("clock_")} == {
+        key: value for key, value in summary.items() if key.startswith("clock_")
+    }
+
+
 def test_core_mlflow_train_metric_filter_keeps_turnover_reason_breakdown():
     metrics = {
         "mean_turnovers_per_completed_episode": 2.0,

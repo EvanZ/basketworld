@@ -17,6 +17,7 @@ import {
   continuationHistoricalEvalSchedule as buildContinuationHistoricalEvalSchedule,
   historicalEvalUpdatesForTarget,
   parseHistoricalEvalUpdates,
+  savedHistoricalEvalUpdates,
 } from './configEditing'
 import { launchGitCommit, launchWorktreeState } from './runProvenance'
 
@@ -137,6 +138,11 @@ function loadSelectedMetricNames() {
 }
 
 const runs = ref([])
+const runStatusFilter = ref('all')
+const runStatuses = ['queued', 'starting', 'running', 'pausing', 'paused', 'stopping', 'stopped', 'completed', 'failed']
+const filteredRuns = computed(() => runStatusFilter.value === 'all'
+  ? runs.value
+  : runs.value.filter((run) => run.status === runStatusFilter.value))
 const selected = ref(null)
 const config = ref(defaultConfig())
 const configInputDrafts = ref({})
@@ -181,6 +187,20 @@ const activeRun = computed(() => runs.value.find((run) =>
 const canPause = computed(() => selected.value?.status === 'running')
 const canResume = computed(() => selected.value?.status === 'paused')
 const canRecover = computed(() => selected.value?.status === 'stopped')
+const resumeHistoricalEvalUpdates = ref('')
+const resumeHistoricalEvalInput = computed(() => parseHistoricalEvalUpdates(resumeHistoricalEvalUpdates.value))
+const resumeHistoricalEvalSchedule = computed(() => {
+  const existing = savedHistoricalEvalUpdates(selected.value)
+  if (resumeHistoricalEvalInput.value.error) {
+    return { updates: existing, error: resumeHistoricalEvalInput.value.error }
+  }
+  return buildContinuationHistoricalEvalSchedule(
+    existing,
+    resumeHistoricalEvalInput.value.updates,
+    Number(selected.value?.current_update) || 0,
+    Number(selected.value?.target_updates) || 0,
+  )
+})
 const continuationUpdates = ref(10000)
 const continuationHistoricalEvalUpdates = ref('')
 const continuationTarget = computed(() => {
@@ -195,8 +215,7 @@ const continuationPreviousTarget = computed(() => Math.max(
   Number(selected.value?.target_updates) || 0,
 ))
 const continuationExistingHistoricalEvalUpdates = computed(() => {
-  const updates = selected.value?.config?.historical_eval_updates
-  if (!Array.isArray(updates)) return []
+  const updates = savedHistoricalEvalUpdates(selected.value)
   return [...new Set(updates.filter((update) => Number.isSafeInteger(update) && update > 0))]
     .sort((left, right) => left - right)
 })
@@ -365,6 +384,15 @@ function formatMetricValue(value) {
 
 function formatElo(value) {
   return Number.isFinite(Number(value)) ? Math.round(Number(value)).toLocaleString() : '—'
+}
+
+function eloBadgeTitle(badge) {
+  if (badge?.status === 'unavailable') return badge.error || 'Historical Elo is unavailable.'
+  if (badge?.status !== 'ready') return 'Waiting for completed historical evaluation matchups.'
+  return [
+    `Latest deterministic historical Elo, measured at update ${badge.update}. Ratings are relative to checkpoints within this run.`,
+    ...(badge.warnings || []),
+  ].join('\n')
 }
 
 function formatEloDelta(value) {
@@ -720,6 +748,7 @@ async function selectRun(run) {
     selected.value = detail
     continuationUpdates.value = 10000
     continuationHistoricalEvalUpdates.value = ''
+    resumeHistoricalEvalUpdates.value = ''
     logs.value = logText
     eloSummary.value = null
     eloError.value = ''
@@ -804,15 +833,16 @@ async function withProvenanceConfirmation(requestAction) {
 }
 
 async function resumeRun() {
-  if (!selected.value || (!canResume.value && !canRecover.value)) return
+  if (!selected.value || (!canResume.value && !canRecover.value) || resumeHistoricalEvalSchedule.value.error) return
   loading.value = true
   error.value = ''
   try {
     const response = await withProvenanceConfirmation((confirmed) => (
-      api.resumeRun(selected.value.id, confirmed)
+      api.resumeRun(selected.value.id, confirmed, resumeHistoricalEvalInput.value.updates)
     ))
     if (response) {
       selected.value = response.run
+      resumeHistoricalEvalUpdates.value = ''
       await loadRuns()
     }
   } catch (cause) {
@@ -901,14 +931,45 @@ onBeforeUnmount(() => {
           <div><h2>Experiments</h2><p>Durable workers and their latest persisted state.</p></div>
           <button class="primary" :disabled="Boolean(activeRun)" @click="activeView = 'new'">New run</button>
         </div>
+        <div class="run-filters">
+          <label for="run-status-filter">Status
+            <select id="run-status-filter" v-model="runStatusFilter">
+              <option value="all">All statuses</option>
+              <option v-for="status in runStatuses" :key="status" :value="status">{{ status.charAt(0).toUpperCase() + status.slice(1) }}</option>
+            </select>
+          </label>
+          <span>{{ filteredRuns.length }} of {{ runs.length }} experiments</span>
+        </div>
         <div v-if="!runs.length" class="empty">No training runs yet.</div>
-        <button v-for="run in runs" :key="run.id" class="run-row" @click="selectRun(run)">
+        <div v-else-if="!filteredRuns.length" class="empty">No {{ runStatusFilter }} experiments.</div>
+        <button v-for="run in filteredRuns" :key="run.id" class="run-row" @click="selectRun(run)">
           <span class="status-dot" :class="run.status"></span>
-          <span class="run-name"><strong>{{ run.name }}</strong><small>{{ formatDate(run.created_at) }}</small></span>
+          <span class="run-name">
+            <strong>{{ run.name }}</strong>
+            <small>{{ formatDate(run.created_at) }}</small>
+            <span class="run-elo-badge" :class="run.elo_badge?.status || 'waiting'" :title="eloBadgeTitle(run.elo_badge)">
+              <template v-if="run.elo_badge?.status === 'ready'">Elo {{ formatElo(run.elo_badge.rating) }} · U{{ run.elo_badge.update.toLocaleString() }}<span v-if="run.elo_badge.warnings?.length" aria-label="Evaluation warnings"> ⚠</span></template>
+              <template v-else>{{ run.elo_badge?.status === 'unavailable' ? 'Elo unavailable' : 'Elo pending' }}</template>
+            </span>
+          </span>
           <span class="status-pill" :class="run.status">{{ run.status }}</span>
           <span class="run-progress">
             <span>{{ run.current_update.toLocaleString() }} / {{ run.target_updates.toLocaleString() }}</span>
             <span class="progress-track"><i :style="{ width: `${progress(run)}%` }"></i></span>
+          </span>
+          <span class="run-timing run-elapsed" title="Total active training time across starts and resumes, including evaluation and checkpoint work. Time spent paused is excluded.">
+            <small>Training time</small>
+            <strong>{{ run.training_elapsed_seconds == null ? 'Unavailable' : formatDuration(run.training_elapsed_seconds) }}</strong>
+            <small>active elapsed</small>
+          </span>
+          <span class="run-timing run-remaining" title="Estimated from average active time per completed update. Future evaluations may change the estimate; paused time is excluded.">
+            <small>Est. remaining</small>
+            <strong>{{ estimateRemainingTrainingSeconds(run) === null ? 'Calculating' : formatDuration(estimateRemainingTrainingSeconds(run)) }}</strong>
+            <small>{{ remainingTrainingTimeCaption(run, estimateRemainingTrainingSeconds(run)) }}</small>
+          </span>
+          <span class="run-identifiers" @click.stop>
+            <span><small>MLflow run ID</small><code>{{ run.mlflow_run_id || 'Unavailable' }}</code></span>
+            <span title="Git commit and tracked worktree state recorded for the most recent worker launch."><small>Launch commit · {{ launchWorktreeState(run) }}</small><code>{{ launchGitCommit(run) }}</code></span>
           </span>
         </button>
       </section>
@@ -1019,8 +1080,22 @@ onBeforeUnmount(() => {
               <button @click="cloneRun(selected)">Copy as new run</button>
               <button :disabled="loading || !canCheckpoint" @click="runAction('checkpoint')">Checkpoint</button>
               <button :disabled="loading || !canPause" @click="runAction('pause')">Pause</button>
-              <button v-if="selected.status === 'paused'" class="primary" :disabled="loading || !canResume" @click="resumeRun">Resume</button>
-              <button v-if="selected.status === 'stopped'" class="primary" :disabled="loading || !canRecover" @click="resumeRun">Recover checkpoint</button>
+              <div v-if="canResume || canRecover" class="continue-control">
+                <div class="continuation-inputs">
+                  <label class="continuation-checkpoints">
+                    <span>Add Elo checkpoints</span>
+                    <input v-model="resumeHistoricalEvalUpdates" type="text" inputmode="numeric" placeholder="e.g. 15000, 20000, 25000" :disabled="loading" />
+                  </label>
+                </div>
+                <div class="continuation-details">
+                  <small>After U{{ selected.current_update.toLocaleString() }}, through U{{ selected.target_updates.toLocaleString() }} · same MLflow run</small>
+                  <small>Saved Elo checkpoints: {{ formatUpdates(continuationExistingHistoricalEvalUpdates) }}</small>
+                  <small v-if="resumeHistoricalEvalSchedule.error" class="error-text">{{ resumeHistoricalEvalSchedule.error }}</small>
+                  <small v-else>Resulting schedule: {{ formatUpdates(resumeHistoricalEvalSchedule.updates) }}</small>
+                  <small>Leave blank to keep the current schedule. Changes are saved when resuming.</small>
+                </div>
+                <button class="primary" :disabled="loading || !!resumeHistoricalEvalSchedule.error" @click="resumeRun">{{ canResume ? 'Resume' : 'Recover checkpoint' }}</button>
+              </div>
               <div v-if="selected.status === 'completed'" class="continue-control">
                 <div class="continuation-inputs">
                   <label>

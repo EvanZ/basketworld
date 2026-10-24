@@ -12,6 +12,7 @@ import { resetStatsStorage } from './services/stats';
 import { startEpisodeExport } from './services/api';
 import { actionAnimationFrameCount, actionAnimationTiming, hexDistance } from './utils/actionAnimationTiming';
 import { playerSurnameForId } from './utils/playerIdentity';
+import { hydrateEpisodeSkillMetadata } from './utils/episodeSkillMetadata';
 import {
   aggregatePlayerShotCharts,
   stableEvalTeamIds,
@@ -3455,7 +3456,7 @@ function previewGifRangeFrame(frameNumber) {
 
   cancelReplayAnimation();
   if (replayStates.value !== states) {
-    replayStates.value = states.map(cloneState);
+    replayStates.value = hydrateEpisodeSkillMetadata(states).map(cloneState);
   }
   isManualStepping.value = true;
   applyReplayStateAtIndex(frameNumber - 1);
@@ -3673,7 +3674,7 @@ async function animateReplayStates(states) {
   }
 
   const runId = ++replayAnimationRunId;
-  replayStates.value = states.map(cloneState);
+  replayStates.value = hydrateEpisodeSkillMetadata(states).map(cloneState);
   isReplaying.value = true;
   isReplayPaused.value = false;
   isManualStepping.value = false;
@@ -3720,7 +3721,7 @@ async function handleManualReplay(showAlert = false, keepCurrentView = true) {
     const res = await replayLastEpisode();
     if (res.status === 'success' && Array.isArray(res.states) && res.states.length > 0) {
       // Store states for manual stepping
-      replayStates.value = res.states.map(cloneState);
+      replayStates.value = hydrateEpisodeSkillMetadata(res.states).map(cloneState);
       resetGifFrameRange(replayStates.value.length);
       isManualStepping.value = true;
       isReplayPaused.value = false;

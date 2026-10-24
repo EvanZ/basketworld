@@ -4053,8 +4053,13 @@ class JaxDevRuntime:
                 else "team_b_shooting_pct_by_player"
             ]
         )
-        if include_episode_metadata:
+        if include_episode_metadata or state["done"]:
             state.update(copy.deepcopy(episode_metadata))
+        if state["done"]:
+            # Episode Stats consumes the full rebound history at completion.
+            # The final tick alone usually contains no rebound in a timed or
+            # multi-possession game. Keep intermediate Fast Mode frames small.
+            state["episode_rebounds"] = copy.deepcopy(self.episode_rebounds)
         if include_state_values:
             state["state_values"] = self.state_values()
         return state
@@ -4149,12 +4154,17 @@ class JaxDevRuntime:
         rebound_target_observation_features = bool(
             getattr(self.raw_model.spec, "rebound_target_observation_features", True)
         )
+        clock_mode = (
+            _as_int(_field0(self.state, "episode_end_mode"))
+            == EPISODE_END_GAME_CLOCK
+        )
         player_labels, globals_labels = token_observation_labels(
             rebound_win_prob_features=bool(
                 getattr(self.raw_model.spec, "rebound_win_prob_features", False)
             ),
             rebound_target_observation_features=rebound_target_observation_features,
             multi_possession_features=self.multi_possession_enabled,
+            episode_end_mode="game_clock" if clock_mode else "possessions",
             team_clearance_features=(
                 int(getattr(self.raw_model.spec, "observation_schema_version", 1)) >= 6
             ),
@@ -4186,10 +4196,6 @@ class JaxDevRuntime:
         )
         overtime_starting_team = _as_int(
             _field0(self.state, "overtime_starting_team")
-        )
-        clock_mode = (
-            _as_int(_field0(self.state, "episode_end_mode"))
-            == EPISODE_END_GAME_CLOCK
         )
         episode_possession_limit = _as_int(
             _field0(self.state, "episode_possession_limit")

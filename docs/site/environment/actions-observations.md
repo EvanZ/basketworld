@@ -174,6 +174,13 @@ The multi-possession schema then appends `relative_score`,
 `restart_countdown_norm`. These begin at index 7 without the optional rebound
 probability feature, or index 8 with it.
 
+In game-clock mode, the `possessions_remaining_norm` slot is labeled
+`game_clock_remaining_norm` and contains the remaining seconds in the current
+period divided by the fixed scale of 720 (also in overtime). For example,
+300 seconds is approximately 0.4167. The Observation tab shows this label and
+the remaining seconds. Older clock checkpoints may retain the possession label
+in their saved metadata; the input slot and values are unchanged.
+
 The positive check-clearance schema then appends `check_ball_q_norm`,
 `check_ball_r_norm`, `check_clearance_norm`,
 `check_double_violation_count_norm`, and

@@ -12,7 +12,7 @@ from uuid import uuid4
 from app.training_backend.config import Settings
 from app.training_backend.database import TrainingRepository, utc_now
 from app.training_backend.models import RunStatus, TrainingRunConfig
-from app.training_backend.presets import build_halfcourt_multi_possession_preview
+from app.training_backend.presets import build_halfcourt_multi_possession_preview, _historical_updates
 from app.training_backend.application_training import resolve_run_training_config
 from basketworld_jax.checkpoints import CHECKPOINT_VERSION, load_checkpoint_metadata
 from basketworld_jax.provenance import (
@@ -275,13 +275,43 @@ class JobManager:
         return updated
 
     def resume(
-        self, run_id: str, *, confirm_provenance_mismatch: bool = False
+        self, run_id: str, *, confirm_provenance_mismatch: bool = False,
+        additional_historical_eval_updates: list[int] | None = None,
     ) -> dict[str, Any]:
         run = self._require_status(
             run_id, {RunStatus.PAUSED.value, RunStatus.STOPPED.value}
         )
         config = TrainingRunConfig.model_validate(run["config"])
         self._require_available_worker_slot(run_id)
+        added = list(additional_historical_eval_updates or [])
+        schedule_event = None
+        if added:
+            if any(isinstance(update, bool) or not isinstance(update, int) for update in added):
+                raise RuntimeError("Added Elo checkpoints must be whole-number updates.")
+            if len(set(added)) != len(added):
+                raise RuntimeError("Each added Elo checkpoint must appear only once.")
+            if any(update <= int(run["current_update"]) or update < 1 for update in added):
+                raise RuntimeError(
+                    f"Added Elo checkpoints must be after the current update U{int(run['current_update']):,}."
+                )
+            if any(update > int(run["target_updates"]) for update in added):
+                raise RuntimeError(
+                    f"Added Elo checkpoints must be no later than the target U{int(run['target_updates']):,}."
+                )
+            existing = (
+                list(config.historical_eval_updates)
+                if config.historical_eval_updates is not None
+                else _historical_updates(config)
+            )
+            if set(added).intersection(existing):
+                raise RuntimeError("An added Elo checkpoint is already in the saved schedule.")
+            resulting = sorted(set(existing).union(added))
+            config = config.model_copy(update={"historical_eval_updates": resulting})
+            schedule_event = {
+                "previous_historical_eval_updates": existing,
+                "added_historical_eval_updates": sorted(added),
+                "resulting_historical_eval_updates": resulting,
+            }
         return self._resume_from_checkpoint(
             run,
             config,
@@ -290,6 +320,7 @@ class JobManager:
                 if run["status"] == RunStatus.STOPPED.value
                 else "resume_requested"
             ),
+            event_payload=schedule_event,
             confirm_provenance_mismatch=confirm_provenance_mismatch,
         )
 
@@ -404,6 +435,9 @@ class JobManager:
             checkpoint=checkpoint,
             preview=preview,
         )
+        added_evaluations = (event_payload or {}).get("added_historical_eval_updates", [])
+        if any(update <= int(checkpoint_metadata["update_index"]) for update in added_evaluations):
+            raise RuntimeError("Added Elo checkpoints must be after the saved checkpoint update.")
         if (
             provenance_comparison["requires_confirmation"]
             and not confirm_provenance_mismatch

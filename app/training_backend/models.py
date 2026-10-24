@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 
 
 class RunStatus(str, Enum):
@@ -137,6 +137,14 @@ class RunPreview(BaseModel):
     log_file: str
 
 
+class RunEloBadge(BaseModel):
+    status: Literal["waiting", "ready", "unavailable"]
+    rating: float | None = None
+    update: int | None = None
+    warnings: list[str] = Field(default_factory=list)
+    error: str | None = None
+
+
 class TrainingRun(BaseModel):
     id: str
     idempotency_key: str
@@ -163,6 +171,8 @@ class TrainingRun(BaseModel):
     log_file: str
     error_message: str | None = None
     provenance: dict[str, Any] = Field(default_factory=dict)
+    training_elapsed_seconds: float | None = None
+    elo_badge: RunEloBadge | None = None
 
 
 class RunEvent(BaseModel):
@@ -180,7 +190,6 @@ class RunDetail(TrainingRun):
     worker_status: dict[str, Any] | None = None
     display_command: str
     resolved_config: list[dict[str, Any]] = Field(default_factory=list)
-    training_elapsed_seconds: float = 0.0
     provenance_comparison: dict[str, Any] | None = None
 
 
@@ -218,6 +227,16 @@ class RunContinuationRequest(BaseModel):
 
 class RunResumeRequest(BaseModel):
     confirm_provenance_mismatch: bool = False
+    additional_historical_eval_updates: list[StrictInt] = Field(default_factory=list)
+
+    @field_validator("additional_historical_eval_updates")
+    @classmethod
+    def validate_added_historical_eval_updates(cls, value: list[int]) -> list[int]:
+        if any(update <= 0 for update in value):
+            raise ValueError("Added Elo checkpoints must be positive.")
+        if len(set(value)) != len(value):
+            raise ValueError("Each added Elo checkpoint must appear only once.")
+        return sorted(value)
 
 
 class HealthResponse(BaseModel):

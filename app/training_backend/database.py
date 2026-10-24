@@ -252,6 +252,28 @@ class TrainingRepository:
                 ],
             )
 
+    def timing_events_by_run(self, run_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+        """Read the complete lifecycle history in one query for timing displays."""
+        events = {run_id: [] for run_id in run_ids}
+        if not run_ids:
+            return events
+        placeholders = ", ".join("?" for _ in run_ids)
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT run_id, event_type, created_at FROM run_events
+                WHERE run_id IN ({placeholders})
+                  AND event_type IN (
+                      'started', 'paused', 'stopped', 'completed', 'failed', 'launch_failed'
+                  )
+                ORDER BY created_at
+                """,
+                run_ids,
+            ).fetchall()
+        for run_id, event_type, created_at in rows:
+            events[run_id].append({"event_type": event_type, "created_at": created_at})
+        return events
+
     def list_events(self, run_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
         with self._lock, self._connection() as connection:
             cursor = connection.execute(

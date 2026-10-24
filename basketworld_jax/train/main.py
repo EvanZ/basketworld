@@ -2929,12 +2929,14 @@ def _migrate_v2_frozen_opponent_params(
 def _checkpoint_observation_metadata(
     spec: ActorCriticSpec, *, args=None
 ) -> dict[str, Any]:
+    mode = str(getattr(args, "episode_end_mode", "possessions"))
     player_labels, global_labels = token_observation_labels(
         rebound_win_prob_features=bool(spec.rebound_win_prob_features),
         rebound_target_observation_features=bool(
             spec.rebound_target_observation_features
         ),
         multi_possession_features=bool(spec.multi_possession_features),
+        episode_end_mode=mode,
         team_clearance_features=(
             int(spec.observation_schema_version)
             >= TEAM_CLEARANCE_OBSERVATION_SCHEMA_VERSION
@@ -2953,10 +2955,13 @@ def _checkpoint_observation_metadata(
         "flat_observation_dim": int(spec.flat_obs_dim),
     }
     if bool(spec.multi_possession_features):
-        mode = str(getattr(args, "episode_end_mode", "possessions"))
         metadata["episode_end_mode"] = mode
         metadata["episode_budget_feature"] = {
-            "slot": "possessions_remaining_norm",
+            "slot": (
+                "game_clock_remaining_norm"
+                if mode == "game_clock"
+                else "possessions_remaining_norm"
+            ),
             "semantic": (
                 "game_clock_seconds_remaining"
                 if mode == "game_clock"
@@ -4600,7 +4605,13 @@ def _filter_mlflow_deploy_metrics(
         return dict(metrics)
     if profile != "core":
         raise ValueError(f"Unknown MLflow metric profile: {profile}")
-    return {key: value for key, value in metrics.items() if key in _CORE_DEPLOY_METRICS}
+    # Clock diagnostics (including pace) are core deploy outcomes. Keep the
+    # completion/truncation denominators alongside their rates.
+    return {
+        key: value
+        for key, value in metrics.items()
+        if key in _CORE_DEPLOY_METRICS or key.startswith("clock_")
+    }
 
 
 def _log_mlflow_checkpoint_artifacts(

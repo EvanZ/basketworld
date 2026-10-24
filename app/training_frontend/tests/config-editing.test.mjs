@@ -1,11 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { responseErrorMessage } from '../src/api.js'
+import { api, responseErrorMessage } from '../src/api.js'
 import {
   continuationHistoricalEvalSchedule,
   historicalEvalUpdatesForTarget,
   parseHistoricalEvalUpdates,
+  savedHistoricalEvalUpdates,
 } from '../src/configEditing.js'
 
 test('keeps future evaluation milestones when a copied run is shortened', () => {
@@ -133,4 +134,47 @@ test('shows FastAPI validation messages instead of a generic 422 error', () => {
     }],
   }, 422), 'Historical evaluation updates must be positive.')
   assert.equal(responseErrorMessage({}, 422), 'Request failed (422)')
+})
+
+test('paused-run additions use current progress rather than the final target as the lower bound', () => {
+  const draft = '15000, 20000, '
+  const parsed = parseHistoricalEvalUpdates(draft)
+  assert.equal(parsed.error, '')
+  assert.deepEqual(
+    continuationHistoricalEvalSchedule([100, 10000, 30000, 40000], parsed.updates, 10000, 30000),
+    { updates: [100, 10000, 15000, 20000, 30000, 40000], error: '' },
+  )
+  assert.match(continuationHistoricalEvalSchedule([30000], [30000], 10000, 30000).error, /already/)
+  assert.match(continuationHistoricalEvalSchedule([], [10000], 10000, 30000).error, /after/)
+  assert.match(continuationHistoricalEvalSchedule([], [30001], 10000, 30000).error, /no later/)
+})
+
+test('schedule preview preserves explicit milestones and resolves defaults from the launch command', () => {
+  const run = { config: { historical_eval_updates: null }, command: ['python', '--historical-eval-updates', '100,500,10000,30000'] }
+  assert.deepEqual(savedHistoricalEvalUpdates(run), [100, 500, 10000, 30000])
+  run.config.historical_eval_updates = [100, 30000, 40000]
+  assert.deepEqual(savedHistoricalEvalUpdates(run), [100, 30000, 40000])
+  run.config.historical_eval_updates = []
+  assert.deepEqual(savedHistoricalEvalUpdates(run), [])
+})
+
+test('resume sends schedule additions together with provenance confirmation', async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, body: JSON.parse(options.body) })
+    return { ok: true, json: async () => ({}) }
+  }
+  try {
+    await api.resumeRun('original-run', true, [15000, 20000])
+    await api.resumeRun('original-run')
+    assert.equal(calls[0].url, '/api/v1/runs/original-run/resume')
+    assert.deepEqual(calls[0].body, {
+      confirm_provenance_mismatch: true,
+      additional_historical_eval_updates: [15000, 20000],
+    })
+    assert.deepEqual(calls[1].body.additional_historical_eval_updates, [])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })

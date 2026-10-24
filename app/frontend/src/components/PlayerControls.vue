@@ -8528,7 +8528,11 @@ const tokenGlobals = computed(() => {
 const tokenGlobalLabels = computed(() => {
   const provided = obsTokens.value?.globals_labels;
   if (Array.isArray(provided) && provided.length > 0) {
-    const labels = provided.slice(0, tokenGlobals.value.length);
+    const labels = provided.slice(0, tokenGlobals.value.length).map((label) => (
+      isGameClockGame.value && label === 'possessions_remaining_norm'
+        ? 'game_clock_remaining_norm'
+        : label
+    ));
     const hasReboundWinProbability = tokenPlayers.value.some(
       (row) => Array.isArray(row) && row.length > 18
     );
@@ -13412,6 +13416,10 @@ function offenseSkillDeltaLabel(idx) {
           </div>
 
           <h5 class="token-subtitle">Globals</h5>
+          <p v-if="isGameClockGame" class="clock-observation-note">
+            Game clock: {{ props.gameState.game_clock_remaining }} seconds remaining.
+            <code>game_clock_remaining_norm</code> is seconds remaining divided by the fixed scale of 720, including during overtime.
+          </p>
           <table class="observation-table token-table">
             <thead>
               <tr>
@@ -14974,6 +14982,12 @@ function offenseSkillDeltaLabel(idx) {
 }
 
 /* Observation Tab Styles */
+.clock-observation-note {
+  margin: 0 12px 12px;
+  color: #94a3b8;
+  font-size: 12px;
+}
+
 .observation-section {
   padding: 0;
 }

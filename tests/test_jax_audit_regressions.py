@@ -282,6 +282,9 @@ def test_checkpoint_semantics_reject_silent_cross_mode_reuse():
         args=clock_args,
     )
     assert observation_metadata["episode_budget_feature"]["normalization"] == 720.0
+    assert observation_metadata["episode_budget_feature"]["slot"] == "game_clock_remaining_norm"
+    assert "game_clock_remaining_norm" in observation_metadata["global_labels"]
+    assert "possessions_remaining_norm" not in observation_metadata["global_labels"]
     assert observation_metadata["relative_score_feature"]["normalization"] == 30.0
     _validate_checkpoint_episode_semantics(
         {

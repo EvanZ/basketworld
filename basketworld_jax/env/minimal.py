@@ -72,6 +72,7 @@ def token_observation_labels(
     rebound_target_observation_features: bool = True,
     multi_possession_features: bool = False,
     check_clearance_features: bool = False,
+    episode_end_mode: str = "possessions",
     team_clearance_features: bool = False,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Return the ordered labels for the selected token-observation schema."""
@@ -132,7 +133,11 @@ def token_observation_labels(
         global_labels.extend(
             (
                 "relative_score",
-                "possessions_remaining_norm",
+                (
+                    "game_clock_remaining_norm"
+                    if episode_end_mode == "game_clock"
+                    else "possessions_remaining_norm"
+                ),
                 "clearance_required",
                 "restart_phase",
                 "restart_countdown_norm",

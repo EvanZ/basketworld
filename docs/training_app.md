@@ -41,6 +41,28 @@ The combined production-style application is available at <http://localhost:8090
 
 Closing the browser or stopping the frontend does not stop a training worker. The backend launches each worker in a new process session and records its PID plus Linux process-start token to guard against PID reuse.
 
+The **Experiments** list shows **Training time** and **Est. remaining** for each
+run, refreshed automatically. Training time totals active worker sessions across
+resumes, including evaluation and checkpoint work, and excludes paused time.
+Remaining time uses average active time per completed update and the remaining
+update count. It shows **Calculating** until progress is available; later
+evaluations or changes in throughput can change the estimate. The same timing
+is available in Run detail.
+Use the **Status** filter to show runs in a particular state (running, paused,
+failed, and so on), or **All statuses** to show every listed run. The selection
+stays in place during automatic refresh and while opening and returning from
+Run detail.
+Each row also displays the full MLflow run ID and the full Git commit from the
+latest worker launch, alongside its clean/dirty tracked worktree state. These
+identifiers can be selected and copied; missing historical values show
+**Unavailable**.
+The Elo badge shows the latest evaluated checkpoint's deterministic historical
+Elo and update number, refreshed when evaluation results change. It uses the
+same rating as Run detail, relative to checkpoints within that run. **Elo pending**
+means no completed matchups are available yet; **Elo unavailable** indicates an
+evaluation read/calculation error. Hover over the badge for details and any
+evaluation warnings.
+
 For a nonzero check-clearance radius, checks use one deterministic safe anchor
 by default. **Randomize check location** is an opt-in that samples each check
 uniformly from safe outside-arc pickup tiles; either setting retains the same
@@ -56,6 +78,7 @@ up freely but cannot pick up until the countdown ends.
 - **Checkpoint** writes a request file that the JAX trainer consumes after its current PPO update.
 - **Pause** finishes the current update, writes a complete checkpoint, acknowledges the request, and exits normally.
 - **Resume** launches the same absolute-update target from the local `latest` checkpoint without resetting environment or intent-discriminator state, and reopens the original MLflow run so metrics and artifacts continue in one history. Before launch, the app validates checkpoint schema, policy/action/observation metadata, and resolved training settings.
+- While **paused**, use **Add Elo checkpoints** to append future absolute updates (for example `15000, 20000, 25000`), then **Resume**. The same option is available for stopped-run recovery. Additions must be after the current and saved-checkpoint updates, at or below the existing training target, and absent from the saved schedule. The UI previews the merged schedule; leaving the field blank preserves it. Existing milestones, evaluations, checkpoints, and the MLflow run ID are retained. Additions are saved only after restore preflight succeeds and are recorded in the run events. Running workers do not reload schedule edits; pause before adding evaluations.
 - **Continue** extends a completed run from its latest checkpoint in the same MLflow run. The update target changes, but checkpoint-compatible training settings do not.
 - **Stop** sends SIGTERM to the verified worker process group. It is distinct from pause and does not promise a fresh checkpoint. A stopped run can be deliberately recovered from its last validated checkpoint.
 
@@ -124,6 +147,16 @@ It intentionally omits per-intent, per-action, raw-count, and duplicate metric
 families so MLflow does not create hundreds of charts or exhaust browser local
 storage. Set the profile to `full` when a diagnostic run needs every scalar;
 the profile never changes training logic or the JSON/checkpoint artifacts.
+
+The core profile includes deploy game-clock diagnostics under
+`jax/eval_deploy/clock_*`, including
+`clock_team_a_pace_completed_offensive_possessions_per_game_minute` and its
+`team_b` counterpart. Pace is each stable team's completed offensive possessions
+divided by elapsed game-clock minutes, including overtime, using completed games
+only. Truncated-game time and possession counts are logged separately. Select
+these metrics in the Run detail metric picker after a deploy evaluation logs
+them. With no completed games or no elapsed clock time, pace is zero; check
+`completed_episode_count` and the truncation counters before interpreting it.
 
 The application schema excludes retired arguments that the JAX
 trainer does not consume. For example, use `rollout_horizon` rather than

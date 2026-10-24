@@ -61,9 +61,12 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ config, idempotency_key: idempotencyKey }),
   }),
-  resumeRun: (id, confirmProvenanceMismatch = false) => request(`/runs/${id}/resume`, {
+  resumeRun: (id, confirmProvenanceMismatch = false, additionalHistoricalEvalUpdates = []) => request(`/runs/${id}/resume`, {
     method: 'POST',
-    body: JSON.stringify({ confirm_provenance_mismatch: confirmProvenanceMismatch }),
+    body: JSON.stringify({
+      confirm_provenance_mismatch: confirmProvenanceMismatch,
+      additional_historical_eval_updates: additionalHistoricalEvalUpdates,
+    }),
   }),
   continueRun: (
     id,

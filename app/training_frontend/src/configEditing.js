@@ -35,6 +35,16 @@ export function parseHistoricalEvalUpdates(rawValue) {
   return { updates: updates.sort((left, right) => left - right), error: '' }
 }
 
+export function savedHistoricalEvalUpdates(run) {
+  const saved = run?.config?.historical_eval_updates
+  if (Array.isArray(saved)) return [...saved]
+  // A null config uses preset defaults. Read the resolved launch command so
+  // adding milestones cannot silently replace that existing schedule.
+  const command = run?.command || []
+  const index = command.indexOf('--historical-eval-updates')
+  return index >= 0 ? parseHistoricalEvalUpdates(command[index + 1]).updates : []
+}
+
 export function continuationHistoricalEvalSchedule(
   existingUpdates,
   addedUpdates,

@@ -264,6 +264,57 @@ def test_jax_render_snapshot_contract_covers_live_restart_rebound_terminal_and_o
     ]
 
 
+@pytest.mark.parametrize("episode_end_mode", ["possessions", "game_clock"])
+def test_fast_terminal_stats_keep_earlier_rebounds_matching_box_score(episode_end_mode):
+    runtime = _make_runtime(env_params={
+        "enable_multi_possession": True,
+        "episode_end_mode": episode_end_mode,
+    })
+    game_state = GameState()
+    offensive_winner = runtime._team_ids(True)[0]
+    defensive_winner = runtime._team_ids(False)[0]
+    runtime.episode_rebounds = [
+        {"attempt": True, "offensive": True, "defensive": False, "winner": offensive_winner},
+        {"attempt": True, "offensive": False, "defensive": True, "winner": defensive_winner},
+        {"attempt": True, "offensive": False, "defensive": True, "winner": offensive_winner},
+    ]
+    runtime._box_score_players[str(offensive_winner)].update(orb=1, drb=1, reb=2)
+    runtime._box_score_players[str(defensive_winner)].update(drb=1, reb=1)
+    # The last tick ends the game without a rebound. Both teams have rebounded
+    # earlier, including a defensive rebound by the initial offensive roster.
+    runtime.last_action_results = runtime._empty_action_results()
+    assert "episode_rebounds" not in runtime._fast_game_state(game_state)
+    runtime.state = runtime.state._replace(
+        episode_ended=jnp.ones_like(runtime.state.episode_ended),
+    )
+    runtime._sync_environment()
+
+    fast = runtime.get_full_game_state(game_state, compact=True)
+    full = runtime.get_full_game_state(game_state)
+    assert fast["done"]
+    assert not fast["last_action_results"]["rebounds"]
+    assert fast["episode_rebounds"] == full["episode_rebounds"] == runtime.episode_rebounds
+    for field in (
+        "player_shooting_skills", "player_rebound_skills",
+        "player_rebound_skill_specialists", "player_episode_skills",
+    ):
+        assert fast[field] == full[field]
+        assert fast[field]
+    for team, ids in (("team_a", runtime._team_ids(True)), ("team_b", runtime._team_ids(False))):
+        for skill in ("layup", "three_pt", "dunk"):
+            assert fast[f"{team}_shooting_pct_by_player"][skill] == [
+                full["player_shooting_skills"][str(pid)][skill] for pid in ids
+            ]
+    orb = sum(int(row["offensive"]) for row in fast["episode_rebounds"])
+    drb = sum(int(row["defensive"]) for row in fast["episode_rebounds"])
+    assert orb == sum(team["totals"]["orb"] for team in fast["box_score"].values()) == 1
+    assert drb == sum(team["totals"]["drb"] for team in fast["box_score"].values()) == 2
+    assert 100 * drb / (orb + drb) == pytest.approx(66.6666667)
+    # Saved replay snapshots must not change with the next episode's history.
+    runtime.episode_rebounds.clear()
+    assert len(fast["episode_rebounds"]) == 3
+
+
 def test_jax_dev_runtime_labels_rebound_win_probability_observation_features():
     runtime = _make_runtime()
     runtime.raw_model.spec = _FakeSpec(rebound_win_prob_features=True)
@@ -1915,6 +1966,7 @@ def test_jax_dev_runtime_serializes_actual_clock_mode_in_full_and_fast_state():
         "game_clock_seconds": 300,
         "overtime_seconds": 120,
     })
+    runtime.raw_model.spec = _FakeSpec(multi_possession_features=True)
     runtime.state = runtime.state._replace(
         game_clock_remaining=jnp.asarray([83], dtype=jnp.int32),
         elapsed_game_clock_seconds=jnp.asarray([217], dtype=jnp.int32),
@@ -1941,6 +1993,12 @@ def test_jax_dev_runtime_serializes_actual_clock_mode_in_full_and_fast_state():
         assert state["elapsed_game_clock_seconds"] == 217
         assert state["period_elapsed_game_clock_seconds"] == 217
         assert state["overtime_round"] == 2
+        if not compact:
+            tokens = state["obs_tokens"]
+            labels = tokens["globals_labels"]
+            assert "possessions_remaining_norm" not in labels
+            clock_index = labels.index("game_clock_remaining_norm")
+            assert tokens["globals"][clock_index] == pytest.approx(83 / 720)
 
 
 def test_jax_dev_runtime_box_score_resets_with_game_and_restores_with_snapshot():

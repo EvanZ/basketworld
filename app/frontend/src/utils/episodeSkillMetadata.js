@@ -2,6 +2,9 @@ const EPISODE_SKILL_FIELDS = [
   'player_episode_skills',
   'player_rebound_skills',
   'player_shooting_skills',
+  'player_rebound_skill_specialists',
+  'team_a_shooting_pct_by_player',
+  'team_b_shooting_pct_by_player',
 ];
 
 function hasField(state, field) {
@@ -11,7 +14,7 @@ function hasField(state, field) {
 
 /**
  * Resolve episode-stable player skills for compact live and replay states.
- * Fast-mode payloads include these fields on the initial state only, so later
+ * Fast-mode payloads omit these fields on intermediate states, so later
  * replay frames inherit them from an earlier frame in the same episode.
  */
 export function resolveEpisodeSkillMetadata(currentState, history = []) {
@@ -29,4 +32,15 @@ export function resolveEpisodeSkillMetadata(currentState, history = []) {
     }
   }
   return result;
+}
+
+/** Make each replay frame usable by both the board and player inspectors. */
+export function hydrateEpisodeSkillMetadata(states = []) {
+  let skills = {};
+  return states.map((state) => {
+    // Use only this episode's preceding frames, never a future frame or the
+    // currently displayed game (which may belong to another episode).
+    skills = { ...skills, ...resolveEpisodeSkillMetadata(state) };
+    return { ...state, ...skills };
+  });
 }
