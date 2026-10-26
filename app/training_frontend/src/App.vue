@@ -45,9 +45,10 @@ const defaultConfig = () => ({
 
 const PIN_STORAGE_KEY = 'basketworld.training.pinned-configs.v1'
 const PIN_MIGRATION_KEY = 'basketworld.training.pinned-configs.migration.v1'
-const PIN_MIGRATION_VERSION = 'team-offense-clearance-v4'
+const PIN_MIGRATION_VERSION = 'attention-layers-v5'
 const MIGRATED_PINNED_FIELDS = [
   'entropy_decay_updates',
+  'attention_num_layers',
   'shot_contest_skill_mean',
   'shot_contest_skill_std',
   'shot_contest_skill_effect_weight',
@@ -75,6 +76,7 @@ const DEFAULT_PINNED_FIELDS = [
   'shot_contest_skill_std',
   'shot_contest_skill_effect_weight',
   'policy_seed',
+  'attention_num_layers',
   'multi_possession_limit_start',
   'multi_possession_limit_end',
   'multi_possession_limit_ramp_updates',
@@ -554,6 +556,7 @@ function fieldLabel(field) {
     mlflow_experiment_name: 'MLflow experiment',
     num_updates: 'Updates',
     policy_seed: 'Policy seed',
+    attention_num_layers: 'Attention layers',
     multi_possession_limit_start: 'Start possessions',
     multi_possession_limit_end: 'Final possessions',
     multi_possession_limit_ramp_updates: 'Curriculum updates',
