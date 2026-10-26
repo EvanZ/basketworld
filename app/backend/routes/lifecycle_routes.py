@@ -470,6 +470,7 @@ def _populate_jax_training_ui_aliases(training_params: dict) -> dict:
             parts = [
                 f"attention embed={merged.get('attention_embed_dim')}",
                 f"heads={merged.get('attention_num_heads', 'N/A')}",
+                f"layers={merged.get('attention_num_layers', 1)}",
                 f"token_mlp={merged.get('attention_token_mlp_dim', 'N/A')}",
             ]
             if pi:

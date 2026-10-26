@@ -23,6 +23,7 @@ def test_application_schema_excludes_sb3_only_fields(tmp_path):
         "ppo_minibatches",
         "kernel_batch_size",
         "policy_hidden_dims",
+        "attention_num_layers",
         "eval_deploy_every_updates",
         "shot_contest_skill_mean",
         "shot_contest_skill_std",
@@ -30,6 +31,9 @@ def test_application_schema_excludes_sb3_only_fields(tmp_path):
     }.issubset(names)
 
     fields = {field["name"]: field for field in schema}
+    assert fields["attention_num_layers"]["default"] == 1
+    assert fields["attention_num_layers"]["editable"] is True
+    assert fields["attention_num_layers"]["category"] == "Policy"
     for name in (
         "shot_contest_skill_mean",
         "shot_contest_skill_std",

@@ -198,6 +198,7 @@ def test_overlay_jax_mlflow_training_params_exposes_selector_config():
         "jax/policy_model": "attention",
         "jax/attention_embed_dim": "64",
         "jax/attention_num_heads": "4",
+        "jax/attention_num_layers": "2",
         "jax/attention_token_mlp_dim": "64",
         "jax/intent_selector_enabled": "true",
         "jax/intent_selector_hidden_dim": "96",
@@ -247,6 +248,8 @@ def test_overlay_jax_mlflow_training_params_exposes_selector_config():
     assert merged["vf_coef"] == 0.5
     assert merged["ent_coef"] == 0.01
     assert merged["policy_class"] == "JAX attention actor-critic"
+    assert merged["attention_num_layers"] == 2
+    assert "layers=2" in merged["net_arch_used"]
     assert merged["intent_selector_alpha_warmup_steps"] == 20971520
     assert merged["intent_selector_alpha_ramp_steps"] == 104857600
     assert "env/layup_std" not in merged

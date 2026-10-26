@@ -512,6 +512,12 @@ def build_train_parser():
         help="Number of self-attention heads for --policy-model attention.",
     )
     parser.add_argument(
+        "--attention-num-layers",
+        type=int,
+        default=1,
+        help="Number of stacked self-attention blocks for --policy-model attention.",
+    )
+    parser.add_argument(
         "--attention-token-mlp-dim",
         type=int,
         default=64,
@@ -1718,6 +1724,8 @@ def _values_match(actual: Any, expected: Any) -> bool:
 
 
 def validate_train_args(args) -> None:
+    if int(getattr(args, "attention_num_layers", 1)) < 1:
+        raise SystemExit("--attention-num-layers must be >= 1.")
     if bool(getattr(args, "require_all_offense_clear", False)) and not bool(
         getattr(args, "enable_multi_possession", False)
     ):
@@ -2894,6 +2902,7 @@ def _build_policy_spec(
         global_dim=global_dim if model_type == "attention" else 0,
         attention_embed_dim=int(getattr(args, "attention_embed_dim", 64)),
         attention_num_heads=int(getattr(args, "attention_num_heads", 4)),
+        attention_num_layers=int(getattr(args, "attention_num_layers", 1)),
         attention_token_mlp_dim=int(getattr(args, "attention_token_mlp_dim", 64)),
         attention_num_cls_tokens=int(getattr(args, "attention_cls_tokens", 2)),
         attention_pi_head_hidden_dims=tuple(
@@ -4045,6 +4054,7 @@ def _log_mlflow_params(
         "jax/global_dim": int(spec.global_dim),
         "jax/attention_embed_dim": int(spec.attention_embed_dim),
         "jax/attention_num_heads": int(spec.attention_num_heads),
+        "jax/attention_num_layers": int(spec.attention_num_layers),
         "jax/attention_token_mlp_dim": int(spec.attention_token_mlp_dim),
         "jax/attention_cls_tokens": int(spec.attention_num_cls_tokens),
         "jax/attention_pi_head_hidden_dims": ",".join(

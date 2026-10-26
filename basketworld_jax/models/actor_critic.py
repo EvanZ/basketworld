@@ -27,6 +27,7 @@ class ActorCriticSpec:
     global_dim: int = 0
     attention_embed_dim: int = 64
     attention_num_heads: int = 4
+    attention_num_layers: int = 1
     attention_token_mlp_dim: int = 64
     attention_num_cls_tokens: int = 2
     attention_pi_head_hidden_dims: tuple[int, ...] = ()
@@ -59,6 +60,7 @@ def build_actor_critic_spec(
     global_dim: int = 0,
     attention_embed_dim: int = 64,
     attention_num_heads: int = 4,
+    attention_num_layers: int = 1,
     attention_token_mlp_dim: int = 64,
     attention_num_cls_tokens: int = 2,
     attention_pi_head_hidden_dims: Sequence[int] = (),
@@ -131,6 +133,7 @@ def build_actor_critic_spec(
         global_dim = int(global_dim)
         attention_embed_dim = int(attention_embed_dim)
         attention_num_heads = int(attention_num_heads)
+        attention_num_layers = int(attention_num_layers)
         if token_player_count <= 0 or token_dim <= 0 or global_dim <= 0:
             raise ValueError("Attention policy requires positive token/player/global dimensions.")
         expected_dim = (token_player_count * token_dim) + global_dim + 1
@@ -140,6 +143,8 @@ def build_actor_critic_spec(
             )
         if attention_embed_dim % attention_num_heads != 0:
             raise ValueError("--attention-embed-dim must be divisible by --attention-num-heads.")
+        if attention_num_layers < 1:
+            raise ValueError("--attention-num-layers must be >= 1.")
     return ActorCriticSpec(
         flat_obs_dim=int(flat_obs_batch.shape[1]),
         training_player_count=training_player_count,
@@ -152,6 +157,7 @@ def build_actor_critic_spec(
         global_dim=int(global_dim),
         attention_embed_dim=int(attention_embed_dim),
         attention_num_heads=int(attention_num_heads),
+        attention_num_layers=int(attention_num_layers),
         attention_token_mlp_dim=int(attention_token_mlp_dim),
         attention_num_cls_tokens=int(attention_num_cls_tokens),
         attention_pi_head_hidden_dims=tuple(int(v) for v in attention_pi_head_hidden_dims),
@@ -284,15 +290,18 @@ def build_actor_critic_module(spec: ActorCriticSpec):
             }
 
         @nn.compact
-        def _attention_layer(self, tokens):
+        def _attention_layer(self, tokens, *, layer_index: int):
             embed_dim = int(spec.attention_embed_dim)
             num_heads = int(spec.attention_num_heads)
             head_dim = embed_dim // num_heads
+            # Keep the first block's historical names so existing one-layer
+            # checkpoints load without a parameter migration.
+            suffix = "" if int(layer_index) == 0 else f"_{int(layer_index)}"
             qkv = nn.Dense(
                 3 * embed_dim,
                 kernel_init=kernel_init,
                 bias_init=bias_init,
-                name="attention_qkv",
+                name=f"attention_qkv{suffix}",
             )(tokens)
             qkv = qkv.reshape(tokens.shape[0], tokens.shape[1], 3, num_heads, head_dim)
             query = qkv[:, :, 0]
@@ -307,9 +316,11 @@ def build_actor_critic_module(spec: ActorCriticSpec):
                 embed_dim,
                 kernel_init=kernel_init,
                 bias_init=bias_init,
-                name="attention_out",
+                name=f"attention_out{suffix}",
             )(attended)
-            return nn.LayerNorm(name="attention_norm")(tokens + projected), weights
+            return nn.LayerNorm(name=f"attention_norm{suffix}")(
+                tokens + projected
+            ), weights
 
         def _unpack_token_observation(self, flat_obs):
             batch_size = flat_obs.shape[0]
@@ -558,7 +569,14 @@ def build_actor_critic_module(spec: ActorCriticSpec):
                 )
                 token_hidden = jnp.concatenate([token_hidden, cls_batch], axis=1)
 
-            attended, attention_weights = self._attention_layer(token_hidden)
+            attended = token_hidden
+            attention_weights = None
+            for layer_index in range(int(spec.attention_num_layers)):
+                attended, attention_weights = self._attention_layer(
+                    attended,
+                    layer_index=layer_index,
+                )
+            assert attention_weights is not None
             player_tokens = attended[:, : int(spec.token_player_count), :]
             pi_player_tokens = self._attention_head_mlp(
                 player_tokens,

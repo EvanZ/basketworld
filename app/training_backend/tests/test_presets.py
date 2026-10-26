@@ -120,7 +120,11 @@ def test_preview_persists_explicit_mlflow_location(tmp_path):
 def test_preview_compiles_typed_overrides(tmp_path):
     preview = build_halfcourt_multi_possession_preview(
         config=TrainingRunConfig(
-            overrides={"gamma": 0.97, "single_episode_rollouts": True}
+            overrides={
+                "gamma": 0.97,
+                "single_episode_rollouts": True,
+                "attention_num_layers": 2,
+            }
         ),
         run_id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
         repo_root=tmp_path,
@@ -130,6 +134,8 @@ def test_preview_compiles_typed_overrides(tmp_path):
     assert "--gamma" in preview.argv
     assert preview.argv[preview.argv.index("--gamma") + 1] == "0.97"
     assert "--single-episode-rollouts" in preview.argv
+    attention_layers_index = preview.argv.index("--attention-num-layers")
+    assert preview.argv[attention_layers_index + 1] == "2"
 
 
 def test_preview_persists_and_launches_game_clock_configuration(tmp_path):

@@ -66,6 +66,7 @@ from basketworld_jax.train.main import (
     _migrate_v2_frozen_opponent_params,
     _multi_possession_curriculum_enabled,
     _multi_possession_limit_for_update,
+    _normalize_policy_spec_dict,
     _selector_learning_rate_for_args,
     _selector_active_for_update,
     _summarize_intent_intrinsic_advantages,
@@ -364,6 +365,28 @@ def test_deploy_eval_args_reject_invalid_values():
         validate_train_args(parse_args(["--eval-deploy-batches", "-1"]))
     with pytest.raises(SystemExit, match="--eval-deploy-horizon must be >= 1"):
         validate_train_args(parse_args(["--eval-deploy-horizon", "0"]))
+
+
+def test_attention_layer_count_cli_defaults_overrides_and_validates():
+    assert parse_args([]).attention_num_layers == 1
+    assert parse_args(["--attention-num-layers", "3"]).attention_num_layers == 3
+    with pytest.raises(SystemExit, match="--attention-num-layers must be >= 1"):
+        validate_train_args(parse_args(["--attention-num-layers", "0"]))
+
+
+def test_legacy_policy_spec_defaults_to_one_attention_layer():
+    legacy = ActorCriticSpec(
+        flat_obs_dim=5,
+        training_player_count=1,
+        action_dim_per_player=14,
+        total_action_dim=14,
+        hidden_dims=(8,),
+    ).__dict__.copy()
+    legacy.pop("attention_num_layers")
+
+    normalized = _normalize_policy_spec_dict(legacy)
+
+    assert normalized["attention_num_layers"] == 1
 
 
 def test_historical_eval_milestones_are_additive_and_validate():
@@ -3053,6 +3076,7 @@ def test_mlflow_params_include_jax_env_skill_stds():
     assert recorder.params["jax/env/dunk_pct"] == 0.6
     assert recorder.params["jax/env/layup_pct"] == args.layup_pct
     assert recorder.params["jax/env/pass_mode"] == args.pass_mode
+    assert recorder.params["jax/attention_num_layers"] == 1
     assert recorder.params["jax/env/enable_intent_learning"] is True
     assert recorder.params["jax/env/enable_defense_intent_learning"] is True
     assert recorder.params["jax/env/num_intents"] == 6
@@ -3212,6 +3236,8 @@ def test_train_scaffold_supports_attention_policy_model():
             "16",
             "--attention-num-heads",
             "4",
+            "--attention-num-layers",
+            "2",
             "--attention-token-mlp-dim",
             "12",
             "--attention-pi-head-hidden-dims",
@@ -3251,6 +3277,7 @@ def test_train_scaffold_supports_attention_policy_model():
     assert result["policy_spec"]["model_type"] == "attention"
     assert result["policy_spec"]["action_head_mode"] == "pointer_targeted"
     assert result["policy_spec"]["token_player_count"] == 6
+    assert result["policy_spec"]["attention_num_layers"] == 2
     assert result["policy_spec"]["token_dim"] == TOKEN_OBS_PLAYER_DIM + 1
     assert result["policy_spec"]["global_dim"] == TOKEN_OBS_GLOBAL_DIM + 1
     assert result["policy_spec"]["rebound_win_prob_features"] is True

@@ -26,7 +26,7 @@ flowchart LR
     C --> M[Shared two-layer token MLP]
     I[Optional role-aware intent embedding] --> M
     M --> L[Append learned CLS tokens]
-    L --> A[Multi-head self-attention<br/>residual + layer norm]
+    L --> A[Configurable attention stack<br/>residual + layer norm per block]
     A --> H[Role-specific action heads]
     A --> V[Offense and defense value heads]
     A --> S[Optional intent selector heads]
@@ -38,10 +38,14 @@ The shared token MLP is:
 2. ReLU;
 3. dense to `attention_embed_dim`.
 
-One multi-head self-attention block operates on all player and CLS tokens. Its
-output is added to the input and layer-normalized.
+`attention_num_layers` multi-head self-attention blocks operate on all player
+and CLS tokens. Each block has independent parameters, adds its output to its
+input, and layer-normalizes the result. The default remains one block, so older
+one-layer checkpoints retain their existing parameter layout. The exported
+`attention_weights` diagnostic reports the final block.
 
 `attention_embed_dim` must be divisible by `attention_num_heads`.
+`attention_num_layers` must be at least one.
 
 ## Player and role selection
 

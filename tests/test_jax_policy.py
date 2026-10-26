@@ -88,6 +88,7 @@ def test_attention_actor_critic_forward_shapes():
         global_dim=4,
         attention_embed_dim=16,
         attention_num_heads=4,
+        attention_num_layers=2,
         attention_token_mlp_dim=12,
         attention_num_cls_tokens=2,
         attention_pi_head_hidden_dims=(8, 8),
@@ -119,11 +120,48 @@ def test_attention_actor_critic_forward_shapes():
     assert out["attention_weights"].shape == (4, 4, 8, 8)
     assert out["selector_logits"].shape == (4, 8)
     assert out["selector_values"].shape == (4,)
+    assert {
+        "attention_qkv",
+        "attention_out",
+        "attention_norm",
+        "attention_qkv_1",
+        "attention_out_1",
+        "attention_norm_1",
+    }.issubset(params)
     np.testing.assert_allclose(
         np.asarray(out["attention_weights"]).sum(axis=-1),
         np.ones((4, 4, 8), dtype=np.float32),
         atol=1e-5,
     )
+
+
+def test_single_attention_layer_keeps_legacy_parameter_names():
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+
+    spec = ActorCriticSpec(
+        flat_obs_dim=95,
+        training_player_count=3,
+        action_dim_per_player=14,
+        total_action_dim=42,
+        hidden_dims=(8,),
+        model_type="attention",
+        token_player_count=6,
+        token_dim=15,
+        global_dim=4,
+        attention_embed_dim=16,
+        attention_num_heads=4,
+        attention_num_layers=1,
+        attention_token_mlp_dim=12,
+        attention_num_cls_tokens=2,
+    )
+
+    params = init_actor_critic_params(jax, jnp, spec, seed=0)
+
+    assert "attention_qkv" in params
+    assert "attention_out" in params
+    assert "attention_norm" in params
+    assert not any(name.startswith("attention_qkv_") for name in params)
 
 
 def test_attention_intent_selector_head_starts_uniform_and_zero_value():
