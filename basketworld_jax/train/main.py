@@ -2539,6 +2539,88 @@ def _periodic_checkpoint_updates(args) -> set[int]:
     return due_updates
 
 
+def _scheduled_opponent_checkpoint_updates(
+    args,
+    *,
+    historical_updates: tuple[int, ...] | None = None,
+) -> set[int]:
+    """Return checkpoints intentionally published into the self-play pool."""
+    scheduled = _periodic_checkpoint_updates(args)
+    scheduled.update(
+        int(update)
+        for update in (
+            _historical_eval_updates(args)
+            if historical_updates is None
+            else historical_updates
+        )
+    )
+    return scheduled
+
+
+def _filter_restored_opponent_pool_candidates(
+    candidate_infos: list[dict[str, Any]],
+    candidate_params: list[Any],
+    assignments: dict[str, Any],
+    *,
+    scheduled_updates: set[int],
+) -> tuple[list[dict[str, Any]], list[Any], dict[str, np.ndarray], list[int]]:
+    """Drop unscheduled self-checkpoints and remap their pinned assignments."""
+    retained_indices: list[int] = []
+    removed_updates: list[int] = []
+    for index, raw_info in enumerate(candidate_infos):
+        info = dict(raw_info)
+        candidate_kind = str(info.get("candidate_kind", "") or "")
+        explicit_eligibility = info.get("opponent_pool_eligible")
+        if explicit_eligibility is not None:
+            eligible = bool(explicit_eligibility)
+        elif candidate_kind == "self_checkpoint":
+            update_index = int(info.get("update_index", 0) or 0)
+            eligible = update_index in scheduled_updates
+        else:
+            # Explicit frozen/continuation candidates are not created by the
+            # current run's checkpoint schedule and remain valid pool seeds.
+            eligible = True
+        if eligible:
+            retained_indices.append(index)
+        else:
+            removed_updates.append(int(info.get("update_index", 0) or 0))
+
+    old_to_new = np.full((len(candidate_infos),), -1, dtype=np.int32)
+    for new_index, old_index in enumerate(retained_indices):
+        old_to_new[old_index] = int(new_index)
+    if retained_indices:
+        previous_retained = -1
+        first_retained = int(old_to_new[retained_indices[0]])
+        for old_index in range(len(candidate_infos)):
+            if old_to_new[old_index] >= 0:
+                previous_retained = int(old_to_new[old_index])
+            else:
+                # A restored game may still be pinned to a legacy pause
+                # checkpoint. Keep it on the closest earlier scheduled
+                # opponent (or the first scheduled opponent when none is
+                # earlier) until the next real game reset resamples normally.
+                old_to_new[old_index] = (
+                    previous_retained
+                    if previous_retained >= 0
+                    else first_retained
+                )
+
+    remapped_assignments: dict[str, np.ndarray] = {}
+    for role, raw_values in assignments.items():
+        values = np.asarray(raw_values, dtype=np.int32)
+        remapped = np.full_like(values, -1)
+        valid = (values >= 0) & (values < len(candidate_infos))
+        remapped[valid] = old_to_new[values[valid]]
+        remapped_assignments[str(role)] = remapped
+
+    return (
+        [dict(candidate_infos[index]) for index in retained_indices],
+        [candidate_params[index] for index in retained_indices],
+        remapped_assignments,
+        removed_updates,
+    )
+
+
 def _historical_eval_updates(args) -> tuple[int, ...]:
     """Parse the user-configured, explicitly pinned eval milestones."""
     raw = str(getattr(args, "historical_eval_updates", "") or "").strip()
@@ -3507,11 +3589,13 @@ def _load_continuation_opponent_candidates(
     )
     choices = _numbered_mlflow_checkpoint_artifacts(client, run_id)
     boundary_key = _checkpoint_artifact_sort_key(boundary_artifact)
+    scheduled_updates = _scheduled_opponent_checkpoint_updates(args)
     eligible = [
-        path for path in choices if _checkpoint_artifact_sort_key(path) <= boundary_key
+        path
+        for path in choices
+        if _checkpoint_artifact_sort_key(path) <= boundary_key
+        and _checkpoint_artifact_sort_key(path)[1] in scheduled_updates
     ]
-    if not eligible and boundary_artifact in choices:
-        eligible = [boundary_artifact]
     selected = eligible[-seed_count:]
 
     candidates: list[dict[str, Any]] = []
@@ -7317,6 +7401,10 @@ def _print_checkpoint_summary(
 def run_training_loop(args) -> dict[str, Any]:
     validate_train_args(args)
     historical_milestone_updates = _historical_eval_updates(args)
+    scheduled_opponent_checkpoint_updates = _scheduled_opponent_checkpoint_updates(
+        args,
+        historical_updates=historical_milestone_updates,
+    )
     jax, jnp = ensure_jax_available("basketworld_jax/train/main.py")
     final_possession_limit = _multi_possession_final_limit(args)
     initial_possession_limit = _multi_possession_limit_for_update(args, 1)
@@ -7733,6 +7821,28 @@ def run_training_loop(args) -> dict[str, Any]:
                 len(restored_infos),
                 jax=jax,
             )
+            restored_assignments = dict(
+                restored_opponent_pool.get("assignments", {}) or {}
+            )
+            (
+                restored_infos,
+                restored_params,
+                restored_assignments,
+                removed_opponent_updates,
+            ) = _filter_restored_opponent_pool_candidates(
+                restored_infos,
+                restored_params,
+                restored_assignments,
+                scheduled_updates=scheduled_opponent_checkpoint_updates,
+            )
+            if removed_opponent_updates:
+                removed_labels = ", ".join(
+                    str(update) for update in sorted(set(removed_opponent_updates))
+                )
+                print(
+                    "[resume] Removed unscheduled self-play opponent "
+                    f"checkpoint(s): {removed_labels}."
+                )
             opponent_candidates = [
                 {"params": jax.device_put(candidate_params), "info": dict(info)}
                 for candidate_params, info in zip(
@@ -7741,9 +7851,6 @@ def run_training_loop(args) -> dict[str, Any]:
                     strict=True,
                 )
             ]
-            restored_assignments = dict(
-                restored_opponent_pool.get("assignments", {}) or {}
-            )
             restored_modes = dict(
                 restored_opponent_pool.get("deterministic_modes", {}) or {}
             )
@@ -9215,9 +9322,23 @@ def run_training_loop(args) -> dict[str, Any]:
             force_control_checkpoint = control_request is not None
             checkpoint_enabled = bool(checkpoint_dir) or mlflow is not None
             is_historical_milestone = int(update_idx) in historical_milestone_set
+            is_periodic_checkpoint = int(update_idx) in periodic_checkpoint_updates
+            publish_opponent_candidate = (
+                opponent_pool_enabled
+                and int(update_idx) in scheduled_opponent_checkpoint_updates
+            )
+            opponent_pool_checkpoint_reason = (
+                "periodic_and_historical"
+                if is_periodic_checkpoint and is_historical_milestone
+                else (
+                    "historical"
+                    if is_historical_milestone
+                    else "periodic"
+                )
+            )
             should_checkpoint = checkpoint_enabled and (
                 update_idx == int(args.num_updates)
-                or int(update_idx) in periodic_checkpoint_updates
+                or is_periodic_checkpoint
                 or is_historical_milestone
                 or force_control_checkpoint
             )
@@ -9255,7 +9376,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         )
                     }
                 saved_candidate_info = None
-                if opponent_pool_enabled and pinned_opponent_pool_enabled:
+                if publish_opponent_candidate and pinned_opponent_pool_enabled:
                     _add_opponent_candidate(
                         opponent_candidates,
                         params=params,
@@ -9263,6 +9384,10 @@ def run_training_loop(args) -> dict[str, Any]:
                             "source": "self_checkpoint",
                             "update_index": int(update_idx),
                             "candidate_kind": "self_checkpoint",
+                            "opponent_pool_eligible": True,
+                            "opponent_pool_checkpoint_reason": (
+                                opponent_pool_checkpoint_reason
+                            ),
                         },
                     )
                 opponent_pool_checkpoint_state = (
@@ -9399,11 +9524,15 @@ def run_training_loop(args) -> dict[str, Any]:
                             "update_index": int(update_idx),
                         }
                     latest_checkpoint_path = None
-                if opponent_pool_enabled and saved_candidate_info is not None:
+                if publish_opponent_candidate and saved_candidate_info is not None:
                     if pinned_opponent_pool_enabled:
                         opponent_candidates[-1]["info"] = {
                             **saved_candidate_info,
                             "candidate_kind": "self_checkpoint",
+                            "opponent_pool_eligible": True,
+                            "opponent_pool_checkpoint_reason": (
+                                opponent_pool_checkpoint_reason
+                            ),
                         }
                         opponent_params = None
                         grouped_opponent_params = None
@@ -9418,6 +9547,10 @@ def run_training_loop(args) -> dict[str, Any]:
                             info={
                                 **saved_candidate_info,
                                 "candidate_kind": "self_checkpoint",
+                                "opponent_pool_eligible": True,
+                                "opponent_pool_checkpoint_reason": (
+                                    opponent_pool_checkpoint_reason
+                                ),
                             },
                         )
                     if (

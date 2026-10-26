@@ -22,7 +22,9 @@ from basketworld_jax.env.minimal import (
     reset_batch_minimal,
     step_batch_minimal,
 )
+from basketworld_jax.train.control import atomic_write_json
 from basketworld_jax.train.main import (
+    _filter_restored_opponent_pool_candidates,
     parse_args,
     run_training_loop,
     validate_train_args,
@@ -281,6 +283,31 @@ def test_opponent_identity_and_action_mode_change_only_at_real_game_reset():
     np.testing.assert_array_equal(np.asarray(mode), [False, False, False])
 
 
+def test_restored_pool_drops_unscheduled_self_checkpoint_and_remaps_assignments():
+    infos, params, assignments, removed_updates = (
+        _filter_restored_opponent_pool_candidates(
+            [
+                {"candidate_kind": "self_checkpoint", "update_index": 100},
+                {"candidate_kind": "self_checkpoint", "update_index": 1983},
+                {"candidate_kind": "self_checkpoint", "update_index": 2000},
+                {"candidate_kind": "continued_pool", "update_index": 77},
+            ],
+            ["u100", "u1983", "u2000", "continued"],
+            {
+                "offense": np.asarray([0, 1, 2, 3, -1], dtype=np.int32),
+                "defense": np.asarray([1, 2], dtype=np.int32),
+            },
+            scheduled_updates={100, 2000},
+        )
+    )
+
+    assert [info["update_index"] for info in infos] == [100, 2000, 77]
+    assert params == ["u100", "u2000", "continued"]
+    assert removed_updates == [1983]
+    np.testing.assert_array_equal(assignments["offense"], [0, 0, 1, 2, -1])
+    np.testing.assert_array_equal(assignments["defense"], [0, 1])
+
+
 def test_fresh_launcher_keeps_the_agreed_budget_and_has_no_continuation_dependency():
     script = Path("scripts/run_jax_5v5_halfcourt_multi_possession.sh").read_text()
     assert "--enable-multi-possession" in script
@@ -423,3 +450,70 @@ def test_short_fresh_multi_possession_training_continues_and_resumes(
             ),
             [False],
         )
+
+
+def test_unscheduled_pause_checkpoint_resumes_without_joining_opponent_pool(tmp_path):
+    checkpoint_dir = tmp_path / "pause_ckpts"
+    control_file = tmp_path / "control.json"
+    common_args = [
+        "--run-train-loop",
+        "--enable-multi-possession",
+        "--multi-possession-limit",
+        "25",
+        "--kernel-batch-size",
+        "1",
+        "--rollout-horizon",
+        "1",
+        "--policy-update-epochs",
+        "1",
+        "--ppo-minibatches",
+        "1",
+        "--log-every-updates",
+        "1",
+        "--eval-every-updates",
+        "0",
+        "--eval-deploy-every-updates",
+        "0",
+        "--eval-deploy-batches",
+        "0",
+        "--checkpoint-dir",
+        str(checkpoint_dir),
+        "--checkpoint-every-updates",
+        "2",
+        "--control-file",
+        str(control_file),
+        "--num-updates",
+        "2",
+        "--no-progress",
+    ]
+    atomic_write_json(
+        control_file,
+        {"request_id": "pause-at-one", "action": "pause"},
+    )
+
+    paused_result = run_training_loop(parse_args(common_args))
+    assert paused_result["status"] == "paused"
+    assert paused_result["completed_updates"] == 1
+
+    latest = checkpoint_dir / "latest"
+    paused_payload = load_checkpoint(latest)
+    assert paused_payload["update_index"] == 1
+    assert paused_payload["opponent_pool_state"]["candidate_infos"] == []
+
+    resumed_result = run_training_loop(
+        parse_args(
+            [
+                *common_args,
+                "--resume-checkpoint",
+                str(latest),
+            ]
+        )
+    )
+    assert resumed_result["status"] == "train_loop"
+    assert resumed_result["completed_updates"] == 2
+
+    resumed_payload = load_checkpoint(latest)
+    candidate_infos = resumed_payload["opponent_pool_state"]["candidate_infos"]
+    assert [info["update_index"] for info in candidate_infos] == [2]
+    assert candidate_infos[0]["opponent_pool_eligible"] is True
+    assert candidate_infos[0]["opponent_pool_checkpoint_reason"] == "periodic"

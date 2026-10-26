@@ -53,6 +53,7 @@ from basketworld_jax.train.main import (
     _historical_eval_updates,
     _historical_eval_artifact_payload,
     _periodic_checkpoint_updates,
+    _scheduled_opponent_checkpoint_updates,
     _persist_historical_eval_artifact,
     _historical_eval_update_artifact_payload,
     _persist_historical_eval_update_artifact,
@@ -771,6 +772,23 @@ def test_fixed_checkpoint_schedule_preserves_modulo_cadence():
 
     assert _checkpoint_interval_for_update(args, 1) == 3
     assert _periodic_checkpoint_updates(args) == {3, 6, 9}
+
+
+def test_opponent_pool_schedule_excludes_unscheduled_persistence_checkpoints():
+    args = parse_args(
+        [
+            "--num-updates",
+            "10",
+            "--checkpoint-every-updates",
+            "3",
+            "--checkpoint-dir",
+            "artifacts/checkpoints",
+            "--historical-eval-updates",
+            "2,7",
+        ]
+    )
+
+    assert _scheduled_opponent_checkpoint_updates(args) == {2, 3, 6, 7, 9}
 
 
 def test_log_checkpoint_schedule_starts_frequent_and_caps_interval():

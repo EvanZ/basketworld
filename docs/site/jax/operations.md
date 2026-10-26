@@ -185,6 +185,11 @@ A frozen opponent can come from:
 - compatible checkpoints saved during the current run;
 - compatible checkpoints loaded from a continuation run.
 
+Only checkpoints on the configured periodic or historical-evaluation schedule
+are published into the current run's opponent pool. A checkpoint forced by a
+pause or manual checkpoint request is still saved for exact resume, but it does
+not become a training opponent merely because it was persisted.
+
 The pool maintains a bounded recent history. Sampling uses recency-biased
 geometric selection plus an exploration probability.
 
