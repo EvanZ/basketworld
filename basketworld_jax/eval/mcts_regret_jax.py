@@ -407,7 +407,7 @@ class JaxCounterfactualRuntime:
             evaluated_key, opponent_key, environment_key = jax.random.split(key, 3)
             (
                 _,
-                evaluated_mask,
+                _,
                 evaluated_logits,
                 evaluated_deterministic,
             ) = evaluated_policy(state)

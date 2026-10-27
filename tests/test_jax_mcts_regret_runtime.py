@@ -28,7 +28,13 @@ from basketworld_jax.eval.mcts_regret_jax import (
 from basketworld_jax.models import build_actor_critic_spec, init_actor_critic_params
 
 
-def _runtime() -> tuple[JaxCounterfactualRuntime, object]:
+def _runtime(
+    *,
+    evaluated_action_mode: str = "deterministic",
+    opponent_action_mode: str = "deterministic",
+    evaluated_seed: int = 5,
+    opponent_seed: int = 5,
+) -> tuple[JaxCounterfactualRuntime, object]:
     config = JaxEnvironmentConfig(
         grid_size=9,
         court_rows=9,
@@ -58,16 +64,29 @@ def _runtime() -> tuple[JaxCounterfactualRuntime, object]:
         np.asarray(masks),
         (16,),
     )
-    params = init_actor_critic_params(jax, jnp, spec, seed=5)
+    evaluated_params = init_actor_critic_params(
+        jax,
+        jnp,
+        spec,
+        seed=int(evaluated_seed),
+    )
+    opponent_params = init_actor_critic_params(
+        jax,
+        jnp,
+        spec,
+        seed=int(opponent_seed),
+    )
     runtime = JaxCounterfactualRuntime(
         jax=jax,
         jnp=jnp,
         static=static,
         config=config,
-        evaluated_params=params,
+        evaluated_params=evaluated_params,
         evaluated_spec=spec,
-        opponent_params=params,
+        opponent_params=opponent_params,
         opponent_spec=spec,
+        evaluated_action_mode=evaluated_action_mode,  # type: ignore[arg-type]
+        opponent_action_mode=opponent_action_mode,  # type: ignore[arg-type]
         max_rollout_steps=64,
     )
     return runtime, state
@@ -116,6 +135,72 @@ def test_runtime_forced_transition_uses_real_kernel_and_is_seeded() -> None:
     assert first.terminal == second.terminal
     assert runtime.state_key(first.state) == runtime.state_key(second.state)
     assert int(np.asarray(first.state.step_count)[0]) == 1
+
+
+def test_sampled_policy_modes_are_seeded_and_legal() -> None:
+    runtime, state = _runtime(
+        evaluated_action_mode="sampled",
+        opponent_action_mode="sampled",
+        opponent_seed=7,
+    )
+
+    first = runtime.policy_step(state, np.random.default_rng(41))
+    second = runtime.policy_step(state, np.random.default_rng(41))
+    _, evaluated_mask, _, _ = runtime.jax.device_get(
+        runtime._compiled_evaluated_policy(state)
+    )
+    _, opponent_mask, _, _ = runtime.jax.device_get(
+        runtime._compiled_opponent_policy(state)
+    )
+
+    assert first[1:] == second[1:]
+    assert runtime.state_key(first[0]) == runtime.state_key(second[0])
+    assert all(
+        evaluated_mask[0, player_index, action]
+        for player_index, action in enumerate(first[1])
+    )
+    assert all(
+        opponent_mask[0, player_index, action]
+        for player_index, action in enumerate(first[2])
+    )
+
+
+def test_fixed_deterministic_opponent_is_not_changed_by_evaluated_sampling() -> None:
+    runtime, state = _runtime(
+        evaluated_action_mode="sampled",
+        opponent_action_mode="deterministic",
+        evaluated_seed=5,
+        opponent_seed=17,
+    )
+    _, _, _, expected_actions = runtime.jax.device_get(
+        runtime._compiled_opponent_policy(state)
+    )
+    expected = tuple(int(value) for value in np.asarray(expected_actions)[0])
+
+    observed = [
+        runtime.policy_step(state, np.random.default_rng(seed))[2]
+        for seed in (3, 11, 29)
+    ]
+
+    assert observed == [expected, expected, expected]
+
+
+def test_runtime_treats_environment_truncation_as_terminal() -> None:
+    runtime, state = _runtime()
+    action = runtime.policy_decision(state).deterministic_action
+    runtime._compiled_forced_step = lambda *_args: SimpleNamespace(
+        state=state,
+        possession_ended=jnp.asarray([False]),
+        done=jnp.asarray([False]),
+        truncated=jnp.asarray([True]),
+        team_a_score_delta=jnp.asarray([1.0]),
+        team_b_score_delta=jnp.asarray([3.0]),
+    )
+
+    transition = runtime.transition(state, action, np.random.default_rng(13))
+
+    assert transition.terminal is True
+    assert transition.reward == pytest.approx(-2.0)
 
 
 def test_runtime_rejects_wrong_joint_action_width() -> None:
@@ -230,3 +315,32 @@ def test_compiled_batch_sampler_returns_one_replayable_state_per_episode() -> No
     assert {sample.episode_index for sample in samples} == {0, 1}
     assert all(sample.eligible_decision_count >= 1 for sample in samples)
     assert all(sample.state_id == runtime.state_key(sample.state) for sample in samples)
+
+
+def test_compiled_batch_sampling_is_reproducible_from_seed() -> None:
+    runtime, _ = _runtime(
+        evaluated_action_mode="sampled",
+        opponent_action_mode="sampled",
+        opponent_seed=7,
+    )
+
+    first_samples, first_summary = sample_policy_decisions(
+        runtime,
+        episode_count=2,
+        seed=401,
+        max_episode_steps=64,
+    )
+    second_samples, second_summary = sample_policy_decisions(
+        runtime,
+        episode_count=2,
+        seed=401,
+        max_episode_steps=64,
+    )
+
+    assert first_summary == second_summary
+    assert [sample.metadata() for sample in first_samples] == [
+        sample.metadata() for sample in second_samples
+    ]
+    assert [sample.state_id for sample in first_samples] == [
+        runtime.state_key(sample.state) for sample in second_samples
+    ]
