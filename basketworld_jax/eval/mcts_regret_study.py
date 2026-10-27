@@ -242,6 +242,7 @@ def analyze_sample_root_actions(
     paired_rollout_count: int,
     bootstrap_samples: int = 2000,
     include_full_possession: bool = False,
+    paired_return_cache: dict[tuple[int, ...], tuple[float, ...]] | None = None,
 ) -> dict[str, Any]:
     """Run each requested depth and compare its action with the policy action."""
 
@@ -275,6 +276,7 @@ def analyze_sample_root_actions(
     paired_seeds = _seed_tuple(depth_sequences[-2], int(paired_rollout_count))
     planning_seed = int(depth_sequences[-1].generate_state(1, dtype=np.uint32)[0])
     depth_results: dict[str, Any] = {}
+    return_cache = paired_return_cache if paired_return_cache is not None else {}
     for depth, depth_sequence in zip(
         protocol.search_depths,
         search_sequences,
@@ -304,6 +306,13 @@ def analyze_sample_root_actions(
             discount=float(protocol.discount),
             bootstrap_seed=search_seed,
             bootstrap_samples=int(bootstrap_samples),
+            precomputed_policy_returns=return_cache.get(policy_action),
+            precomputed_planner_returns=return_cache.get(tuple(search.selected_action)),
+        )
+        return_cache.setdefault(policy_action, tuple(comparison.policy_returns))
+        return_cache.setdefault(
+            tuple(search.selected_action),
+            tuple(comparison.planner_returns),
         )
         planner_probability = joint_action_probability(
             search.selected_action,
@@ -678,15 +687,19 @@ def run_budget_calibration_study(
     )
     records_by_budget: dict[int, list[dict[str, Any]]] = {}
     budget_payloads: dict[str, Any] = {}
+    paired_return_caches: list[dict[tuple[int, ...], tuple[float, ...]]] = [
+        {} for _sample in samples
+    ]
     for budget_index, budget in enumerate(settings.calibration_budgets, start=1):
         budget_protocol = replace(
             settings,
+            search_depths=(int(settings.primary_search_depth),),
             simulations_per_action=int(budget),
         )
         sample_sequences = np.random.SeedSequence(int(seed)).spawn(len(samples))
         records: list[dict[str, Any]] = []
-        for sample_index, (sample, sequence) in enumerate(
-            zip(samples, sample_sequences, strict=True),
+        for sample_index, (sample, sequence, return_cache) in enumerate(
+            zip(samples, sample_sequences, paired_return_caches, strict=True),
             start=1,
         ):
             sample_seed = int(sequence.generate_state(1, dtype=np.uint32)[0])
@@ -699,6 +712,7 @@ def run_budget_calibration_study(
                     paired_rollout_count=int(paired_rollout_count),
                     bootstrap_samples=int(bootstrap_samples),
                     include_full_possession=False,
+                    paired_return_cache=return_cache,
                 )
             )
             if progress_callback is not None:

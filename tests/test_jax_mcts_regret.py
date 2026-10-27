@@ -250,6 +250,42 @@ def test_policy_and_planner_actions_use_common_random_numbers() -> None:
     assert comparison.regret_ci95_high == pytest.approx(1.0)
 
 
+def test_paired_comparison_reuses_precomputed_action_returns() -> None:
+    comparison = compare_actions_with_paired_rollouts(
+        "root",
+        policy_action=(0,),
+        planner_action=(1,),
+        transition=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("precomputed returns should avoid transitions")
+        ),
+        rollout_value=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("precomputed returns should avoid rollouts")
+        ),
+        rollout_seeds=(3, 5, 7),
+        precomputed_policy_returns=(0.0, 1.0, 2.0),
+        precomputed_planner_returns=(1.0, 2.0, 3.0),
+        bootstrap_samples=50,
+    )
+
+    assert comparison.policy_returns == (0.0, 1.0, 2.0)
+    assert comparison.planner_returns == (1.0, 2.0, 3.0)
+    assert comparison.regret_samples == (1.0, 1.0, 1.0)
+
+
+def test_paired_comparison_rejects_misaligned_precomputed_returns() -> None:
+    with pytest.raises(ValueError, match="must align with rollout_seeds"):
+        compare_actions_with_paired_rollouts(
+            "root",
+            policy_action=(0,),
+            planner_action=(1,),
+            transition=lambda *_args: MctsTransition("done", 0.0, True),
+            rollout_value=lambda *_args: 0.0,
+            rollout_seeds=(3, 5),
+            precomputed_policy_returns=(0.0,),
+            bootstrap_samples=10,
+        )
+
+
 def test_receding_horizon_planner_selects_each_action_until_possession_end() -> None:
     selected_states = []
 

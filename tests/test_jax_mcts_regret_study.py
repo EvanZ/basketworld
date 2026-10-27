@@ -136,6 +136,48 @@ def test_root_analysis_reports_paired_regret_for_each_depth() -> None:
         assert len(row["paired_comparison"]["regret_samples"]) == 16
 
 
+def test_root_analysis_can_share_paired_returns_across_repeated_searches() -> None:
+    class CountingRuntime(_BanditRuntime):
+        def __init__(self):
+            self.transition_count = 0
+
+        def transition(self, state, action, rng):
+            self.transition_count += 1
+            return super().transition(state, action, rng)
+
+    runtime = CountingRuntime()
+    protocol = MctsRegretConfig(
+        search_depths=(1,),
+        primary_search_depth=1,
+        simulations_per_action=4,
+        max_joint_actions_per_node=2,
+    )
+    return_cache: dict[tuple[int, ...], tuple[float, ...]] = {}
+
+    analyze_sample_root_actions(
+        runtime,  # type: ignore[arg-type]
+        _sample("state-a"),
+        protocol=protocol,
+        seed=17,
+        paired_rollout_count=8,
+        bootstrap_samples=20,
+        paired_return_cache=return_cache,
+    )
+    first_count = runtime.transition_count
+    analyze_sample_root_actions(
+        runtime,  # type: ignore[arg-type]
+        _sample("state-a"),
+        protocol=protocol,
+        seed=17,
+        paired_rollout_count=8,
+        bootstrap_samples=20,
+        paired_return_cache=return_cache,
+    )
+
+    assert set(return_cache) == {(0,)}
+    assert runtime.transition_count - first_count == protocol.simulations_per_action
+
+
 def test_root_summary_splits_roles_and_compares_primary_with_depth_one() -> None:
     protocol = MctsRegretConfig(
         search_depths=(1, 3),

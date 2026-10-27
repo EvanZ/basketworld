@@ -582,34 +582,58 @@ def compare_actions_with_paired_rollouts(
     discount: float = 1.0,
     bootstrap_seed: int = 0,
     bootstrap_samples: int = 2000,
+    precomputed_policy_returns: Sequence[float] | None = None,
+    precomputed_planner_returns: Sequence[float] | None = None,
 ) -> PairedActionComparison:
     """Compare root actions using the same chance stream for every seed."""
 
     seeds = tuple(int(seed) for seed in rollout_seeds)
     if not seeds:
         raise ValueError("rollout_seeds must contain at least one seed.")
-    policy_returns = tuple(
-        evaluate_action_return(
-            state,
-            policy_action,
-            transition=transition,
-            rollout_value=rollout_value,
-            seed=seed,
-            discount=discount,
-        )
-        for seed in seeds
+
+    def resolve_returns(
+        action: JointAction,
+        precomputed: Sequence[float] | None,
+        *,
+        label: str,
+    ) -> tuple[float, ...]:
+        if precomputed is None:
+            return tuple(
+                evaluate_action_return(
+                    state,
+                    action,
+                    transition=transition,
+                    rollout_value=rollout_value,
+                    seed=seed,
+                    discount=discount,
+                )
+                for seed in seeds
+            )
+        values = tuple(float(value) for value in precomputed)
+        if len(values) != len(seeds):
+            raise ValueError(
+                f"{label} must align with rollout_seeds "
+                f"({len(values)} != {len(seeds)})."
+            )
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError(f"{label} must contain only finite values.")
+        return values
+
+    policy_returns = resolve_returns(
+        policy_action,
+        precomputed_policy_returns,
+        label="precomputed_policy_returns",
     )
-    planner_returns = tuple(
-        evaluate_action_return(
-            state,
+    if precomputed_planner_returns is None and tuple(
+        int(value) for value in planner_action
+    ) == tuple(int(value) for value in policy_action):
+        planner_returns = policy_returns
+    else:
+        planner_returns = resolve_returns(
             planner_action,
-            transition=transition,
-            rollout_value=rollout_value,
-            seed=seed,
-            discount=discount,
+            precomputed_planner_returns,
+            label="precomputed_planner_returns",
         )
-        for seed in seeds
-    )
     regrets = tuple(
         float(planner) - float(policy)
         for policy, planner in zip(policy_returns, planner_returns, strict=True)

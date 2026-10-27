@@ -80,6 +80,11 @@ stability and paired regret deltas. The evaluator records the evidence but does
 not impose an arbitrary automatic stability threshold. Retain the
 512-simulation main-study budget only after inspecting that comparison.
 
+Calibration searches only the primary depth (depth 5 by default), because the
+budget decision is based on the primary planner. It also reuses identical
+paired policy/action returns across budgets for each state. The main study
+still reports depths 1, 3, and 5 separately.
+
 `--print-calibration-command` remains available when separate scheduler jobs
 are preferable. Those printed commands explicitly use root-only mode. Both
 calibration paths isolate search-budget stability without multiplying the sweep
