@@ -6,14 +6,17 @@ policy's action. Both checkpoint paths are explicit. The evaluated checkpoint
 controls stable Team A and the opponent checkpoint controls stable Team B;
 their offense and defense roles change normally between possessions.
 
-The first implementation mode is **root-only**:
+The evaluator reports the **root-only** comparison and, by default, the
+**full-possession** comparison:
 
 1. Run independently seeded policy episodes.
 2. Uniformly reservoir-sample one eligible live decision per episode.
 3. Run depth-1, depth-3, and depth-5 MCTS from the exact saved state.
 4. Force either the policy action or planner action at the root, then return
    both teams to their fixed policies through possession end.
-5. Estimate regret with matched rollout seeds so policy/planner differences do
+5. For full-possession mode, keep the selected root action and run a fresh
+   primary-depth search at each subsequent meaningful evaluated-team decision.
+6. Estimate gains with matched rollout seeds so policy/planner differences do
    not include avoidable independent-rollout noise.
 
 The learned value head is not used as the return target. Search transitions and
@@ -33,28 +36,34 @@ From the repository root:
   --seed 1
 ```
 
-Defaults follow Issue #76: depths 1/3/5, depth 5 primary, and 512 MCTS
-simulations per action selection. Use `--evaluated-action-mode sampled` and/or
-`--opponent-action-mode sampled` for a separately labeled stochastic-policy
-study. Do not mix deterministic and sampled results into one headline number.
+Defaults follow Issue #76: depths 1/3/5, depth 5 primary, 512 MCTS simulations
+per action selection, and root plus full-possession planning. Pass
+`--planning-mode root-only` to omit receding-horizon evaluation. Use
+`--evaluated-action-mode sampled` and/or `--opponent-action-mode sampled` for a
+separately labeled stochastic-policy study. Do not mix deterministic and
+sampled results into one headline number.
 
 An output directory must not already exist. Each study writes:
 
 - `sampled_states.npz`: lossless `KernelState` arrays for exact replay;
 - `sampled_states.json`: state context, all sampling seeds, exclusion counts,
   checkpoint/environment settings, and source provenance;
-- `root_action_comparison.json`: per-depth search diagnostics, paired returns,
-  regret, offense/defense splits, uncertainty, and aggregate runtime.
+- `policy_regret_study.json`: per-depth root search diagnostics, full-possession
+  replanning traces, paired returns and gains, offense/defense splits,
+  uncertainty, and aggregate runtime. Root-only runs instead write
+  `root_action_comparison.json`.
 
 The sampler excludes terminal states, non-live setup/inbound phases, and joint
-decisions where every controlled player is forced to one action. It alternates
-the opening stable team across episodes and reports the observed offense and
-defense sample counts separately.
+decisions where every controlled player is forced to one action. It compiles
+the episode batch as one JAX scan, performs uniform reservoir replacement on
+device, and retains only one full state per episode. It alternates the opening
+stable team across episodes and reports the observed offense and defense sample
+counts separately. Checkpoint restore and the first JAX compile can take time;
+the command prints those phases explicitly.
 
 ## Calibrate the search budget first
 
-Print the agreed commands for the same 50 episode seeds at 64, 128, 256, 512,
-and 1,024 simulations:
+Run the agreed budgets over one persisted set of 50 sampled states:
 
 ```bash
 .env/bin/python analytics/jax_mcts_policy_regret.py \
@@ -62,16 +71,21 @@ and 1,024 simulations:
   --opponent-checkpoint /path/to/opponent/checkpoint \
   --output-dir results/mcts-regret/calibration-name \
   --seed 1 \
-  --print-calibration-command
+  --calibration
 ```
 
-Retain the 512-simulation main-study budget only after comparing its selected
-actions and regret estimates with the 1,024-simulation artifacts.
+This writes `budget_calibration.json`, including per-budget records, adjacent
+budget comparisons, and a focused 512-versus-1,024 summary of selected-action
+stability and paired regret deltas. The evaluator records the evidence but does
+not impose an arbitrary automatic stability threshold. Retain the
+512-simulation main-study budget only after inspecting that comparison.
+
+`--print-calibration-command` remains available when separate scheduler jobs
+are preferable. Those printed commands explicitly use root-only mode. Both
+calibration paths isolate search-budget stability without multiplying the sweep
+by every subsequent possession decision.
 
 ## Current boundary
 
-The command currently implements the root-only comparison. Full-possession
-receding-horizon control, in which depth-5 MCTS replans at every evaluated-team
-decision, is the next Issue #76 implementation slice. Checkpoints with an
-enabled learned intent selector are rejected rather than simulated with
-incorrect selector state; no-intent checkpoints are supported.
+Checkpoints with an enabled learned intent selector are rejected rather than
+simulated with incorrect selector state; no-intent checkpoints are supported.

@@ -11,6 +11,7 @@ the search can be tested without restoring a model.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import heapq
 import math
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -24,6 +25,47 @@ DEFAULT_SIMULATIONS_PER_ACTION = 512
 DEFAULT_CALIBRATION_BUDGETS = (64, 128, 256, 512, 1024)
 
 JointAction = tuple[int, ...]
+
+
+def action_semantics(action: int) -> tuple[str, int | None]:
+    value = int(action)
+    if value == 0:
+        return "noop", None
+    if 1 <= value <= 6:
+        return "move", value - 1
+    if value == 7:
+        return "shoot", None
+    if 8 <= value <= 13:
+        return "pass", value - 8
+    return "unknown", value
+
+
+def joint_action_agreement_payload(
+    policy_action: Sequence[int], planner_action: Sequence[int]
+) -> dict[str, Any]:
+    policy = tuple(int(value) for value in policy_action)
+    planner = tuple(int(value) for value in planner_action)
+    if len(policy) != len(planner):
+        raise ValueError("Joint actions must have equal controlled-player widths.")
+    player_exact = [left == right for left, right in zip(policy, planner, strict=True)]
+    family_agreement: list[bool] = []
+    pass_target_agreement: list[bool | None] = []
+    for left, right in zip(policy, planner, strict=True):
+        left_family, left_target = action_semantics(left)
+        right_family, right_target = action_semantics(right)
+        family_agreement.append(left_family == right_family)
+        if left_family == "pass" or right_family == "pass":
+            pass_target_agreement.append(
+                left_family == right_family and left_target == right_target
+            )
+        else:
+            pass_target_agreement.append(None)
+    return {
+        "exact_action_agreement": bool(all(player_exact)),
+        "player_action_agreement": player_exact,
+        "player_action_family_agreement": family_agreement,
+        "player_pass_target_agreement": pass_target_agreement,
+    }
 
 
 @dataclass(frozen=True)
@@ -144,6 +186,14 @@ class PairedActionComparison:
     regret_ci95_high: float
 
 
+@dataclass(frozen=True)
+class RecedingHorizonRollout:
+    value: float
+    decision_count: int
+    actions: tuple[JointAction, ...]
+    terminated: bool
+
+
 StateKeyFn = Callable[[Any], Any]
 ProposalFn = Callable[
     [Any, np.random.Generator, int, frozenset[JointAction]],
@@ -151,6 +201,7 @@ ProposalFn = Callable[
 ]
 TransitionFn = Callable[[Any, JointAction, np.random.Generator], MctsTransition]
 RolloutFn = Callable[[Any, np.random.Generator], float]
+PlannerActionFn = Callable[[Any, int], JointAction]
 
 
 def _validated_policy_rows(
@@ -259,6 +310,73 @@ def sample_factorized_joint_actions(
         )
         _append(action)
     return tuple(proposals)
+
+
+def top_factorized_joint_actions(
+    probabilities: np.ndarray,
+    legal_mask: np.ndarray,
+    *,
+    count: int,
+) -> tuple[JointActionProposal, ...]:
+    """Return exact top-k joint actions without enumerating the full product."""
+
+    requested = int(count)
+    if requested < 1:
+        raise ValueError("count must be positive.")
+    normalized = _validated_policy_rows(probabilities, legal_mask)
+    ranked_rows: list[list[tuple[int, float]]] = []
+    for player_index in range(normalized.shape[0]):
+        row = [
+            (int(action), float(normalized[player_index, action]))
+            for action in range(normalized.shape[1])
+            if float(normalized[player_index, action]) > 0.0
+        ]
+        row.sort(key=lambda item: (-item[1], item[0]))
+        ranked_rows.append(row)
+
+    initial_indices = tuple(0 for _ in ranked_rows)
+
+    def proposal_for(indices: tuple[int, ...]) -> JointActionProposal:
+        action = tuple(
+            ranked_rows[player_index][rank_index][0]
+            for player_index, rank_index in enumerate(indices)
+        )
+        prior = math.prod(
+            ranked_rows[player_index][rank_index][1]
+            for player_index, rank_index in enumerate(indices)
+        )
+        return JointActionProposal(action=action, prior=float(prior))
+
+    initial = proposal_for(initial_indices)
+    heap: list[tuple[float, JointAction, tuple[int, ...]]] = [
+        (-float(initial.prior), initial.action, initial_indices)
+    ]
+    seen = {initial_indices}
+    result: list[JointActionProposal] = []
+    while heap and len(result) < requested:
+        _negative_prior, _action, indices = heapq.heappop(heap)
+        proposal = proposal_for(indices)
+        result.append(proposal)
+        for player_index in range(len(indices)):
+            next_rank = indices[player_index] + 1
+            if next_rank >= len(ranked_rows[player_index]):
+                continue
+            neighbor = list(indices)
+            neighbor[player_index] = next_rank
+            neighbor_indices = tuple(neighbor)
+            if neighbor_indices in seen:
+                continue
+            seen.add(neighbor_indices)
+            neighbor_proposal = proposal_for(neighbor_indices)
+            heapq.heappush(
+                heap,
+                (
+                    -float(neighbor_proposal.prior),
+                    neighbor_proposal.action,
+                    neighbor_indices,
+                ),
+            )
+    return tuple(result)
 
 
 def _progressive_widening_limit(config: MctsRegretConfig, visits: int) -> int:
@@ -513,6 +631,55 @@ def compare_actions_with_paired_rollouts(
         regret_mean=float(np.mean(regrets)),
         regret_ci95_low=float(low),
         regret_ci95_high=float(high),
+    )
+
+
+def evaluate_receding_horizon_return(
+    state: Any,
+    *,
+    select_action: PlannerActionFn,
+    transition: TransitionFn,
+    seed: int,
+    max_steps: int,
+    discount: float = 1.0,
+) -> RecedingHorizonRollout:
+    """Replan the controlled side at every step until possession termination."""
+
+    if int(max_steps) < 1:
+        raise ValueError("max_steps must be positive.")
+    if not 0.0 <= float(discount) <= 1.0:
+        raise ValueError("discount must be in [0, 1].")
+    rng = np.random.default_rng(int(seed))
+    rollout_state = state
+    total = 0.0
+    actions: list[JointAction] = []
+    discount_power = 1.0
+    for decision_index in range(int(max_steps)):
+        action = tuple(
+            int(value) for value in select_action(rollout_state, decision_index)
+        )
+        if not action:
+            raise ValueError("Planner returned an empty joint action.")
+        outcome = transition(rollout_state, action, rng)
+        reward = float(outcome.reward)
+        if not math.isfinite(reward):
+            raise ValueError("Transition returned a non-finite reward.")
+        actions.append(action)
+        total += discount_power * reward
+        if bool(outcome.terminal):
+            return RecedingHorizonRollout(
+                value=float(total),
+                decision_count=len(actions),
+                actions=tuple(actions),
+                terminated=True,
+            )
+        rollout_state = outcome.state
+        discount_power *= float(discount)
+    return RecedingHorizonRollout(
+        value=float(total),
+        decision_count=len(actions),
+        actions=tuple(actions),
+        terminated=False,
     )
 
 

@@ -23,8 +23,12 @@ def test_cli_defaults_match_issue_76_protocol(tmp_path) -> None:
     assert args.search_depths == [1, 3, 5]
     assert args.primary_search_depth == 5
     assert args.simulations_per_action == 512
+    assert args.planning_mode == "root-and-full-possession"
     assert args.evaluated_action_mode == "deterministic"
     assert args.opponent_action_mode == "deterministic"
+    assert args.calibration is False
+    assert args.calibration_states == 50
+    assert args.calibration_budgets == [64, 128, 256, 512, 1024]
 
 
 def test_cli_calibration_commands_reuse_same_seed_and_50_states(
@@ -38,6 +42,7 @@ def test_cli_calibration_commands_reuse_same_seed_and_50_states(
     assert result == 0
     assert len(lines) == 5
     assert all("--episodes 50 --seed 19" in line for line in lines)
+    assert all("--planning-mode root-only" in line for line in lines)
     assert [
         int(line.split("--simulations-per-action ", 1)[1].split()[0]) for line in lines
     ] == [64, 128, 256, 512, 1024]
@@ -92,5 +97,59 @@ def test_cli_wires_explicit_checkpoints_and_protocol(monkeypatch, tmp_path) -> N
     assert passed_runtime is runtime
     assert run_kwargs["episode_count"] == 12
     assert run_kwargs["paired_rollout_count"] == 20
+    assert run_kwargs["include_full_possession"] is True
     assert run_kwargs["protocol"].search_depths == (1, 3)
     assert run_kwargs["protocol"].simulations_per_action == 64
+
+
+def test_cli_runs_calibration_as_one_shared_state_study(monkeypatch, tmp_path) -> None:
+    observed = {}
+    runtime = SimpleNamespace()
+
+    monkeypatch.setattr(
+        cli,
+        "load_jax_counterfactual_runtime",
+        lambda **kwargs: runtime,
+    )
+
+    def fake_calibration(passed_runtime, **kwargs):
+        observed["call"] = (passed_runtime, kwargs)
+        return {
+            "results": str(tmp_path / "calibration" / "budget_calibration.json"),
+            "convergence": {
+                "main_budget_evidence": {
+                    "lower_budget": 512,
+                    "upper_budget": 1024,
+                    "selected_action_stability_rate": 0.95,
+                    "regret_delta": {"mean_absolute": 0.02},
+                }
+            },
+        }
+
+    monkeypatch.setattr(cli, "run_budget_calibration_study", fake_calibration)
+    monkeypatch.setattr(
+        cli,
+        "run_root_only_study",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("root study should not run")
+        ),
+    )
+
+    result = cli.main(
+        _required_args(tmp_path)
+        + [
+            "--calibration",
+            "--calibration-states",
+            "12",
+            "--calibration-budgets",
+            "64",
+            "512",
+            "1024",
+        ]
+    )
+
+    assert result == 0
+    passed_runtime, kwargs = observed["call"]
+    assert passed_runtime is runtime
+    assert kwargs["episode_count"] == 12
+    assert kwargs["protocol"].calibration_budgets == (64, 512, 1024)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -21,6 +23,7 @@ from basketworld_jax.eval.mcts_regret_jax import (
     meaningful_joint_choice,
     persist_sampled_decisions,
     sample_episode_decision,
+    sample_policy_decisions,
 )
 from basketworld_jax.models import build_actor_critic_spec, init_actor_critic_params
 
@@ -122,6 +125,23 @@ def test_runtime_rejects_wrong_joint_action_width() -> None:
         runtime.transition(state, (0,), np.random.default_rng(1))
 
 
+def test_runtime_value_is_always_oriented_to_evaluated_stable_team_a() -> None:
+    runtime, _ = _runtime()
+
+    assert runtime._score_margin_delta(
+        SimpleNamespace(
+            team_a_score_delta=jnp.asarray([2.0]),
+            team_b_score_delta=jnp.asarray([0.0]),
+        )
+    ) == pytest.approx(2.0)
+    assert runtime._score_margin_delta(
+        SimpleNamespace(
+            team_a_score_delta=jnp.asarray([0.0]),
+            team_b_score_delta=jnp.asarray([3.0]),
+        )
+    ) == pytest.approx(-3.0)
+
+
 def test_runtime_reset_is_reproducible() -> None:
     runtime, _ = _runtime()
 
@@ -190,3 +210,23 @@ def test_sample_artifacts_refuse_to_overwrite_existing_study(tmp_path) -> None:
             sampling_summary={},
             jax=jax,
         )
+
+
+def test_compiled_batch_sampler_returns_one_replayable_state_per_episode() -> None:
+    runtime, _ = _runtime()
+
+    samples, summary = sample_policy_decisions(
+        runtime,
+        episode_count=2,
+        seed=301,
+        max_episode_steps=64,
+    )
+
+    assert summary["episode_count"] == 2
+    assert summary["completed_episode_count"] == 2
+    assert summary["sample_count"] == 2
+    assert summary["selection_method"].startswith("compiled-")
+    assert len(samples) == 2
+    assert {sample.episode_index for sample in samples} == {0, 1}
+    assert all(sample.eligible_decision_count >= 1 for sample in samples)
+    assert all(sample.state_id == runtime.state_key(sample.state) for sample in samples)

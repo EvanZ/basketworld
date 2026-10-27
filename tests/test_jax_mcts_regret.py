@@ -14,11 +14,14 @@ from basketworld_jax.eval.mcts_regret import (
     RegretRecord,
     calibration_protocol_payload,
     compare_actions_with_paired_rollouts,
+    evaluate_receding_horizon_return,
     joint_action_probability,
+    joint_action_agreement_payload,
     run_joint_action_mcts,
     sample_factorized_joint_actions,
     search_result_payload,
     summarize_regret_records,
+    top_factorized_joint_actions,
 )
 
 
@@ -85,6 +88,28 @@ def test_joint_action_sampling_respects_every_player_mask_and_deduplicates() -> 
         excluded={(1, 0)},
     )
     assert all(proposal.action != (1, 0) for proposal in excluded)
+
+
+def test_joint_action_agreement_separates_family_and_pass_target() -> None:
+    payload = joint_action_agreement_payload(
+        (1, 8, 7, 0),
+        (2, 9, 7, 0),
+    )
+
+    assert payload["exact_action_agreement"] is False
+    assert payload["player_action_agreement"] == [False, False, True, True]
+    assert payload["player_action_family_agreement"] == [True, True, True, True]
+    assert payload["player_pass_target_agreement"] == [None, False, None, None]
+
+
+def test_exact_top_joint_actions_do_not_enumerate_irrelevant_masked_actions() -> None:
+    probabilities = np.asarray([[0.6, 0.4, 10.0], [0.7, 0.3, 10.0]])
+    legal_mask = np.asarray([[True, True, False], [True, True, False]])
+
+    top = top_factorized_joint_actions(probabilities, legal_mask, count=4)
+
+    assert [item.action for item in top] == [(0, 0), (1, 0), (0, 1), (1, 1)]
+    assert [item.prior for item in top] == pytest.approx([0.42, 0.28, 0.18, 0.12])
 
 
 def _fixed_proposals(actions: tuple[int, ...]):
@@ -223,6 +248,54 @@ def test_policy_and_planner_actions_use_common_random_numbers() -> None:
     assert comparison.regret_mean == pytest.approx(1.0)
     assert comparison.regret_ci95_low == pytest.approx(1.0)
     assert comparison.regret_ci95_high == pytest.approx(1.0)
+
+
+def test_receding_horizon_planner_selects_each_action_until_possession_end() -> None:
+    selected_states = []
+
+    def select_action(state, decision_index):
+        selected_states.append((state, decision_index))
+        return (1,)
+
+    def transition(state, action, rng):
+        next_state = state + 1
+        return MctsTransition(
+            state=next_state,
+            reward=float(action[0]),
+            terminal=next_state == 3,
+        )
+
+    result = evaluate_receding_horizon_return(
+        0,
+        select_action=select_action,
+        transition=transition,
+        seed=5,
+        max_steps=10,
+        discount=0.5,
+    )
+
+    assert result.terminated
+    assert result.decision_count == 3
+    assert result.actions == ((1,), (1,), (1,))
+    assert result.value == pytest.approx(1.0 + 0.5 + 0.25)
+    assert selected_states == [(0, 0), (1, 1), (2, 2)]
+
+
+def test_receding_horizon_reports_step_limit_without_inventing_termination() -> None:
+    result = evaluate_receding_horizon_return(
+        "state",
+        select_action=lambda state, index: (0,),
+        transition=lambda state, action, rng: MctsTransition(
+            state=state,
+            reward=0.0,
+            terminal=False,
+        ),
+        seed=7,
+        max_steps=2,
+    )
+
+    assert not result.terminated
+    assert result.decision_count == 2
 
 
 def test_regret_summary_reports_action_agreement_and_paired_uncertainty() -> None:

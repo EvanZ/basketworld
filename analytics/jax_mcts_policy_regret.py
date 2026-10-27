@@ -23,7 +23,10 @@ from basketworld_jax.eval.mcts_regret import (  # noqa: E402
 from basketworld_jax.eval.mcts_regret_jax import (  # noqa: E402
     load_jax_counterfactual_runtime,
 )
-from basketworld_jax.eval.mcts_regret_study import run_root_only_study  # noqa: E402
+from basketworld_jax.eval.mcts_regret_study import (  # noqa: E402
+    run_budget_calibration_study,
+    run_root_only_study,
+)
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -42,6 +45,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--episodes", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument(
+        "--planning-mode",
+        choices=("root-only", "root-and-full-possession"),
+        default="root-and-full-possession",
+        help=(
+            "Whether to stop after root-action comparison or also replan with "
+            "primary-depth MCTS through possession end."
+        ),
+    )
     parser.add_argument(
         "--evaluated-action-mode",
         choices=("deterministic", "sampled"),
@@ -84,6 +96,18 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-episode-steps", type=int, default=10_000)
     parser.add_argument("--bootstrap-samples", type=int, default=2000)
     parser.add_argument(
+        "--calibration",
+        action="store_true",
+        help="Run one shared-state search-budget convergence study.",
+    )
+    parser.add_argument("--calibration-states", type=int, default=50)
+    parser.add_argument(
+        "--calibration-budgets",
+        type=int,
+        nargs="+",
+        default=list(DEFAULT_CALIBRATION_BUDGETS),
+    )
+    parser.add_argument(
         "--environment-overrides-json",
         default="",
         help=(
@@ -120,6 +144,7 @@ def _print_calibration_commands(args: argparse.Namespace) -> None:
         f"--episodes 50 --seed {args.seed} "
         f"--evaluated-action-mode {args.evaluated_action_mode} "
         f"--opponent-action-mode {args.opponent_action_mode} "
+        "--planning-mode root-only "
     )
     for budget in DEFAULT_CALIBRATION_BUDGETS:
         destination = Path(args.output_dir) / f"budget-{budget}"
@@ -135,6 +160,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         search_depths=tuple(int(value) for value in args.search_depths),
         primary_search_depth=int(args.primary_search_depth),
         simulations_per_action=int(args.simulations_per_action),
+        calibration_budgets=tuple(int(value) for value in args.calibration_budgets),
         exploration_c=float(args.exploration_c),
         progressive_widening_c=float(args.progressive_widening_c),
         progressive_widening_alpha=float(args.progressive_widening_alpha),
@@ -150,11 +176,55 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.environment_overrides_json
         ),
         max_rollout_steps=int(args.max_rollout_steps),
+        progress_callback=lambda phase: print(phase, flush=True),
     )
 
     def report_progress(completed: int, total: int) -> None:
         print(f"Analyzed {completed}/{total} sampled states.", flush=True)
 
+    if args.calibration:
+
+        def report_calibration_progress(
+            budget_index: int,
+            budget_count: int,
+            completed: int,
+            total: int,
+        ) -> None:
+            print(
+                f"Budget {budget_index}/{budget_count}: analyzed "
+                f"{completed}/{total} states.",
+                flush=True,
+            )
+
+        print(
+            "Sampling episodes (the first run compiles the JAX collector).",
+            flush=True,
+        )
+        result = run_budget_calibration_study(
+            runtime,
+            output_dir=Path(args.output_dir).expanduser(),
+            episode_count=int(args.calibration_states),
+            seed=int(args.seed),
+            protocol=protocol,
+            paired_rollout_count=int(args.paired_rollouts),
+            max_episode_steps=int(args.max_episode_steps),
+            bootstrap_samples=int(args.bootstrap_samples),
+            progress_callback=report_calibration_progress,
+        )
+        evidence = result["convergence"]["main_budget_evidence"]
+        print(f"Results: {Path(result['results']).resolve()}")
+        print(
+            f"{evidence['lower_budget']}→{evidence['upper_budget']} action "
+            f"stability: {evidence['selected_action_stability_rate']:.1%}; "
+            "mean absolute regret delta: "
+            f"{evidence['regret_delta']['mean_absolute']:.4f}."
+        )
+        return 0
+
+    print(
+        "Sampling episodes (the first run compiles the JAX collector).",
+        flush=True,
+    )
     result = run_root_only_study(
         runtime,
         output_dir=Path(args.output_dir).expanduser(),
@@ -164,6 +234,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         paired_rollout_count=int(args.paired_rollouts),
         max_episode_steps=int(args.max_episode_steps),
         bootstrap_samples=int(args.bootstrap_samples),
+        include_full_possession=(args.planning_mode == "root-and-full-possession"),
         progress_callback=report_progress,
     )
     aggregate = result["aggregate"]
