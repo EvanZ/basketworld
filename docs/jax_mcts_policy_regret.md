@@ -49,8 +49,10 @@ An output directory must not already exist. Each study writes:
 - `sampled_states.json`: state context, all sampling seeds, exclusion counts,
   checkpoint/environment settings, and source provenance;
 - `policy_regret_study.json`: per-depth root search diagnostics, full-possession
-  replanning traces, paired returns and gains, offense/defense splits,
-  uncertainty, and aggregate runtime. Root-only runs instead write
+  replanning traces, paired returns and gains, offense/defense splits, exact
+  action agreement, coarse action-family agreement, three-way movement-direction
+  agreement (northward/lateral/southward), uncertainty, and aggregate runtime.
+  Root-only runs instead write
   `root_action_comparison.json`.
 - `regret_trajectory.json`: an atomically updated running mean, bootstrap 95%
   interval, and offense/defense split after every analyzed state.

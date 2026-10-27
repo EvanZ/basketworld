@@ -494,6 +494,7 @@ def summarize_root_action_results(
         runtimes: list[float] = []
         player_agreements: list[bool] = []
         family_agreements: list[bool] = []
+        direction_bucket_agreements: list[bool] = []
         pass_target_agreements: list[bool] = []
         for record in records:
             sample = dict(record["sample"])
@@ -516,6 +517,10 @@ def summarize_root_action_results(
             family_agreements.extend(
                 bool(value) for value in depth_result["player_action_family_agreement"]
             )
+            direction_bucket_agreements.extend(
+                bool(value)
+                for value in depth_result["player_action_direction_bucket_agreement"]
+            )
             pass_target_agreements.extend(
                 bool(value)
                 for value in depth_result["player_pass_target_agreement"]
@@ -533,6 +538,9 @@ def summarize_root_action_results(
         )
         summary["controlled_player_action_family_agreement_rate"] = float(
             np.mean(family_agreements)
+        )
+        summary["controlled_player_action_direction_bucket_agreement_rate"] = float(
+            np.mean(direction_bucket_agreements)
         )
         summary["pass_target_comparison_count"] = len(pass_target_agreements)
         summary["pass_target_agreement_rate"] = (

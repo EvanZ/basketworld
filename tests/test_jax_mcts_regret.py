@@ -99,7 +99,28 @@ def test_joint_action_agreement_separates_family_and_pass_target() -> None:
     assert payload["exact_action_agreement"] is False
     assert payload["player_action_agreement"] == [False, False, True, True]
     assert payload["player_action_family_agreement"] == [True, True, True, True]
+    assert payload["player_action_direction_bucket_agreement"] == [
+        False,
+        True,
+        True,
+        True,
+    ]
     assert payload["player_pass_target_agreement"] == [None, False, None, None]
+
+
+def test_direction_buckets_group_north_lateral_and_south_moves() -> None:
+    payload = joint_action_agreement_payload(
+        (1, 2, 4, 5),
+        (4, 3, 1, 6),
+    )
+
+    assert payload["player_action_agreement"] == [False, False, False, False]
+    assert payload["player_action_direction_bucket_agreement"] == [
+        True,
+        True,
+        True,
+        True,
+    ]
 
 
 def test_exact_top_joint_actions_do_not_enumerate_irrelevant_masked_actions() -> None:

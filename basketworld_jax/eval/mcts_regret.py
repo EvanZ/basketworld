@@ -40,6 +40,20 @@ def action_semantics(action: int) -> tuple[str, int | None]:
     return "unknown", value
 
 
+def action_direction_bucket(action: int) -> str:
+    """Return a three-way court-relative bucket for movement actions."""
+
+    value = int(action)
+    if value in {2, 3}:
+        return "move_north"
+    if value in {1, 4}:
+        return "move_lateral"
+    if value in {5, 6}:
+        return "move_south"
+    family, _target = action_semantics(value)
+    return family
+
+
 def joint_action_agreement_payload(
     policy_action: Sequence[int], planner_action: Sequence[int]
 ) -> dict[str, Any]:
@@ -49,11 +63,15 @@ def joint_action_agreement_payload(
         raise ValueError("Joint actions must have equal controlled-player widths.")
     player_exact = [left == right for left, right in zip(policy, planner, strict=True)]
     family_agreement: list[bool] = []
+    direction_bucket_agreement: list[bool] = []
     pass_target_agreement: list[bool | None] = []
     for left, right in zip(policy, planner, strict=True):
         left_family, left_target = action_semantics(left)
         right_family, right_target = action_semantics(right)
         family_agreement.append(left_family == right_family)
+        direction_bucket_agreement.append(
+            action_direction_bucket(left) == action_direction_bucket(right)
+        )
         if left_family == "pass" or right_family == "pass":
             pass_target_agreement.append(
                 left_family == right_family and left_target == right_target
@@ -64,6 +82,7 @@ def joint_action_agreement_payload(
         "exact_action_agreement": bool(all(player_exact)),
         "player_action_agreement": player_exact,
         "player_action_family_agreement": family_agreement,
+        "player_action_direction_bucket_agreement": direction_bucket_agreement,
         "player_pass_target_agreement": pass_target_agreement,
     }
 
