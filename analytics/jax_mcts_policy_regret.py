@@ -96,6 +96,20 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-episode-steps", type=int, default=10_000)
     parser.add_argument("--bootstrap-samples", type=int, default=2000)
     parser.add_argument(
+        "--sample-metadata",
+        default="",
+        help=(
+            "Optional sampled_states.json to replay instead of sampling new "
+            "episodes. Checkpoint and environment provenance must match."
+        ),
+    )
+    parser.add_argument(
+        "--evaluated-role",
+        choices=("offense", "defense"),
+        default=None,
+        help="Optionally analyze only sampled offense or defense decisions.",
+    )
+    parser.add_argument(
         "--calibration",
         action="store_true",
         help="Run one shared-state search-budget convergence study.",
@@ -247,6 +261,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_episode_steps=int(args.max_episode_steps),
         bootstrap_samples=int(args.bootstrap_samples),
         include_full_possession=(args.planning_mode == "root-and-full-possession"),
+        sample_metadata_path=(
+            None
+            if not str(args.sample_metadata).strip()
+            else Path(args.sample_metadata).expanduser()
+        ),
+        evaluated_role=args.evaluated_role,
         progress_callback=report_progress,
     )
     aggregate = result["aggregate"]

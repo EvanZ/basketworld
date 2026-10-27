@@ -52,6 +52,8 @@ An output directory must not already exist. Each study writes:
   replanning traces, paired returns and gains, offense/defense splits,
   uncertainty, and aggregate runtime. Root-only runs instead write
   `root_action_comparison.json`.
+- `regret_trajectory.json`: an atomically updated running mean, bootstrap 95%
+  interval, and offense/defense split after every analyzed state.
 
 The sampler excludes terminal states, non-live setup/inbound phases, and joint
 decisions where every controlled player is forced to one action. It compiles
@@ -84,6 +86,26 @@ Calibration searches only the primary depth (depth 5 by default), because the
 budget decision is based on the primary planner. It also reuses identical
 paired policy/action returns across budgets for each state. The main study
 still reports depths 1, 3, and 5 separately.
+
+To rerun a budget over the exact same states, pass the earlier metadata file.
+An optional role filter makes offense-only or defense-only sweeps possible:
+
+```bash
+.env/bin/python analytics/jax_mcts_policy_regret.py \
+  --evaluated-checkpoint /path/to/evaluated/checkpoint \
+  --opponent-checkpoint /path/to/opponent/checkpoint \
+  --output-dir results/mcts-regret/defense-budget-256 \
+  --sample-metadata results/mcts-regret/main/sampled_states.json \
+  --evaluated-role defense \
+  --planning-mode root-only \
+  --search-depths 5 \
+  --primary-search-depth 5 \
+  --simulations-per-action 256
+```
+
+Replay validates checkpoint, policy, action-mode, and environment provenance
+before analysis. The filtered states are copied into the new immutable output
+directory with their source metadata recorded.
 
 `--print-calibration-command` remains available when separate scheduler jobs
 are preferable. Those printed commands explicitly use root-only mode. Both

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -13,7 +14,9 @@ from basketworld_jax.eval.mcts_regret import (
 )
 from basketworld_jax.eval.mcts_regret_jax import PolicyDecision, SampledDecision
 from basketworld_jax.eval.mcts_regret_study import (
+    _SAMPLE_REPLAY_PROVENANCE_FIELDS,
     _running_primary_regret_point,
+    _study_samples,
     _write_regret_trajectory,
     analyze_sample_root_actions,
     summarize_budget_convergence,
@@ -269,6 +272,43 @@ def test_running_regret_trajectory_reports_mean_ci_and_roles(tmp_path) -> None:
     assert point["regret_mean_ci95_low"] == pytest.approx(1.0)
     assert point["regret_mean_ci95_high"] == pytest.approx(1.0)
     assert set(point["by_role"]) == {"offense", "defense"}
+
+
+def test_study_samples_reuses_matching_persisted_defense_states(
+    monkeypatch, tmp_path
+) -> None:
+    provenance = {field: field for field in _SAMPLE_REPLAY_PROVENANCE_FIELDS}
+    metadata_rows = [
+        _sample("state-a", "offense").metadata(),
+        _sample("state-b", "defense").metadata(),
+    ]
+    monkeypatch.setattr(
+        "basketworld_jax.eval.mcts_regret_study.load_persisted_sample_states",
+        lambda _path: (
+            metadata_rows,
+            ["offense-state", "defense-state"],
+            {
+                "provenance": provenance,
+                "sampling_summary": {"sample_count": 2},
+            },
+        ),
+    )
+
+    samples, summary = _study_samples(
+        SimpleNamespace(provenance=provenance),  # type: ignore[arg-type]
+        episode_count=1000,
+        seed=1,
+        max_episode_steps=10_000,
+        sample_metadata_path=tmp_path / "sampled_states.json",
+        evaluated_role="defense",
+    )
+
+    assert [sample.state_id for sample in samples] == ["state-b"]
+    assert samples[0].state == "defense-state"
+    assert summary["sample_count"] == 1
+    assert summary["source_sample_count"] == 2
+    assert summary["role_counts"] == {"defense": 1}
+    assert summary["evaluated_role_filter"] == "defense"
 
 
 def test_full_possession_mode_replans_after_the_root_action() -> None:

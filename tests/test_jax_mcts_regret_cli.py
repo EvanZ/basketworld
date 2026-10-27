@@ -86,6 +86,10 @@ def test_cli_wires_explicit_checkpoints_and_protocol(monkeypatch, tmp_path) -> N
             "20",
             "--evaluated-action-mode",
             "sampled",
+            "--sample-metadata",
+            str(tmp_path / "source" / "sampled_states.json"),
+            "--evaluated-role",
+            "defense",
         ]
     )
 
@@ -98,6 +102,11 @@ def test_cli_wires_explicit_checkpoints_and_protocol(monkeypatch, tmp_path) -> N
     assert run_kwargs["episode_count"] == 12
     assert run_kwargs["paired_rollout_count"] == 20
     assert run_kwargs["include_full_possession"] is True
+    assert (
+        run_kwargs["sample_metadata_path"]
+        == tmp_path / "source" / "sampled_states.json"
+    )
+    assert run_kwargs["evaluated_role"] == "defense"
     assert run_kwargs["protocol"].search_depths == (1, 3)
     assert run_kwargs["protocol"].simulations_per_action == 64
 

@@ -29,9 +29,120 @@ from basketworld_jax.eval.mcts_regret import (
 from basketworld_jax.eval.mcts_regret_jax import (
     JaxCounterfactualRuntime,
     SampledDecision,
+    load_persisted_sample_states,
     persist_sampled_decisions,
     sample_policy_decisions,
 )
+
+
+_SAMPLE_REPLAY_PROVENANCE_FIELDS = (
+    "evaluated_checkpoint_path",
+    "evaluated_checkpoint_update_index",
+    "evaluated_policy_spec",
+    "evaluated_stable_team",
+    "evaluated_action_mode",
+    "opponent_checkpoint_path",
+    "opponent_checkpoint_update_index",
+    "opponent_policy_spec",
+    "opponent_stable_team",
+    "opponent_action_mode",
+    "resolved_environment_config",
+    "value_target",
+)
+
+
+def _sampled_decision_from_metadata(
+    metadata: Mapping[str, Any], state: Any
+) -> SampledDecision:
+    return SampledDecision(
+        episode_index=int(metadata["episode_index"]),
+        episode_seed=int(metadata["episode_seed"]),
+        policy_seed=int(metadata["policy_seed"]),
+        selection_seed=int(metadata["selection_seed"]),
+        environment_step=int(metadata["environment_step"]),
+        eligible_decision_index=int(metadata["eligible_decision_index"]),
+        eligible_decision_count=int(metadata["eligible_decision_count"]),
+        state_id=str(metadata["state_id"]),
+        evaluated_role=str(metadata["evaluated_role"]),
+        shot_clock=int(metadata["shot_clock"]),
+        game_clock_remaining=int(metadata["game_clock_remaining"]),
+        team_a_score=float(metadata["team_a_score"]),
+        team_b_score=float(metadata["team_b_score"]),
+        ball_holder=int(metadata["ball_holder"]),
+        legal_action_counts=tuple(
+            int(value) for value in metadata["legal_action_counts"]
+        ),
+        policy_action=tuple(int(value) for value in metadata["policy_action"]),
+        state=state,
+    )
+
+
+def _study_samples(
+    runtime: JaxCounterfactualRuntime,
+    *,
+    episode_count: int,
+    seed: int,
+    max_episode_steps: int,
+    sample_metadata_path: str | Path | None,
+    evaluated_role: str | None,
+) -> tuple[list[SampledDecision], dict[str, Any]]:
+    if evaluated_role not in {None, "offense", "defense"}:
+        raise ValueError("evaluated_role must be offense, defense, or None.")
+    if sample_metadata_path is None:
+        samples, sampling_summary = sample_policy_decisions(
+            runtime,
+            episode_count=int(episode_count),
+            seed=int(seed),
+            max_episode_steps=int(max_episode_steps),
+        )
+    else:
+        source_path = Path(sample_metadata_path).expanduser().resolve()
+        metadata_rows, states, source_payload = load_persisted_sample_states(
+            source_path
+        )
+        source_provenance = dict(source_payload.get("provenance", {}))
+        runtime_provenance = dict(runtime.provenance)
+        mismatches = [
+            field
+            for field in _SAMPLE_REPLAY_PROVENANCE_FIELDS
+            if json.dumps(source_provenance.get(field), sort_keys=True)
+            != json.dumps(runtime_provenance.get(field), sort_keys=True)
+        ]
+        if mismatches:
+            raise ValueError(
+                "Persisted sample provenance does not match the active runtime: "
+                + ", ".join(mismatches)
+            )
+        samples = [
+            _sampled_decision_from_metadata(metadata, state)
+            for metadata, state in zip(metadata_rows, states, strict=True)
+        ]
+        sampling_summary = dict(source_payload.get("sampling_summary", {}))
+        sampling_summary.update(
+            {
+                "selection_method": "reused-persisted-policy-decisions",
+                "source_sample_count": len(samples),
+                "source_sample_metadata": str(source_path),
+            }
+        )
+
+    if evaluated_role is not None:
+        samples = [
+            sample for sample in samples if sample.evaluated_role == evaluated_role
+        ]
+    role_counts = {
+        role: sum(sample.evaluated_role == role for sample in samples)
+        for role in ("offense", "defense")
+        if any(sample.evaluated_role == role for sample in samples)
+    }
+    sampling_summary.update(
+        {
+            "sample_count": len(samples),
+            "role_counts": role_counts,
+            "evaluated_role_filter": evaluated_role,
+        }
+    )
+    return samples, sampling_summary
 
 
 def _seed_tuple(sequence: np.random.SeedSequence, count: int) -> tuple[int, ...]:
@@ -859,16 +970,20 @@ def run_root_only_study(
     max_episode_steps: int = 10_000,
     bootstrap_samples: int = 2000,
     include_full_possession: bool = False,
+    sample_metadata_path: str | Path | None = None,
+    evaluated_role: str | None = None,
     progress_callback=None,
 ) -> dict[str, Any]:
     """Sample states, run MCTS comparisons, and persist immutable artifacts."""
 
     settings = protocol or MctsRegretConfig()
-    samples, sampling_summary = sample_policy_decisions(
+    samples, sampling_summary = _study_samples(
         runtime,
         episode_count=int(episode_count),
         seed=int(seed),
         max_episode_steps=int(max_episode_steps),
+        sample_metadata_path=sample_metadata_path,
+        evaluated_role=evaluated_role,
     )
     if not samples:
         raise RuntimeError("No eligible policy decisions were sampled.")
