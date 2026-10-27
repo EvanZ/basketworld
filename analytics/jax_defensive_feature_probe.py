@@ -105,11 +105,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     payload = result["payload"]
     print(f"Results: {Path(result['results']).resolve()}")
     for variant, variant_result in payload["feature_variants"].items():
-        metric = variant_result["metrics"]["test"]["exact_player_action_accuracy"]
+        test_metrics = variant_result["metrics"]["test"]
+        accuracy = test_metrics["exact_player_action_accuracy"]
+        cross_entropy = test_metrics["negative_log_likelihood"]
+        roc_auc = test_metrics["legal_action_macro_roc_auc"]
+        pr_auc = test_metrics["legal_action_macro_pr_auc"]
         print(
             f"{variant}: test exact action accuracy "
-            f"{metric['estimate']:.1%} "
-            f"(95% CI {metric['ci95_low']:.1%} to {metric['ci95_high']:.1%})"
+            f"{accuracy['estimate']:.1%} "
+            f"(95% CI {accuracy['ci95_low']:.1%} to {accuracy['ci95_high']:.1%}); "
+            f"cross-entropy (NLL) {cross_entropy['estimate']:.4f}; "
+            f"legal-action macro ROC-AUC {roc_auc['estimate']:.3f}; "
+            f"macro PR-AUC {pr_auc['estimate']:.3f}"
         )
     return 0
 

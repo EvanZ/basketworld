@@ -35,7 +35,7 @@ from basketworld_jax.provenance import capture_source_provenance
 from basketworld_jax.train.cli import ensure_jax_available
 
 
-PROBE_SCHEMA_VERSION = 1
+PROBE_SCHEMA_VERSION = 2
 DEFENSIVE_ACTION_COUNT = 7
 FEATURE_VARIANTS = (
     "current_observation",
@@ -695,19 +695,162 @@ def _bootstrap_ratio(
     }
 
 
+def _binary_roc_auc(labels: np.ndarray, scores: np.ndarray) -> float | None:
+    labels = np.asarray(labels, dtype=bool).reshape(-1)
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    positive_count = int(np.sum(labels))
+    negative_count = int(labels.size - positive_count)
+    if positive_count == 0 or negative_count == 0:
+        return None
+    order = np.argsort(scores, kind="mergesort")
+    sorted_scores = scores[order]
+    ranks = np.empty(scores.shape[0], dtype=np.float64)
+    start = 0
+    while start < sorted_scores.size:
+        end = start + 1
+        while end < sorted_scores.size and sorted_scores[end] == sorted_scores[start]:
+            end += 1
+        average_rank = 0.5 * ((start + 1) + end)
+        ranks[order[start:end]] = average_rank
+        start = end
+    positive_rank_sum = float(np.sum(ranks[labels]))
+    return float(
+        (positive_rank_sum - (positive_count * (positive_count + 1) / 2.0))
+        / (positive_count * negative_count)
+    )
+
+
+def _binary_pr_auc(labels: np.ndarray, scores: np.ndarray) -> float | None:
+    labels = np.asarray(labels, dtype=bool).reshape(-1)
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    positive_count = int(np.sum(labels))
+    negative_count = int(labels.size - positive_count)
+    if positive_count == 0 or negative_count == 0:
+        return None
+    order = np.argsort(-scores, kind="mergesort")
+    sorted_scores = scores[order]
+    sorted_labels = labels[order].astype(np.float64)
+    cumulative_positive = np.cumsum(sorted_labels)
+    cumulative_count = np.arange(1, labels.size + 1)
+    threshold_ends = np.concatenate(
+        [np.flatnonzero(sorted_scores[1:] != sorted_scores[:-1]), [labels.size - 1]]
+    )
+    precision = cumulative_positive[threshold_ends] / cumulative_count[threshold_ends]
+    recall = cumulative_positive[threshold_ends] / positive_count
+    return float(np.sum(np.diff(np.concatenate([[0.0], recall])) * precision))
+
+
+def _macro_action_auc(
+    labels: np.ndarray,
+    probabilities: np.ndarray,
+    action_masks: np.ndarray,
+    *,
+    metric: str,
+) -> tuple[float | None, int]:
+    values: list[float] = []
+    for action in range(DEFENSIVE_ACTION_COUNT):
+        eligible = np.asarray(action_masks[..., action], dtype=bool)
+        action_labels = (np.asarray(labels) == action)[eligible]
+        action_scores = np.asarray(probabilities[..., action])[eligible]
+        value = (
+            _binary_roc_auc(action_labels, action_scores)
+            if metric == "roc"
+            else _binary_pr_auc(action_labels, action_scores)
+        )
+        if value is not None:
+            values.append(float(value))
+    if not values:
+        return None, 0
+    return float(np.mean(values)), len(values)
+
+
+def _move_auc(
+    labels: np.ndarray,
+    probabilities: np.ndarray,
+    *,
+    metric: str,
+) -> float | None:
+    move_labels = np.asarray(labels) > 0
+    move_scores = np.sum(np.asarray(probabilities)[..., 1:], axis=-1)
+    if metric == "roc":
+        return _binary_roc_auc(move_labels, move_scores)
+    return _binary_pr_auc(move_labels, move_scores)
+
+
+def _bootstrap_auc(
+    labels: np.ndarray,
+    probabilities: np.ndarray,
+    action_masks: np.ndarray,
+    *,
+    metric: str,
+    move_vs_noop: bool,
+    samples: int,
+    seed: int,
+) -> dict[str, Any]:
+    if move_vs_noop:
+        estimate = _move_auc(labels, probabilities, metric=metric)
+        class_count = 2 if estimate is not None else 0
+    else:
+        estimate, class_count = _macro_action_auc(
+            labels, probabilities, action_masks, metric=metric
+        )
+    if estimate is None:
+        return {
+            "estimate": None,
+            "ci95_low": None,
+            "ci95_high": None,
+            "state_count": int(labels.shape[0]),
+            "decision_count": int(labels.size),
+            "class_count": int(class_count),
+        }
+    rng = np.random.default_rng(int(seed))
+    values: list[float] = []
+    for _ in range(int(samples)):
+        draw = rng.integers(0, labels.shape[0], size=labels.shape[0])
+        if move_vs_noop:
+            value = _move_auc(labels[draw], probabilities[draw], metric=metric)
+        else:
+            value, _ = _macro_action_auc(
+                labels[draw], probabilities[draw], action_masks[draw], metric=metric
+            )
+        if value is not None:
+            values.append(float(value))
+    ci95_low = float(np.quantile(values, 0.025)) if values else None
+    ci95_high = float(np.quantile(values, 0.975)) if values else None
+    return {
+        "estimate": float(estimate),
+        "ci95_low": ci95_low,
+        "ci95_high": ci95_high,
+        "state_count": int(labels.shape[0]),
+        "decision_count": int(labels.size),
+        "class_count": int(class_count),
+    }
+
+
 def classification_metrics(
     labels: np.ndarray,
     probabilities: np.ndarray,
     *,
+    action_masks: np.ndarray | None = None,
     bootstrap_samples: int,
     bootstrap_seed: int,
 ) -> dict[str, Any]:
-    """Return state-bootstrapped exact and directional probe metrics."""
+    """Return state-bootstrapped accuracy, cross-entropy, and AUC metrics."""
 
     labels = np.asarray(labels, dtype=np.int32)
     probabilities = np.asarray(probabilities, dtype=np.float64)
     if probabilities.shape != (*labels.shape, DEFENSIVE_ACTION_COUNT):
         raise ValueError("Probability shape does not match defensive labels.")
+    if action_masks is None:
+        action_masks = np.ones(probabilities.shape, dtype=bool)
+    action_masks = np.asarray(action_masks, dtype=bool)
+    if action_masks.shape != probabilities.shape:
+        raise ValueError("Action-mask shape does not match probabilities.")
+    label_is_legal = np.take_along_axis(action_masks, labels[..., None], axis=-1)[
+        ..., 0
+    ]
+    if not np.all(label_is_legal):
+        raise ValueError("At least one defensive target action is illegal.")
     predictions = np.argmax(probabilities, axis=-1).astype(np.int32)
     state_count, player_count = labels.shape
     state_den = np.full(state_count, player_count, dtype=np.float64)
@@ -754,6 +897,42 @@ def classification_metrics(
         ),
         "top_2_action_accuracy": ratio(top2.sum(axis=1), state_den, 7),
         "top_3_action_accuracy": ratio(top3.sum(axis=1), state_den, 8),
+        "legal_action_macro_roc_auc": _bootstrap_auc(
+            labels,
+            probabilities,
+            action_masks,
+            metric="roc",
+            move_vs_noop=False,
+            samples=int(bootstrap_samples),
+            seed=int(bootstrap_seed) + 9,
+        ),
+        "legal_action_macro_pr_auc": _bootstrap_auc(
+            labels,
+            probabilities,
+            action_masks,
+            metric="pr",
+            move_vs_noop=False,
+            samples=int(bootstrap_samples),
+            seed=int(bootstrap_seed) + 10,
+        ),
+        "move_vs_noop_roc_auc": _bootstrap_auc(
+            labels,
+            probabilities,
+            action_masks,
+            metric="roc",
+            move_vs_noop=True,
+            samples=int(bootstrap_samples),
+            seed=int(bootstrap_seed) + 11,
+        ),
+        "move_vs_noop_pr_auc": _bootstrap_auc(
+            labels,
+            probabilities,
+            action_masks,
+            metric="pr",
+            move_vs_noop=True,
+            samples=int(bootstrap_samples),
+            seed=int(bootstrap_seed) + 12,
+        ),
         "confusion_matrix": confusion.tolist(),
     }
 
@@ -762,6 +941,7 @@ def _deterministic_action_metrics(
     labels: np.ndarray,
     predictions: np.ndarray,
     *,
+    action_masks: np.ndarray,
     bootstrap_samples: int,
     bootstrap_seed: int,
 ) -> dict[str, Any]:
@@ -780,10 +960,11 @@ def _deterministic_action_metrics(
     metrics = classification_metrics(
         labels,
         probabilities,
+        action_masks=action_masks,
         bootstrap_samples=bootstrap_samples,
         bootstrap_seed=bootstrap_seed,
     )
-    metrics["negative_log_likelihood"] = {
+    unavailable_probability_metric = {
         "estimate": None,
         "ci95_low": None,
         "ci95_high": None,
@@ -791,6 +972,14 @@ def _deterministic_action_metrics(
         "decision_count": 0,
         "reason": "Full baseline action probabilities were not persisted.",
     }
+    metrics["negative_log_likelihood"] = unavailable_probability_metric
+    for metric_name in (
+        "legal_action_macro_roc_auc",
+        "legal_action_macro_pr_auc",
+        "move_vs_noop_roc_auc",
+        "move_vs_noop_pr_auc",
+    ):
+        metrics[metric_name] = dict(unavailable_probability_metric)
     return metrics
 
 
@@ -971,6 +1160,7 @@ def _subset_metrics(
     labels: np.ndarray,
     probabilities: np.ndarray,
     *,
+    action_masks: np.ndarray,
     subset_masks: Mapping[str, np.ndarray],
     bootstrap_samples: int,
     bootstrap_seed: int,
@@ -989,6 +1179,7 @@ def _subset_metrics(
             **classification_metrics(
                 labels[selected],
                 probabilities[selected],
+                action_masks=action_masks[selected],
                 bootstrap_samples=int(bootstrap_samples),
                 bootstrap_seed=int(bootstrap_seed) + (offset * 100),
             ),
@@ -1000,6 +1191,7 @@ def _paired_primary_delta(
     labels: np.ndarray,
     left_probabilities: np.ndarray,
     right_probabilities: np.ndarray,
+    action_masks: np.ndarray,
     test_mask: np.ndarray,
     *,
     bootstrap_samples: int,
@@ -1008,6 +1200,7 @@ def _paired_primary_delta(
     selected_labels = np.asarray(labels)[test_mask]
     left = np.asarray(left_probabilities)[test_mask]
     right = np.asarray(right_probabilities)[test_mask]
+    selected_action_masks = np.asarray(action_masks, dtype=bool)[test_mask]
     left_pred = np.argmax(left, axis=-1)
     right_pred = np.argmax(right, axis=-1)
     state_count, player_count = selected_labels.shape
@@ -1049,11 +1242,74 @@ def _paired_primary_delta(
             "decisions_per_state": int(player_count),
         }
 
+    def auc_delta(
+        *,
+        metric: str,
+        move_vs_noop: bool,
+        offset: int,
+    ) -> dict[str, Any]:
+        def value(probabilities: np.ndarray, indices: np.ndarray | None = None):
+            selected_probabilities = probabilities
+            selected_auc_labels = selected_labels
+            selected_auc_masks = selected_action_masks
+            if indices is not None:
+                selected_probabilities = probabilities[indices]
+                selected_auc_labels = selected_labels[indices]
+                selected_auc_masks = selected_action_masks[indices]
+            if move_vs_noop:
+                return _move_auc(
+                    selected_auc_labels,
+                    selected_probabilities,
+                    metric=metric,
+                )
+            result, _ = _macro_action_auc(
+                selected_auc_labels,
+                selected_probabilities,
+                selected_auc_masks,
+                metric=metric,
+            )
+            return result
+
+        left_estimate = value(left)
+        right_estimate = value(right)
+        if left_estimate is None or right_estimate is None:
+            return {
+                "estimate": None,
+                "ci95_low": None,
+                "ci95_high": None,
+                "state_count": int(state_count),
+                "decision_count": int(selected_labels.size),
+            }
+        rng = np.random.default_rng(int(bootstrap_seed) + offset)
+        values: list[float] = []
+        for _ in range(int(bootstrap_samples)):
+            draw = rng.integers(0, state_count, size=state_count)
+            left_draw = value(left, draw)
+            right_draw = value(right, draw)
+            if left_draw is not None and right_draw is not None:
+                values.append(float(right_draw - left_draw))
+        return {
+            "estimate": float(right_estimate - left_estimate),
+            "ci95_low": (float(np.quantile(values, 0.025)) if values else None),
+            "ci95_high": (float(np.quantile(values, 0.975)) if values else None),
+            "state_count": int(state_count),
+            "decision_count": int(selected_labels.size),
+        }
+
     return {
         "exact_player_action_accuracy": delta(left_exact, right_exact, 1),
         "exact_joint_action_accuracy": delta(left_joint, right_joint, 2),
         "negative_log_likelihood": delta(left_nll, right_nll, 3),
         "negative_log_likelihood_direction": "negative_is_better",
+        "legal_action_macro_roc_auc": auc_delta(
+            metric="roc", move_vs_noop=False, offset=4
+        ),
+        "legal_action_macro_pr_auc": auc_delta(
+            metric="pr", move_vs_noop=False, offset=5
+        ),
+        "move_vs_noop_roc_auc": auc_delta(metric="roc", move_vs_noop=True, offset=6),
+        "move_vs_noop_pr_auc": auc_delta(metric="pr", move_vs_noop=True, offset=7),
+        "auc_direction": "positive_is_better",
     }
 
 
@@ -1142,6 +1398,7 @@ def run_defensive_feature_probe(
             "metrics": _subset_metrics(
                 dataset.labels,
                 ensemble,
+                action_masks=dataset.action_masks,
                 subset_masks=subset_masks,
                 bootstrap_samples=int(config.bootstrap_samples),
                 bootstrap_seed=int(config.split_seed) + (variant_index * 1000),
@@ -1179,6 +1436,7 @@ def run_defensive_feature_probe(
             curve_metrics = classification_metrics(
                 dataset.labels[test_mask],
                 curve_probabilities[test_mask],
+                action_masks=dataset.action_masks[test_mask],
                 bootstrap_samples=int(config.bootstrap_samples),
                 bootstrap_seed=int(config.split_seed)
                 + 5000
@@ -1195,6 +1453,12 @@ def run_defensive_feature_probe(
                     ],
                     "test_negative_log_likelihood": curve_metrics[
                         "negative_log_likelihood"
+                    ],
+                    "test_legal_action_macro_roc_auc": curve_metrics[
+                        "legal_action_macro_roc_auc"
+                    ],
+                    "test_legal_action_macro_pr_auc": curve_metrics[
+                        "legal_action_macro_pr_auc"
                     ],
                 }
             )
@@ -1217,6 +1481,7 @@ def run_defensive_feature_probe(
                         **_deterministic_action_metrics(
                             dataset.labels[mask],
                             dataset.policy_actions[mask],
+                            action_masks=dataset.action_masks[mask],
                             bootstrap_samples=int(config.bootstrap_samples),
                             bootstrap_seed=int(config.split_seed) + 7000 + offset,
                         ),
@@ -1229,6 +1494,7 @@ def run_defensive_feature_probe(
             "metrics": _subset_metrics(
                 dataset.labels,
                 frequency_probabilities,
+                action_masks=dataset.action_masks,
                 subset_masks=subset_masks,
                 bootstrap_samples=int(config.bootstrap_samples),
                 bootstrap_seed=int(config.split_seed) + 8000,
@@ -1241,6 +1507,7 @@ def run_defensive_feature_probe(
             dataset.labels,
             ensemble_probabilities["current_observation"],
             ensemble_probabilities["directional_geometry"],
+            dataset.action_masks,
             test_mask,
             bootstrap_samples=int(config.bootstrap_samples),
             bootstrap_seed=int(config.split_seed) + 9000,
@@ -1249,6 +1516,7 @@ def run_defensive_feature_probe(
             dataset.labels,
             ensemble_probabilities["directional_geometry"],
             ensemble_probabilities["threat_and_responsibility"],
+            dataset.action_masks,
             test_mask,
             bootstrap_samples=int(config.bootstrap_samples),
             bootstrap_seed=int(config.split_seed) + 10000,
@@ -1257,6 +1525,7 @@ def run_defensive_feature_probe(
             dataset.labels,
             ensemble_probabilities["current_observation"],
             ensemble_probabilities["threat_and_responsibility"],
+            dataset.action_masks,
             test_mask,
             bootstrap_samples=int(config.bootstrap_samples),
             bootstrap_seed=int(config.split_seed) + 11000,
@@ -1268,7 +1537,24 @@ def run_defensive_feature_probe(
     def reliable_uplift(delta: Mapping[str, Any]) -> bool:
         accuracy = dict(delta["exact_player_action_accuracy"])
         nll = dict(delta["negative_log_likelihood"])
-        return bool(float(accuracy["ci95_low"]) > 0.0 or float(nll["ci95_high"]) < 0.0)
+        auc_metrics = [
+            dict(delta[name])
+            for name in (
+                "legal_action_macro_roc_auc",
+                "legal_action_macro_pr_auc",
+                "move_vs_noop_roc_auc",
+                "move_vs_noop_pr_auc",
+            )
+        ]
+        auc_uplift = any(
+            metric.get("ci95_low") is not None and float(metric["ci95_low"]) > 0.0
+            for metric in auc_metrics
+        )
+        return bool(
+            float(accuracy["ci95_low"]) > 0.0
+            or float(nll["ci95_high"]) < 0.0
+            or auc_uplift
+        )
 
     interpretation = {
         "label_stability": (

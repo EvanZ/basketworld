@@ -114,3 +114,29 @@ def test_classification_metrics_bootstrap_by_state() -> None:
     assert metrics["move_vs_noop_accuracy"]["estimate"] == 1.0
     assert metrics["exact_move_direction_accuracy"]["estimate"] == 2.0 / 3.0
     assert metrics["three_bucket_move_direction_accuracy"]["estimate"] == 1.0
+    assert metrics["legal_action_macro_roc_auc"]["class_count"] == 4
+    assert metrics["legal_action_macro_pr_auc"]["class_count"] == 4
+
+
+def test_auc_metrics_condition_on_legal_actions_and_reward_correct_ranking() -> None:
+    labels = np.asarray([[0], [1], [0], [1]], dtype=np.int32)
+    probabilities = np.zeros((4, 1, 7), dtype=np.float64)
+    probabilities[:, 0, :2] = np.asarray(
+        [[0.9, 0.1], [0.2, 0.8], [0.8, 0.2], [0.1, 0.9]]
+    )
+    action_masks = np.zeros_like(probabilities, dtype=bool)
+    action_masks[..., :2] = True
+
+    metrics = classification_metrics(
+        labels,
+        probabilities,
+        action_masks=action_masks,
+        bootstrap_samples=100,
+        bootstrap_seed=11,
+    )
+
+    assert metrics["legal_action_macro_roc_auc"]["estimate"] == 1.0
+    assert metrics["legal_action_macro_roc_auc"]["class_count"] == 2
+    assert metrics["legal_action_macro_pr_auc"]["estimate"] == 1.0
+    assert metrics["move_vs_noop_roc_auc"]["estimate"] == 1.0
+    assert metrics["move_vs_noop_pr_auc"]["estimate"] == 1.0

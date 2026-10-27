@@ -70,12 +70,24 @@ unavailable. A single MCTS budget is never silently treated as stable.
 - per-seed training histories and data-size learning curves;
 - state-bootstrapped held-out confidence intervals;
 - exact per-player and five-player joint action accuracy;
-- move/no-op, exact six-way direction, three-bucket direction, top-k, negative
-  log likelihood, and confusion-matrix diagnostics;
+- move/no-op, exact six-way direction, three-bucket direction, and top-k
+  diagnostics;
+- multiclass cross-entropy (reported as negative log likelihood),
+  legal-action-conditioned macro one-vs-rest ROC-AUC and PR-AUC, and binary
+  move-vs-no-op ROC-AUC and PR-AUC;
+- confusion matrices;
 - separate high-regret and, when available, stable-label results;
 - paired bootstrap differences between feature variants;
 - per-state ensemble probabilities and predictions;
 - input hashes and source-code provenance.
+
+Cross-entropy is the primary probability-quality metric because it evaluates
+the full seven-way distribution and penalizes confident errors. Exact accuracy
+checks whether the probe actually selects the MCTS action. AUC is supplemental:
+it can detect improved action ranking before the argmax changes, but does not
+measure calibration. Macro action AUC excludes decisions where the candidate
+action was illegal, avoiding artificially easy negatives. PR-AUC is included
+because the one-vs-rest action labels are imbalanced.
 
 If the current observation predicts stable MCTS actions well, PPO credit or
 coordinated exploration is the leading limitation. A reliable held-out gain

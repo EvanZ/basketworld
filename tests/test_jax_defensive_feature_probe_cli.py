@@ -36,7 +36,10 @@ def test_cli_wires_source_stability_and_training_config(monkeypatch, tmp_path) -
                                     "estimate": 0.4,
                                     "ci95_low": 0.3,
                                     "ci95_high": 0.5,
-                                }
+                                },
+                                "negative_log_likelihood": {"estimate": 1.5},
+                                "legal_action_macro_roc_auc": {"estimate": 0.6},
+                                "legal_action_macro_pr_auc": {"estimate": 0.3},
                             }
                         }
                     }
