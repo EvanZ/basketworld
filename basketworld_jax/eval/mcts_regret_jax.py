@@ -1171,6 +1171,7 @@ def load_jax_counterfactual_runtime(
             opponent_action_mode,
             field_name="opponent_action_mode",
         ),
+        "max_rollout_steps": int(max_rollout_steps),
         "value_target": "team_a_minus_team_b_points_to_possession_end",
         "evaluator_source_provenance": capture_source_provenance(),
     }
