@@ -554,6 +554,91 @@ def summarize_root_action_results(
     return result
 
 
+def _running_primary_regret_point(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    protocol: MctsRegretConfig,
+    bootstrap_seed: int,
+    bootstrap_samples: int,
+) -> dict[str, Any]:
+    """Summarize the primary-depth estimate while a study is running."""
+
+    primary_key = str(protocol.primary_search_depth)
+
+    def summarize(
+        selected: Sequence[Mapping[str, Any]], *, seed: int
+    ) -> dict[str, Any]:
+        regrets = [
+            float(
+                record["depth_results"][primary_key]["paired_comparison"]["regret_mean"]
+            )
+            for record in selected
+        ]
+        low, high = paired_bootstrap_mean_interval(
+            regrets,
+            seed=int(seed),
+            samples=int(bootstrap_samples),
+        )
+        agreements = [
+            bool(record["depth_results"][primary_key]["exact_action_agreement"])
+            for record in selected
+        ]
+        return {
+            "state_count": len(regrets),
+            "regret_mean": float(np.mean(regrets)),
+            "regret_mean_ci95_low": float(low),
+            "regret_mean_ci95_high": float(high),
+            "regret_positive_fraction": float(np.mean(np.asarray(regrets) > 0.0)),
+            "exact_action_agreement_rate": float(np.mean(agreements)),
+        }
+
+    point = summarize(records, seed=int(bootstrap_seed))
+    point["by_role"] = {
+        role: summarize(
+            [
+                record
+                for record in records
+                if str(record["sample"]["evaluated_role"]) == role
+            ],
+            seed=int(bootstrap_seed) + 100,
+        )
+        for role in ("offense", "defense")
+        if any(str(record["sample"]["evaluated_role"]) == role for record in records)
+    }
+    return point
+
+
+def _write_regret_trajectory(
+    destination: Path,
+    *,
+    trajectory: Sequence[Mapping[str, Any]],
+    total_state_count: int,
+    primary_search_depth: int,
+    status: str,
+    aggregate: Mapping[str, Any] | None = None,
+) -> Path:
+    """Atomically update the live trajectory so readers never see partial JSON."""
+
+    path = destination / "regret_trajectory.json"
+    temporary_path = destination / ".regret_trajectory.json.tmp"
+    payload: dict[str, Any] = {
+        "schema_version": MCTS_REGRET_SCHEMA_VERSION,
+        "status": str(status),
+        "primary_search_depth": int(primary_search_depth),
+        "completed_state_count": len(trajectory),
+        "total_state_count": int(total_state_count),
+        "trajectory": list(trajectory),
+    }
+    if aggregate is not None:
+        payload["final_aggregate"] = dict(aggregate)
+    temporary_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(path)
+    return path
+
+
 def summarize_budget_convergence(
     records_by_budget: Mapping[int, Sequence[Mapping[str, Any]]],
     *,
@@ -797,6 +882,8 @@ def run_root_only_study(
     )
     study_sequences = np.random.SeedSequence(int(seed)).spawn(len(samples))
     records: list[dict[str, Any]] = []
+    trajectory: list[dict[str, Any]] = []
+    trajectory_path = destination / "regret_trajectory.json"
     for index, (sample, sequence) in enumerate(
         zip(samples, study_sequences, strict=True),
         start=1,
@@ -813,6 +900,21 @@ def run_root_only_study(
                 include_full_possession=bool(include_full_possession),
             )
         )
+        trajectory.append(
+            _running_primary_regret_point(
+                records,
+                protocol=settings,
+                bootstrap_seed=int(seed),
+                bootstrap_samples=int(bootstrap_samples),
+            )
+        )
+        trajectory_path = _write_regret_trajectory(
+            destination,
+            trajectory=trajectory,
+            total_state_count=len(samples),
+            primary_search_depth=int(settings.primary_search_depth),
+            status="running",
+        )
         if progress_callback is not None:
             progress_callback(index, len(samples))
 
@@ -821,6 +923,14 @@ def run_root_only_study(
         protocol=settings,
         bootstrap_seed=int(seed),
         bootstrap_samples=int(bootstrap_samples),
+    )
+    trajectory_path = _write_regret_trajectory(
+        destination,
+        trajectory=trajectory,
+        total_state_count=len(samples),
+        primary_search_depth=int(settings.primary_search_depth),
+        status="complete",
+        aggregate=aggregate,
     )
     payload = {
         "schema_version": MCTS_REGRET_SCHEMA_VERSION,
@@ -833,6 +943,7 @@ def run_root_only_study(
         "aggregate": aggregate,
         "records": records,
         "sample_artifacts": state_paths,
+        "trajectory_artifact": str(trajectory_path),
     }
     results_path = destination / (
         "policy_regret_study.json"
@@ -847,6 +958,7 @@ def run_root_only_study(
         "output_dir": str(destination),
         "state_archive": state_paths["state_archive"],
         "sample_metadata": state_paths["metadata"],
+        "trajectory": str(trajectory_path),
         "results": str(results_path),
         "aggregate": aggregate,
     }

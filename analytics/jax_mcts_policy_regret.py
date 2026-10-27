@@ -180,7 +180,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     def report_progress(completed: int, total: int) -> None:
-        print(f"Analyzed {completed}/{total} sampled states.", flush=True)
+        trajectory_path = Path(args.output_dir).expanduser() / "regret_trajectory.json"
+        trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))[
+            "trajectory"
+        ]
+        latest = trajectory[-1]
+        print(
+            f"Analyzed {completed}/{total} sampled states: "
+            f"mean regret {latest['regret_mean']:+.4f}, "
+            "95% CI "
+            f"[{latest['regret_mean_ci95_low']:+.4f}, "
+            f"{latest['regret_mean_ci95_high']:+.4f}].",
+            flush=True,
+        )
 
     if args.calibration:
 

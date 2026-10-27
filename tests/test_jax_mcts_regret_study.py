@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 
 import numpy as np
 import pytest
@@ -12,6 +13,8 @@ from basketworld_jax.eval.mcts_regret import (
 )
 from basketworld_jax.eval.mcts_regret_jax import PolicyDecision, SampledDecision
 from basketworld_jax.eval.mcts_regret_study import (
+    _running_primary_regret_point,
+    _write_regret_trajectory,
     analyze_sample_root_actions,
     summarize_budget_convergence,
     summarize_root_action_results,
@@ -216,6 +219,56 @@ def test_root_summary_splits_roles_and_compares_primary_with_depth_one() -> None
     assert summary["primary_regret_mean"] == pytest.approx(1.0)
     assert summary["primary_minus_depth_one_regret_mean"] == pytest.approx(0.0)
     assert summary["primary_planner_gain_over_depth_one"]["mean"] == pytest.approx(0.0)
+
+
+def test_running_regret_trajectory_reports_mean_ci_and_roles(tmp_path) -> None:
+    protocol = MctsRegretConfig(
+        search_depths=(1,),
+        primary_search_depth=1,
+        simulations_per_action=8,
+        max_joint_actions_per_node=2,
+    )
+    records = [
+        analyze_sample_root_actions(
+            _BanditRuntime(),  # type: ignore[arg-type]
+            _sample("state-a", "offense"),
+            protocol=protocol,
+            seed=51,
+            paired_rollout_count=4,
+            bootstrap_samples=20,
+        ),
+        analyze_sample_root_actions(
+            _BanditRuntime(),  # type: ignore[arg-type]
+            _sample("state-b", "defense"),
+            protocol=protocol,
+            seed=52,
+            paired_rollout_count=4,
+            bootstrap_samples=20,
+        ),
+    ]
+
+    point = _running_primary_regret_point(
+        records,
+        protocol=protocol,
+        bootstrap_seed=7,
+        bootstrap_samples=50,
+    )
+    path = _write_regret_trajectory(
+        tmp_path,
+        trajectory=[point],
+        total_state_count=1000,
+        primary_search_depth=1,
+        status="running",
+    )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["status"] == "running"
+    assert payload["completed_state_count"] == 1
+    assert payload["total_state_count"] == 1000
+    assert point["regret_mean"] == pytest.approx(1.0)
+    assert point["regret_mean_ci95_low"] == pytest.approx(1.0)
+    assert point["regret_mean_ci95_high"] == pytest.approx(1.0)
+    assert set(point["by_role"]) == {"offense", "defense"}
 
 
 def test_full_possession_mode_replans_after_the_root_action() -> None:
