@@ -109,6 +109,31 @@ Replay validates checkpoint, policy, action-mode, and environment provenance
 before analysis. The filtered states are copied into the new immutable output
 directory with their source metadata recorded.
 
+## Check search-seed stability
+
+Budget convergence and search-seed stability answer different questions. A
+fixed-budget seed study holds the exact root states, policies, environment,
+action modes, depth, and simulation budget constant while changing only the
+top-level seed that generates each state's MCTS search seed. Run at least two
+additional root-only searches from the original `sampled_states.json`, then
+compare all three completed artifacts. Reuse the earlier root-only command and
+change only `--seed` and `--output-dir` for each rerun.
+
+```bash
+.env/bin/python analytics/jax_mcts_seed_stability.py \
+  --result <seed-1>/root_action_comparison.json \
+  --result <seed-2>/root_action_comparison.json \
+  --result <seed-3>/root_action_comparison.json \
+  --output-dir <new-seed-stability-output-dir>
+```
+
+`mcts_search_seed_stability.json` reports per-player and full joint-action
+agreement with state-level bootstrap intervals, all-seed consensus, modal
+agreement, move/no-op agreement, and the selected action's visit/value margin
+over its runner-up. Small margins plus low agreement indicate that a hard
+argmax action is a noisy teacher label even when several near-tied actions all
+outperform the policy.
+
 `--print-calibration-command` remains available when separate scheduler jobs
 are preferable. Those printed commands explicitly use root-only mode. Both
 calibration paths isolate search-budget stability without multiplying the sweep

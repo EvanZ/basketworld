@@ -61,6 +61,33 @@ seeds, include them to identify stable joint-action labels:
 Without at least one comparison artifact, stability metrics are marked
 unavailable. A single MCTS budget is never silently treated as stable.
 
+### Same-state search-seed stability
+
+Before interpreting probe accuracy as a representation limit, repeat the
+primary depth/budget search over the exact persisted roots with at least two
+new top-level seeds. Keep checkpoints, environment, action modes, depth,
+simulation budget, and sampled-state metadata fixed. Including the original
+artifact, this gives at least three independent MCTS decisions per state.
+Use the existing root-only evaluator command with the original
+`--sample-metadata`, changing only `--seed` and `--output-dir` for each rerun.
+
+Analyze the completed searches with:
+
+```bash
+.env/bin/python analytics/jax_mcts_seed_stability.py \
+  --result <seed-1>/root_action_comparison.json \
+  --result <seed-2>/root_action_comparison.json \
+  --result <seed-3>/root_action_comparison.json \
+  --output-dir <new-seed-stability-output-dir>
+```
+
+The immutable output reports state-bootstrapped per-defender pairwise action
+agreement, full joint-action agreement, all-seed consensus, modal agreement,
+move/no-op agreement, and selected-versus-runner-up visit and value margins.
+The analyzer rejects protocol, checkpoint/environment provenance, state-order,
+sample-label, or search-seed mismatches. It does not impose an arbitrary
+stability cutoff.
+
 ## Output and interpretation
 
 `defensive_feature_probe.json` contains:
@@ -78,6 +105,8 @@ unavailable. A single MCTS budget is never silently treated as stable.
 - confusion matrices;
 - separate high-regret and, when available, stable-label results;
 - paired bootstrap differences between feature variants;
+- stable-label subsets derived from completed same-state search artifacts when
+  supplied;
 - per-state ensemble probabilities and predictions;
 - input hashes and source-code provenance.
 
