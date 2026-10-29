@@ -500,6 +500,27 @@ def build_train_parser():
         ),
     )
     parser.add_argument(
+        "--team-action-mode",
+        choices=("independent", "autoregressive"),
+        default="independent",
+        help=(
+            "Within-team action decoder. 'autoregressive' conditions each player "
+            "on earlier same-team actions while preserving simultaneous environment steps."
+        ),
+    )
+    parser.add_argument(
+        "--offense-action-order",
+        choices=("random", "ball_handler_last", "canonical"),
+        default="random",
+        help="Player decoding order for autoregressive offense actions.",
+    )
+    parser.add_argument(
+        "--defense-action-order",
+        choices=("random", "canonical"),
+        default="random",
+        help="Player decoding order for autoregressive defense actions.",
+    )
+    parser.add_argument(
         "--attention-embed-dim",
         type=int,
         default=64,
@@ -1605,6 +1626,9 @@ def _config_category(dest: str) -> str:
         ("ppo_", "PPO"),
         ("policy_", "Policy"),
         ("attention_", "Policy"),
+        ("team_action_", "Policy"),
+        ("offense_action_", "Policy"),
+        ("defense_action_", "Policy"),
         ("checkpoint_", "Runtime and checkpoints"),
         ("resume_", "Runtime and checkpoints"),
     )
@@ -1726,6 +1750,13 @@ def _values_match(actual: Any, expected: Any) -> bool:
 def validate_train_args(args) -> None:
     if int(getattr(args, "attention_num_layers", 1)) < 1:
         raise SystemExit("--attention-num-layers must be >= 1.")
+    if (
+        str(getattr(args, "team_action_mode", "independent")) == "autoregressive"
+        and str(getattr(args, "policy_model", "mlp")) != "attention"
+    ):
+        raise SystemExit(
+            "--team-action-mode autoregressive requires --policy-model attention."
+        )
     if bool(getattr(args, "require_all_offense_clear", False)) and not bool(
         getattr(args, "enable_multi_possession", False)
     ):
@@ -2915,6 +2946,9 @@ def _build_policy_spec(
             getattr(args, "attention_head_activation", "tanh")
         ),
         action_head_mode=str(getattr(args, "action_head_mode", "flat")),
+        team_action_mode=str(getattr(args, "team_action_mode", "independent")),
+        offense_action_order=str(getattr(args, "offense_action_order", "random")),
+        defense_action_order=str(getattr(args, "defense_action_order", "random")),
         pass_action_start=int(PASS_ACTION_START),
         pass_action_end=int(PASS_ACTION_END),
         intent_embedding_enabled=bool(getattr(args, "intent_embedding_enabled", False)),
@@ -4045,6 +4079,9 @@ def _log_mlflow_params(
         ),
         "jax/policy_model": str(spec.model_type),
         "jax/action_head_mode": str(spec.action_head_mode),
+        "jax/team_action_mode": str(spec.team_action_mode),
+        "jax/offense_action_order": str(spec.offense_action_order),
+        "jax/defense_action_order": str(spec.defense_action_order),
         "jax/policy_hidden_dims": ",".join(str(v) for v in spec.hidden_dims),
         "jax/flat_obs_dim": int(spec.flat_obs_dim),
         "jax/training_player_count": int(spec.training_player_count),
@@ -8327,6 +8364,8 @@ def run_training_loop(args) -> dict[str, Any]:
                         intent_rollout.trajectory.flat_obs,
                         intent_rollout.trajectory.action_mask,
                         sensitivity_active_mask,
+                        intent_rollout.trajectory.action_order,
+                        intent_rollout.trajectory.actions,
                     )
                     block_until_ready_tree(raw_sensitivity_metrics)
                     intent_disc_metrics.update(
@@ -9893,7 +9932,13 @@ def run_train_scaffold(args) -> dict[str, Any]:
     for idx in range(int(args.warmup_iters)):
         sample_key = jax.random.fold_in(sample_key, idx)
         final_out = runner(
-            params, flat_obs, action_masks, policy_intent_context, sample_key
+            params,
+            flat_obs,
+            action_masks,
+            policy_intent_context,
+            sample_key,
+            state.ball_holder,
+            training_player_ids_jnp,
         )
         jax.block_until_ready(final_out["values"])
         progress.update(1)
@@ -9904,7 +9949,13 @@ def run_train_scaffold(args) -> dict[str, Any]:
         sample_key = jax.random.fold_in(sample_key, idx + 10_000)
         start_ns = perf_counter_ns()
         final_out = runner(
-            params, flat_obs, action_masks, policy_intent_context, sample_key
+            params,
+            flat_obs,
+            action_masks,
+            policy_intent_context,
+            sample_key,
+            state.ball_holder,
+            training_player_ids_jnp,
         )
         jax.block_until_ready(final_out["values"])
         timed_ns += perf_counter_ns() - start_ns
@@ -9979,6 +10030,12 @@ def run_train_scaffold(args) -> dict[str, Any]:
         },
         "env_config": _jax_env_config_from_args(args),
         "policy_spec": asdict(spec),
+        "actor_critic_parameter_count": int(
+            sum(
+                int(np.prod(np.asarray(leaf).shape))
+                for leaf in jax.tree_util.tree_leaves(params)
+            )
+        ),
         "steps_per_update": int(args.kernel_batch_size) * int(args.rollout_horizon),
         "actor_critic_forward_states_per_sec": float(total_states / total_seconds),
         "actor_critic_mean_batch_latency_ms": float(
@@ -10031,6 +10088,9 @@ def run_train_scaffold(args) -> dict[str, Any]:
             ),
             "trajectory_actions_shape": list(
                 np.asarray(rollout_out.trajectory.actions).shape
+            ),
+            "trajectory_action_order_shape": list(
+                np.asarray(rollout_out.trajectory.action_order).shape
             ),
             "trajectory_full_actions_shape": list(
                 np.asarray(rollout_out.trajectory.full_actions).shape

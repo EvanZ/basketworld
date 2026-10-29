@@ -688,7 +688,15 @@ def summarize_learner_rebound_metrics(
 
 def build_jitted_actor_critic_runner(jax, jnp, spec: ActorCriticSpec):
     @jax.jit
-    def _runner(params, flat_obs, action_mask, intent_context, sample_key):
+    def _runner(
+        params,
+        flat_obs,
+        action_mask,
+        intent_context,
+        sample_key,
+        ball_holder,
+        controlled_player_ids,
+    ):
         return run_actor_critic(
             params,
             flat_obs,
@@ -698,6 +706,8 @@ def build_jitted_actor_critic_runner(jax, jnp, spec: ActorCriticSpec):
             jax,
             jnp,
             intent_context=intent_context,
+            ball_holder=ball_holder,
+            controlled_player_ids=controlled_player_ids,
         )
 
     return _runner
@@ -1549,6 +1559,9 @@ def build_compiled_rollout_runner(
                 jnp,
                 intent_context=policy_intent_context,
                 include_rebound_critic=bool(spec.rebound_critic_enabled),
+                ball_holder=policy_state.ball_holder,
+                controlled_player_ids=training_ids,
+                generate_deterministic_actions=False,
             )
             opponent_actions = sample_uniform_legal_actions_jax(
                 opponent_action_mask,
@@ -1645,6 +1658,7 @@ def build_compiled_rollout_runner(
                 ),
                 action_mask=training_action_mask,
                 actions=policy_out["sampled_actions"],
+                action_order=policy_out["action_order"],
                 full_actions=full_actions,
                 opponent_assignment=jnp.full(
                     active_step.shape, -1, dtype=jnp.int32
@@ -1913,6 +1927,7 @@ def build_compiled_frozen_opponent_rollout_runner(
             opponent_action_mask,
             opponent_intent_context,
             opponent_assignment,
+            ball_holder,
             key,
         ):
             safe_assignment = jnp.clip(opponent_assignment, 0, candidate_count - 1)
@@ -1922,7 +1937,15 @@ def build_compiled_frozen_opponent_rollout_runner(
             )
             env_keys = jax.random.split(key, batch_size)
 
-            def _run_one(candidate_params, obs, mask, intent_index, intent_gate, env_key):
+            def _run_one(
+                candidate_params,
+                obs,
+                mask,
+                intent_index,
+                intent_gate,
+                state_ball_holder,
+                env_key,
+            ):
                 out = run_actor_critic(
                     candidate_params,
                     obs[None, :],
@@ -1935,6 +1958,8 @@ def build_compiled_frozen_opponent_rollout_runner(
                         "intent_index": intent_index[None],
                         "intent_gate": intent_gate[None],
                     },
+                    ball_holder=state_ball_holder[None],
+                    controlled_player_ids=opponent_ids,
                 )
                 return out["sampled_actions"][0], out["deterministic_actions"][0]
 
@@ -1944,6 +1969,7 @@ def build_compiled_frozen_opponent_rollout_runner(
                 opponent_action_mask,
                 opponent_intent_context["intent_index"],
                 opponent_intent_context["intent_gate"],
+                ball_holder,
                 env_keys,
             )
 
@@ -2041,6 +2067,9 @@ def build_compiled_frozen_opponent_rollout_runner(
                 jnp,
                 intent_context=policy_intent_context,
                 include_rebound_critic=bool(spec.rebound_critic_enabled),
+                ball_holder=policy_state.ball_holder,
+                controlled_player_ids=training_ids,
+                generate_deterministic_actions=False,
             )
             sampled_candidate_actions, deterministic_candidate_actions = (
                 _sample_candidate_opponent_actions(
@@ -2048,6 +2077,7 @@ def build_compiled_frozen_opponent_rollout_runner(
                     opponent_action_mask,
                     opponent_intent_context,
                     opponent_assignment,
+                    policy_state.ball_holder,
                     opponent_key,
                 )
             )
@@ -2178,6 +2208,7 @@ def build_compiled_frozen_opponent_rollout_runner(
                 ),
                 action_mask=training_action_mask,
                 actions=policy_out["sampled_actions"],
+                action_order=policy_out["action_order"],
                 full_actions=full_actions,
                 opponent_assignment=jnp.where(
                     active_step,
@@ -2491,6 +2522,7 @@ def build_compiled_grouped_opponent_rollout_runner(
             opponent_flat_obs,
             opponent_action_mask,
             opponent_intent_context,
+            ball_holder,
             key,
         ):
             grouped_obs = opponent_flat_obs.reshape(
@@ -2508,9 +2540,17 @@ def build_compiled_grouped_opponent_rollout_runner(
                 name: value.reshape(group_count, group_size)
                 for name, value in opponent_intent_context.items()
             }
+            grouped_ball_holder = ball_holder.reshape(group_count, group_size)
             group_keys = jax.random.split(key, group_count)
 
-            def _run_group(group_params, group_obs, group_mask, group_intent_context, group_key):
+            def _run_group(
+                group_params,
+                group_obs,
+                group_mask,
+                group_intent_context,
+                group_ball_holder,
+                group_key,
+            ):
                 group_out = run_actor_critic(
                     group_params,
                     group_obs,
@@ -2520,6 +2560,8 @@ def build_compiled_grouped_opponent_rollout_runner(
                     jax,
                     jnp,
                     intent_context=group_intent_context,
+                    ball_holder=group_ball_holder,
+                    controlled_player_ids=opponent_ids,
                 )
                 return group_out["sampled_actions"], group_out["deterministic_actions"]
 
@@ -2528,6 +2570,7 @@ def build_compiled_grouped_opponent_rollout_runner(
                 grouped_obs,
                 grouped_mask,
                 grouped_intent_context,
+                grouped_ball_holder,
                 group_keys,
             )
             return (
@@ -2620,11 +2663,15 @@ def build_compiled_grouped_opponent_rollout_runner(
                 jnp,
                 intent_context=policy_intent_context,
                 include_rebound_critic=bool(spec.rebound_critic_enabled),
+                ball_holder=policy_state.ball_holder,
+                controlled_player_ids=training_ids,
+                generate_deterministic_actions=False,
             )
             sampled_opponent_actions, deterministic_opponent_actions = _sample_grouped_opponent_actions(
                 opponent_flat_obs,
                 opponent_action_mask,
                 opponent_intent_context,
+                policy_state.ball_holder,
                 opponent_key,
             )
             opponent_actions = jnp.where(
@@ -2732,6 +2779,7 @@ def build_compiled_grouped_opponent_rollout_runner(
                 ),
                 action_mask=training_action_mask,
                 actions=policy_out["sampled_actions"],
+                action_order=policy_out["action_order"],
                 full_actions=full_actions,
                 opponent_assignment=group_assignment,
                 opponent_deterministic_episode=jnp.where(
@@ -3033,6 +3081,7 @@ def build_compiled_eval_runner(
                 offensive_rebound_boundary,
             ) = carry
             key, opponent_key, env_key = jax.random.split(key, 3)
+            policy_key = jax.random.fold_in(key, 101)
             training_role_flags = build_training_role_flags_batch(static, state, jnp)
             selector_obs = build_policy_observation_batch_with_role_flag(
                 static,
@@ -3072,7 +3121,7 @@ def build_compiled_eval_runner(
             opponent_action_mask = full_action_mask[:, opponent_ids, :]
             policy_intent_context = build_policy_intent_context_batch(static, state, jnp)
 
-            forward_out = actor_critic_forward(
+            policy_out = run_actor_critic(
                 params,
                 build_policy_observation_batch(
                     static,
@@ -3091,16 +3140,14 @@ def build_compiled_eval_runner(
                         int(getattr(spec, "observation_schema_version", 1)) >= 5
                     ),
                 ),
-                spec,
-                jnp,
-                intent_context=policy_intent_context,
-            )
-            masked_out = apply_action_mask(
-                forward_out["flat_policy_logits"],
                 training_action_mask,
                 spec,
+                policy_key,
                 jax,
                 jnp,
+                intent_context=policy_intent_context,
+                ball_holder=state.ball_holder,
+                controlled_player_ids=training_ids,
             )
             opponent_actions = sample_uniform_legal_actions_jax(
                 opponent_action_mask,
@@ -3109,7 +3156,7 @@ def build_compiled_eval_runner(
                 jnp,
             )
             full_actions = assemble_full_actions_jax(
-                masked_out["deterministic_actions"],
+                policy_out["deterministic_actions"],
                 opponent_actions,
                 training_ids,
                 opponent_ids,
@@ -3246,6 +3293,7 @@ def build_compiled_frozen_opponent_eval_runner(
                 offensive_rebound_boundary,
             ) = carry
             key, opponent_key, env_key = jax.random.split(key, 3)
+            policy_key = jax.random.fold_in(key, 101)
             training_role_flags = build_training_role_flags_batch(static, state, jnp)
             training_selector_obs = build_policy_observation_batch_with_role_flag(
                 static,
@@ -3325,7 +3373,7 @@ def build_compiled_frozen_opponent_eval_runner(
                 jnp,
             )
 
-            forward_out = actor_critic_forward(
+            policy_out = run_actor_critic(
                 params,
                 build_policy_observation_batch(
                     static,
@@ -3344,16 +3392,14 @@ def build_compiled_frozen_opponent_eval_runner(
                         int(getattr(spec, "observation_schema_version", 1)) >= 5
                     ),
                 ),
-                spec,
-                jnp,
-                intent_context=policy_intent_context,
-            )
-            masked_out = apply_action_mask(
-                forward_out["flat_policy_logits"],
                 training_action_mask,
                 spec,
+                policy_key,
                 jax,
                 jnp,
+                intent_context=policy_intent_context,
+                ball_holder=state.ball_holder,
+                controlled_player_ids=training_ids,
             )
             opponent_out = run_actor_critic(
                 opponent_params,
@@ -3381,9 +3427,11 @@ def build_compiled_frozen_opponent_eval_runner(
                 jax,
                 jnp,
                 intent_context=opponent_intent_context,
+                ball_holder=state.ball_holder,
+                controlled_player_ids=opponent_ids,
             )
             full_actions = assemble_full_actions_jax(
-                masked_out["deterministic_actions"],
+                policy_out["deterministic_actions"],
                 opponent_out["sampled_actions"],
                 training_ids,
                 opponent_ids,
@@ -3829,6 +3877,8 @@ def build_compiled_historical_match_eval_runner(
                 diagnostics,
             ) = carry
             key, env_key = jax.random.split(key, 2)
+            candidate_key = jax.random.fold_in(key, 101)
+            opponent_key = jax.random.fold_in(key, 202)
 
             candidate_role_flags = build_training_role_flags_batch(static, state, jnp)
             candidate_selector_obs = build_policy_observation_batch_with_role_flag(
@@ -3941,10 +3991,13 @@ def build_compiled_historical_match_eval_runner(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
             )
-            candidate_forward = actor_critic_forward(
+            candidate_out = run_actor_critic(
                 candidate_params,
                 candidate_obs,
+                candidate_action_mask,
                 spec,
+                candidate_key,
+                jax,
                 jnp,
                 intent_context=build_policy_intent_context_batch_with_role_flag(
                     static,
@@ -3952,11 +4005,16 @@ def build_compiled_historical_match_eval_runner(
                     candidate_role_flags,
                     jnp,
                 ),
+                ball_holder=state.ball_holder,
+                controlled_player_ids=candidate_ids,
             )
-            opponent_forward = actor_critic_forward(
+            opponent_out = run_actor_critic(
                 opponent_params,
                 opponent_obs,
+                opponent_action_mask,
                 spec,
+                opponent_key,
+                jax,
                 jnp,
                 intent_context=build_policy_intent_context_batch_with_role_flag(
                     static,
@@ -3964,24 +4022,12 @@ def build_compiled_historical_match_eval_runner(
                     opponent_role_flags,
                     jnp,
                 ),
-            )
-            candidate_masked = apply_action_mask(
-                candidate_forward["flat_policy_logits"],
-                candidate_action_mask,
-                spec,
-                jax,
-                jnp,
-            )
-            opponent_masked = apply_action_mask(
-                opponent_forward["flat_policy_logits"],
-                opponent_action_mask,
-                spec,
-                jax,
-                jnp,
+                ball_holder=state.ball_holder,
+                controlled_player_ids=opponent_ids,
             )
             full_actions = assemble_full_actions_jax(
-                candidate_masked["deterministic_actions"],
-                opponent_masked["deterministic_actions"],
+                candidate_out["deterministic_actions"],
+                opponent_out["deterministic_actions"],
                 candidate_ids,
                 opponent_ids,
                 n_players,
@@ -4121,6 +4167,7 @@ def build_compiled_grouped_opponent_eval_runner(
             opponent_flat_obs,
             opponent_action_mask,
             opponent_intent_context,
+            ball_holder,
             key,
         ):
             grouped_obs = opponent_flat_obs.reshape(
@@ -4138,9 +4185,17 @@ def build_compiled_grouped_opponent_eval_runner(
                 name: value.reshape(group_count, group_size)
                 for name, value in opponent_intent_context.items()
             }
+            grouped_ball_holder = ball_holder.reshape(group_count, group_size)
             group_keys = jax.random.split(key, group_count)
 
-            def _run_group(group_params, group_obs, group_mask, group_intent_context, group_key):
+            def _run_group(
+                group_params,
+                group_obs,
+                group_mask,
+                group_intent_context,
+                group_ball_holder,
+                group_key,
+            ):
                 group_out = run_actor_critic(
                     group_params,
                     group_obs,
@@ -4150,6 +4205,8 @@ def build_compiled_grouped_opponent_eval_runner(
                     jax,
                     jnp,
                     intent_context=group_intent_context,
+                    ball_holder=group_ball_holder,
+                    controlled_player_ids=opponent_ids,
                 )
                 return group_out["sampled_actions"]
 
@@ -4158,6 +4215,7 @@ def build_compiled_grouped_opponent_eval_runner(
                 grouped_obs,
                 grouped_mask,
                 grouped_intent_context,
+                grouped_ball_holder,
                 group_keys,
             )
             return grouped_actions.reshape(
@@ -4251,6 +4309,7 @@ def build_compiled_grouped_opponent_eval_runner(
                 offensive_rebound_boundary,
             ) = carry
             key, opponent_key, env_key = jax.random.split(key, 3)
+            policy_key = jax.random.fold_in(key, 101)
             training_role_flags = build_training_role_flags_batch(static, state, jnp)
             training_selector_obs = build_policy_observation_batch_with_role_flag(
                 static,
@@ -4301,7 +4360,7 @@ def build_compiled_grouped_opponent_eval_runner(
                 jnp,
             )
 
-            forward_out = actor_critic_forward(
+            policy_out = run_actor_critic(
                 params,
                 build_policy_observation_batch(
                     static,
@@ -4320,16 +4379,14 @@ def build_compiled_grouped_opponent_eval_runner(
                         int(getattr(spec, "observation_schema_version", 1)) >= 5
                     ),
                 ),
-                spec,
-                jnp,
-                intent_context=policy_intent_context,
-            )
-            masked_out = apply_action_mask(
-                forward_out["flat_policy_logits"],
                 training_action_mask,
                 spec,
+                policy_key,
                 jax,
                 jnp,
+                intent_context=policy_intent_context,
+                ball_holder=state.ball_holder,
+                controlled_player_ids=training_ids,
             )
             opponent_actions = _sample_grouped_opponent_actions(
                 build_policy_observation_batch_with_role_flag(
@@ -4352,10 +4409,11 @@ def build_compiled_grouped_opponent_eval_runner(
                 ),
                 opponent_action_mask,
                 opponent_intent_context,
+                state.ball_holder,
                 opponent_key,
             )
             full_actions = assemble_full_actions_jax(
-                masked_out["deterministic_actions"],
+                policy_out["deterministic_actions"],
                 opponent_actions,
                 training_ids,
                 opponent_ids,
@@ -4504,6 +4562,8 @@ def build_compiled_deploy_eval_runner(
                 rebound_totals,
             ) = carry
             key, env_key = jax.random.split(key, 2)
+            offense_key = jax.random.fold_in(key, 101)
+            defense_key = jax.random.fold_in(key, 202)
             active_step = ~state.episode_ended.astype(jnp.bool_)
             training_role_flags = build_training_role_flags_batch(static, state, jnp)
             selector_obs = build_policy_observation_batch_with_role_flag(
@@ -4604,17 +4664,25 @@ def build_compiled_deploy_eval_runner(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
                 ),
             )
-            offense_forward = actor_critic_forward(
+            offense_out = run_actor_critic(
                 params,
                 offense_obs,
+                offense_action_mask,
                 spec,
+                offense_key,
+                jax,
                 jnp,
                 intent_context=build_policy_intent_context_batch(static, state, jnp),
+                ball_holder=state.ball_holder,
+                controlled_player_ids=offense_ids,
             )
-            defense_forward = actor_critic_forward(
+            defense_out = run_actor_critic(
                 params,
                 defense_obs,
+                defense_action_mask,
                 spec,
+                defense_key,
+                jax,
                 jnp,
                 intent_context=build_policy_intent_context_batch_with_role_flag(
                     static,
@@ -4622,24 +4690,12 @@ def build_compiled_deploy_eval_runner(
                     build_opponent_role_flags_batch(static, state, jnp),
                     jnp,
                 ),
-            )
-            offense_masked = apply_action_mask(
-                offense_forward["flat_policy_logits"],
-                offense_action_mask,
-                spec,
-                jax,
-                jnp,
-            )
-            defense_masked = apply_action_mask(
-                defense_forward["flat_policy_logits"],
-                defense_action_mask,
-                spec,
-                jax,
-                jnp,
+                ball_holder=state.ball_holder,
+                controlled_player_ids=defense_ids,
             )
             full_actions = assemble_full_actions_jax(
-                offense_masked["deterministic_actions"],
-                defense_masked["deterministic_actions"],
+                offense_out["deterministic_actions"],
+                defense_out["deterministic_actions"],
                 offense_ids,
                 defense_ids,
                 n_players,
@@ -5391,6 +5447,8 @@ def build_jitted_ppo_update_runner(jax, jnp, spec: ActorCriticSpec, trainer_conf
                 "intent_gate": batch.policy_intent_gate,
             },
             include_rebound_critic=bool(spec.rebound_critic_enabled),
+            action_order=batch.action_order,
+            teacher_actions=batch.actions,
         )
         masked_out = apply_action_mask(
             forward_out["flat_policy_logits"],

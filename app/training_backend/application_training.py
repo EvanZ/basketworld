@@ -79,6 +79,9 @@ JAX_INAPPLICABLE_FIELDS = frozenset(
 # instead of inheriting defaults by executing a user-facing shell script.
 APPLICATION_PRESET_VALUES: dict[str, Any] = {
     "action_head_mode": "pointer_targeted",
+    "team_action_mode": "independent",
+    "offense_action_order": "random",
+    "defense_action_order": "random",
     "base_passer_risk": 0.02,
     "base_receiver_risk": 0.5,
     "base_steal_rate": 0.2,

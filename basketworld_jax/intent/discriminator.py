@@ -752,7 +752,7 @@ def build_intent_policy_sensitivity_runner(jax, jnp, policy_spec, *, sample_coun
     pair_j = jnp.asarray(pair_j, dtype=jnp.int32)
     pair_count = int(len(pair_i))
 
-    def _runner(params, flat_obs, action_mask, active_mask):
+    def _runner(params, flat_obs, action_mask, active_mask, action_order, actions):
         flat_active = active_mask.reshape(-1).astype(jnp.bool_)
         valid_count = jnp.minimum(
             jnp.sum(flat_active.astype(jnp.int32)),
@@ -766,6 +766,8 @@ def build_intent_policy_sensitivity_runner(jax, jnp, policy_spec, *, sample_coun
             player_count,
             int(policy_spec.action_dim_per_player),
         )[indices]
+        sample_action_order = action_order.reshape(-1, player_count)[indices]
+        sample_actions = actions.reshape(-1, player_count)[indices]
 
         if pair_count == 0:
             zero = jnp.asarray(0.0, dtype=jnp.float32)
@@ -792,6 +794,8 @@ def build_intent_policy_sensitivity_runner(jax, jnp, policy_spec, *, sample_coun
                     ),
                     "intent_gate": jnp.ones((count,), dtype=jnp.float32),
                 },
+                action_order=sample_action_order,
+                teacher_actions=sample_actions,
             )
             return apply_action_mask(
                 out["flat_policy_logits"],

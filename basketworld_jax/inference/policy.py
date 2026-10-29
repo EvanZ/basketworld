@@ -25,8 +25,10 @@ from basketworld_jax.env.minimal import (
 )
 from basketworld_jax.models import (
     ActorCriticSpec,
+    TEAM_ACTION_MODE_AUTOREGRESSIVE,
     actor_critic_forward,
     apply_action_mask,
+    run_actor_critic,
 )
 from basketworld_jax.train.cli import ensure_jax_available
 
@@ -196,6 +198,7 @@ class JAXInferenceModel:
         self._static_cache: dict[bool, Any] = {}
         self._last_team_outputs: dict[str, Any] | None = None
         self._masked_runner = self._build_masked_runner()
+        self._autoregressive_runner = self._build_autoregressive_runner()
         self._selector_runner = self._build_selector_runner()
 
     def _build_masked_runner(self):
@@ -220,6 +223,32 @@ class JAXInferenceModel:
                 "attention_weights": forward_out["attention_weights"],
                 "values": forward_out["values"],
             }
+
+        return _runner
+
+    def _build_autoregressive_runner(self):
+        @self.jax.jit
+        def _runner(
+            params,
+            flat_obs,
+            team_action_mask,
+            intent_context,
+            sample_key,
+            ball_holder,
+            team_ids,
+        ):
+            return run_actor_critic(
+                params,
+                flat_obs,
+                team_action_mask,
+                self.spec,
+                sample_key,
+                self.jax,
+                self.jnp,
+                intent_context=intent_context,
+                ball_holder=ball_holder,
+                controlled_player_ids=team_ids,
+            )
 
         return _runner
 
@@ -331,10 +360,20 @@ class JAXInferenceModel:
         """Prepare inference directly from a JAX state snapshot mapping."""
         self.prepare_for_role(dict(snapshot), observer_is_offense=observer_is_offense)
 
-    def _team_outputs(self, env, observer_is_offense: bool):
+    def _team_outputs(
+        self,
+        env,
+        observer_is_offense: bool,
+        *,
+        force_autoregressive_refresh: bool = False,
+    ):
         snapshot = self._snapshot_from_source(env)
         cache_key = self._snapshot_cache_key(env, observer_is_offense, snapshot)
-        if self._last_team_outputs is not None and self._last_team_outputs.get("key") == cache_key:
+        if (
+            not force_autoregressive_refresh
+            and self._last_team_outputs is not None
+            and self._last_team_outputs.get("key") == cache_key
+        ):
             return self._last_team_outputs["masked_out"]
 
         static = self._build_static_for_role(observer_is_offense)
@@ -364,12 +403,24 @@ class JAXInferenceModel:
         team_ids = static.offense_ids if bool(observer_is_offense) else static.defense_ids
         team_action_mask = self.jnp.take(full_action_mask, team_ids, axis=1)
         intent_context = build_policy_intent_context_batch(static, state, self.jnp)
-        masked_out = self._masked_runner(
-            self.params,
-            flat_obs,
-            team_action_mask,
-            intent_context,
-        )
+        if str(getattr(self.spec, "team_action_mode", "independent")) == TEAM_ACTION_MODE_AUTOREGRESSIVE:
+            self._sample_key, sample_key = self.jax.random.split(self._sample_key)
+            masked_out = self._autoregressive_runner(
+                self.params,
+                flat_obs,
+                team_action_mask,
+                intent_context,
+                sample_key,
+                state.ball_holder,
+                team_ids,
+            )
+        else:
+            masked_out = self._masked_runner(
+                self.params,
+                flat_obs,
+                team_action_mask,
+                intent_context,
+            )
         self._last_team_outputs = {
             "key": cache_key,
             "masked_out": masked_out,
@@ -480,12 +531,29 @@ class JAXInferenceModel:
         if self._prepared_env is None:
             raise RuntimeError("JAXInferenceModel.predict called before prepare_for_role.")
 
+        autoregressive = (
+            str(getattr(self.spec, "team_action_mode", "independent"))
+            == TEAM_ACTION_MODE_AUTOREGRESSIVE
+        )
         masked_out = self._team_outputs(
             self._prepared_env,
             self._prepared_observer_is_offense,
+            force_autoregressive_refresh=autoregressive,
         )
         if deterministic:
             actions = masked_out["deterministic_actions"]
+            if autoregressive:
+                masked_out = {
+                    **masked_out,
+                    "masked_logits": masked_out["deterministic_masked_logits"],
+                    "log_probs": masked_out["deterministic_log_probs"],
+                    "probs": masked_out["deterministic_probs"],
+                    "entropy": masked_out["deterministic_entropy"],
+                }
+                if self._last_team_outputs is not None:
+                    self._last_team_outputs["masked_out"] = masked_out
+        elif autoregressive:
+            actions = masked_out["sampled_actions"]
         else:
             self._sample_key, sample_key = self.jax.random.split(self._sample_key)
             actions = self.jax.random.categorical(

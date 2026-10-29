@@ -1,15 +1,46 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import numpy as np
 import pytest
 
+from basketworld_jax.checkpoints import (
+    build_checkpoint_payload,
+    load_checkpoint,
+    save_checkpoint,
+)
 from basketworld_jax.models.actor_critic import (
     ActorCriticSpec,
     actor_critic_forward,
     apply_action_mask,
+    build_team_action_order,
     init_actor_critic_params,
     run_actor_critic,
+    sample_actions,
 )
+
+
+def _autoregressive_attention_spec(**overrides):
+    values = {
+        "flat_obs_dim": 95,
+        "training_player_count": 3,
+        "action_dim_per_player": 14,
+        "total_action_dim": 42,
+        "hidden_dims": (8,),
+        "model_type": "attention",
+        "token_player_count": 6,
+        "token_dim": 15,
+        "global_dim": 4,
+        "attention_embed_dim": 16,
+        "attention_num_heads": 4,
+        "attention_token_mlp_dim": 12,
+        "attention_num_cls_tokens": 2,
+        "team_action_mode": "autoregressive",
+        "offense_action_order": "random",
+        "defense_action_order": "random",
+    }
+    values.update(overrides)
+    return ActorCriticSpec(**values)
 
 
 def test_actor_critic_forward_shapes():
@@ -42,6 +73,32 @@ def test_actor_critic_forward_shapes():
     assert out["selected_log_probs"].shape == (4, 2)
     assert out["values"].shape == (4,)
     assert out["attention_weights"].shape == (4, 0, 0, 0)
+
+
+def test_independent_mode_keeps_existing_sampling_key_and_canonical_storage_order():
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    spec = ActorCriticSpec(5, 2, 3, 6, (8,))
+    params = init_actor_critic_params(jax, jnp, spec, seed=2)
+    flat_obs = jnp.ones((4, 5), dtype=jnp.float32)
+    action_mask = jnp.ones((4, 2, 3), dtype=jnp.int8)
+    sample_key = jax.random.PRNGKey(9)
+    out = run_actor_critic(
+        params, flat_obs, action_mask, spec, sample_key, jax, jnp
+    )
+    forward = actor_critic_forward(params, flat_obs, spec, jnp)
+    masked = apply_action_mask(
+        forward["flat_policy_logits"], action_mask, spec, jax, jnp
+    )
+    expected_actions, expected_log_probs = sample_actions(
+        masked["masked_logits"], sample_key, jax, jnp
+    )
+    np.testing.assert_array_equal(np.asarray(out["sampled_actions"]), np.asarray(expected_actions))
+    np.testing.assert_allclose(np.asarray(out["selected_log_probs"]), np.asarray(expected_log_probs))
+    np.testing.assert_array_equal(
+        np.asarray(out["action_order"]),
+        np.asarray([[0, 1], [0, 1], [0, 1], [0, 1]], dtype=np.int32),
+    )
 
 
 def test_rebound_critic_head_is_opt_in_and_initialized_for_training():
@@ -133,6 +190,166 @@ def test_attention_actor_critic_forward_shapes():
         np.ones((4, 4, 8), dtype=np.float32),
         atol=1e-5,
     )
+
+
+def test_autoregressive_decoder_is_causal_and_teacher_forced_log_probs_match_rollout():
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    spec = _autoregressive_attention_spec(
+        offense_action_order="canonical",
+        defense_action_order="canonical",
+    )
+    params = init_actor_critic_params(jax, jnp, spec, seed=7)
+    flat_obs = jnp.ones((2, 95), dtype=jnp.float32).at[:, -1].set(1.0)
+    action_mask = jnp.ones((2, 3, 14), dtype=jnp.int8)
+    action_mask = action_mask.at[:, 2, :].set(0)
+    action_mask = action_mask.at[:, 2, 5].set(1)
+    order = jnp.broadcast_to(jnp.arange(3, dtype=jnp.int32)[None, :], (2, 3))
+    actions_a = jnp.zeros((2, 3), dtype=jnp.int32)
+    actions_b = actions_a.at[:, 0].set(1)
+    forward_a = actor_critic_forward(
+        params,
+        flat_obs,
+        spec,
+        jnp,
+        action_order=order,
+        teacher_actions=actions_a,
+    )
+    forward_b = actor_critic_forward(
+        params,
+        flat_obs,
+        spec,
+        jnp,
+        action_order=order,
+        teacher_actions=actions_b,
+    )
+    logits_a = np.asarray(forward_a["flat_policy_logits"]).reshape(2, 3, 14)
+    logits_b = np.asarray(forward_b["flat_policy_logits"]).reshape(2, 3, 14)
+    np.testing.assert_allclose(logits_a[:, 0], logits_b[:, 0], atol=1e-6)
+    assert not np.allclose(logits_a[:, 1], logits_b[:, 1])
+
+    rollout = run_actor_critic(
+        params,
+        flat_obs,
+        action_mask,
+        spec,
+        jax.random.PRNGKey(11),
+        jax,
+        jnp,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(rollout["sampled_actions"][:, 2]), np.asarray([5, 5])
+    )
+    teacher_forced = actor_critic_forward(
+        params,
+        flat_obs,
+        spec,
+        jnp,
+        action_order=rollout["action_order"],
+        teacher_actions=rollout["sampled_actions"],
+    )
+    masked = apply_action_mask(
+        teacher_forced["flat_policy_logits"], action_mask, spec, jax, jnp
+    )
+    selected = jnp.take_along_axis(
+        masked["log_probs"], rollout["sampled_actions"][..., None], axis=-1
+    )[..., 0]
+    np.testing.assert_allclose(
+        np.asarray(selected), np.asarray(rollout["selected_log_probs"]), atol=1e-6
+    )
+    ratio = jnp.exp(
+        jnp.sum(selected - rollout["selected_log_probs"], axis=-1)
+    )
+    np.testing.assert_allclose(np.asarray(ratio), np.ones((2,), dtype=np.float32))
+
+
+def test_ball_handler_last_order_moves_only_offense_holder_to_final_slot():
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    spec = _autoregressive_attention_spec(offense_action_order="ball_handler_last")
+    flat_obs = jnp.ones((3, 95), dtype=jnp.float32)
+    flat_obs = flat_obs.at[0, -1].set(1.0)
+    flat_obs = flat_obs.at[1, -1].set(1.0)
+    flat_obs = flat_obs.at[2, -1].set(-1.0)
+    order_key = jax.random.PRNGKey(13)
+    order = build_team_action_order(
+        flat_obs,
+        spec,
+        order_key,
+        jax,
+        jnp,
+        ball_holder=jnp.asarray([1, -1, 4], dtype=jnp.int32),
+        controlled_player_ids=jnp.asarray([0, 1, 2], dtype=jnp.int32),
+    )
+    random_order = build_team_action_order(
+        flat_obs,
+        _autoregressive_attention_spec(),
+        order_key,
+        jax,
+        jnp,
+        ball_holder=jnp.asarray([1, -1, 4], dtype=jnp.int32),
+        controlled_player_ids=jnp.asarray([0, 1, 2], dtype=jnp.int32),
+    )
+    order_np = np.asarray(order, dtype=np.int32)
+    assert order_np[0, -1] == 1
+    np.testing.assert_array_equal(order_np[1], np.asarray(random_order)[1])
+    np.testing.assert_array_equal(
+        np.sort(order_np, axis=1),
+        np.asarray([[0, 1, 2], [0, 1, 2], [0, 1, 2]]),
+    )
+
+
+def test_autoregressive_pointer_head_preserves_canonical_pass_target_slots():
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    spec = _autoregressive_attention_spec(action_head_mode="pointer_targeted")
+    params = init_actor_critic_params(jax, jnp, spec, seed=19)
+    flat_obs = jnp.ones((1, 95), dtype=jnp.float32).at[:, -1].set(1.0)
+    out = actor_critic_forward(
+        params,
+        flat_obs,
+        spec,
+        jnp,
+        action_order=jnp.asarray([[2, 0, 1]], dtype=jnp.int32),
+        teacher_actions=jnp.asarray([[8, 3, 9]], dtype=jnp.int32),
+    )
+    pass_logits = np.asarray(out["pass_target_logits"])
+    assert pass_logits.shape == (1, 3, 6)
+    assert np.isfinite(pass_logits[..., :2]).all()
+    assert np.all(pass_logits[..., 2:] < -1.0e8)
+
+
+def test_autoregressive_checkpoint_round_trip_preserves_decoder_metadata_and_params(tmp_path):
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    spec = _autoregressive_attention_spec(
+        offense_action_order="ball_handler_last",
+        defense_action_order="canonical",
+    )
+    params = init_actor_critic_params(jax, jnp, spec, seed=23)
+    payload = build_checkpoint_payload(
+        update_index=3,
+        trainer_config={},
+        policy_spec=asdict(spec),
+        frozen_config={},
+        params=params,
+        opt_state={"count": np.asarray(0, dtype=np.int32)},
+        current_state={"marker": np.asarray([1], dtype=np.int32)},
+        eval_initial_state={"marker": np.asarray([2], dtype=np.int32)},
+        base_key=np.asarray(jax.random.PRNGKey(5)),
+        eval_trajectories=[],
+        last_metrics={},
+        resolved_training_config={
+            "team_action_mode": "autoregressive",
+            "offense_action_order": "ball_handler_last",
+            "defense_action_order": "canonical",
+        },
+    )
+    checkpoint_path = save_checkpoint(tmp_path / "checkpoint", payload)
+    restored = load_checkpoint(checkpoint_path)
+    assert ActorCriticSpec(**restored["policy_spec"]) == spec
+    assert restored["resolved_training_config"]["team_action_mode"] == "autoregressive"
+    assert "team_action_embedding" in restored["params"]
 
 
 def test_single_attention_layer_keeps_legacy_parameter_names():

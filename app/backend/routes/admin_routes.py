@@ -943,7 +943,7 @@ def _run_jax_playbook_batch(
             build_policy_observation_batch_with_role_flag,
             step_batch_minimal,
         )
-        from basketworld_jax.models import actor_critic_forward, apply_action_mask
+        from basketworld_jax.models import actor_critic_forward, run_actor_critic
 
         def _build_runner():
             def _runner(
@@ -965,28 +965,31 @@ def _run_jax_playbook_batch(
                 offense_ids_arg = static_arg.offense_ids.astype(jnp.int32)
                 defense_ids_arg = static_arg.defense_ids.astype(jnp.int32)
 
-                def _team_actions(params_arg, flat_obs_arg, action_mask_arg, intent_context_arg, key_arg, deterministic_arg: bool):
-                    forward_out = actor_critic_forward(
+                def _team_actions(
+                    params_arg,
+                    flat_obs_arg,
+                    action_mask_arg,
+                    intent_context_arg,
+                    controlled_player_ids_arg,
+                    ball_holder_arg,
+                    key_arg,
+                    deterministic_arg: bool,
+                ):
+                    policy_out = run_actor_critic(
                         params_arg,
                         flat_obs_arg,
-                        spec,
-                        jnp,
-                        intent_context=intent_context_arg,
-                    )
-                    masked_out = apply_action_mask(
-                        forward_out["flat_policy_logits"],
                         action_mask_arg,
                         spec,
+                        key_arg,
                         jax,
                         jnp,
+                        intent_context=intent_context_arg,
+                        ball_holder=ball_holder_arg,
+                        controlled_player_ids=controlled_player_ids_arg,
                     )
                     if deterministic_arg:
-                        return masked_out["deterministic_actions"]
-                    return jax.random.categorical(
-                        key_arg,
-                        masked_out["masked_logits"],
-                        axis=-1,
-                    ).astype(jnp.int32)
+                        return policy_out["deterministic_actions"]
+                    return policy_out["sampled_actions"]
 
                 def _scan_step(carry, _):
                     (
@@ -1154,6 +1157,8 @@ def _run_jax_playbook_batch(
                         offense_obs,
                         offense_mask,
                         offense_context,
+                        offense_ids_arg,
+                        state_for_action.ball_holder,
                         offense_key,
                         offense_deterministic_arg,
                     )
@@ -1162,6 +1167,8 @@ def _run_jax_playbook_batch(
                         defense_obs,
                         defense_mask,
                         defense_context,
+                        defense_ids_arg,
+                        state_for_action.ball_holder,
                         defense_key,
                         defense_deterministic_arg,
                     )

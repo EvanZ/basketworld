@@ -33,6 +33,7 @@ class TrajectoryBatch(NamedTuple):
     training_role: Any
     action_mask: Any
     actions: Any
+    action_order: Any
     full_actions: Any
     opponent_assignment: Any
     opponent_deterministic_episode: Any
@@ -185,6 +186,7 @@ class PPOBatch(NamedTuple):
     policy_intent_gate: Any
     action_mask: Any
     actions: Any
+    action_order: Any
     old_selected_log_probs: Any
     old_values: Any
     advantages: Any
@@ -650,6 +652,10 @@ def build_ppo_batch(
         actions=rollout.trajectory.actions.reshape(
             -1,
             int(rollout.trajectory.actions.shape[-1]),
+        ),
+        action_order=rollout.trajectory.action_order.reshape(
+            -1,
+            int(rollout.trajectory.action_order.shape[-1]),
         ),
         old_selected_log_probs=rollout.trajectory.selected_log_probs.reshape(
             -1,

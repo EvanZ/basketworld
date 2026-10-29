@@ -676,6 +676,14 @@ def test_native_cross_play_accepts_known_additive_observation_width_changes():
     assert _compatible_native_cross_play_specs(v3, v4)
     assert _compatible_native_cross_play_specs(v3, v2)
     assert _compatible_native_cross_play_specs(v2, v3)
+    autoregressive = replace(
+        v4,
+        team_action_mode="autoregressive",
+        offense_action_order="ball_handler_last",
+        defense_action_order="random",
+    )
+    assert _compatible_native_cross_play_specs(v4, autoregressive)
+    assert _compatible_native_cross_play_specs(autoregressive, v4)
     assert not _compatible_native_cross_play_specs(
         v4,
         replace(v2, action_dim_per_player=13),

@@ -45,10 +45,13 @@ const defaultConfig = () => ({
 
 const PIN_STORAGE_KEY = 'basketworld.training.pinned-configs.v1'
 const PIN_MIGRATION_KEY = 'basketworld.training.pinned-configs.migration.v1'
-const PIN_MIGRATION_VERSION = 'attention-layers-v5'
+const PIN_MIGRATION_VERSION = 'autoregressive-team-actions-v6'
 const MIGRATED_PINNED_FIELDS = [
   'entropy_decay_updates',
   'attention_num_layers',
+  'team_action_mode',
+  'offense_action_order',
+  'defense_action_order',
   'shot_contest_skill_mean',
   'shot_contest_skill_std',
   'shot_contest_skill_effect_weight',
@@ -77,6 +80,9 @@ const DEFAULT_PINNED_FIELDS = [
   'shot_contest_skill_effect_weight',
   'policy_seed',
   'attention_num_layers',
+  'team_action_mode',
+  'offense_action_order',
+  'defense_action_order',
   'multi_possession_limit_start',
   'multi_possession_limit_end',
   'multi_possession_limit_ramp_updates',
@@ -557,6 +563,9 @@ function fieldLabel(field) {
     num_updates: 'Updates',
     policy_seed: 'Policy seed',
     attention_num_layers: 'Attention layers',
+    team_action_mode: 'Team action mode',
+    offense_action_order: 'Offense action order',
+    defense_action_order: 'Defense action order',
     multi_possession_limit_start: 'Start possessions',
     multi_possession_limit_end: 'Final possessions',
     multi_possession_limit_ramp_updates: 'Curriculum updates',

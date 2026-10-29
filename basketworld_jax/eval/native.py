@@ -59,6 +59,7 @@ from basketworld_jax.models import (
     ActorCriticSpec,
     actor_critic_forward,
     apply_action_mask,
+    run_actor_critic,
 )
 from basketworld_jax.train.cli import ensure_jax_available
 from basketworld_jax.eval.fixed_pool import PlayerPool
@@ -115,8 +116,21 @@ def _compatible_native_cross_play_specs(
     first: ActorCriticSpec,
     second: ActorCriticSpec,
 ) -> bool:
-    """Allow intentional multi-possession skill-schema width differences."""
+    """Allow compatible decoder modes and known additive observation schemas."""
     if first == second:
+        return True
+    action_decoder_fields = {
+        "team_action_mode",
+        "offense_action_order",
+        "defense_action_order",
+    }
+    first_without_decoder = {
+        key: value for key, value in vars(first).items() if key not in action_decoder_fields
+    }
+    second_without_decoder = {
+        key: value for key, value in vars(second).items() if key not in action_decoder_fields
+    }
+    if first_without_decoder == second_without_decoder:
         return True
     first_schema = int(getattr(first, "observation_schema_version", 1))
     second_schema = int(getattr(second, "observation_schema_version", 1))
@@ -131,7 +145,12 @@ def _compatible_native_cross_play_specs(
         return False
     first_fields = dict(vars(first))
     second_fields = dict(vars(second))
-    for key in ("flat_obs_dim", "token_dim", "observation_schema_version"):
+    for key in (
+        "flat_obs_dim",
+        "token_dim",
+        "observation_schema_version",
+        *action_decoder_fields,
+    ):
         first_fields.pop(key, None)
         second_fields.pop(key, None)
     if first_fields != second_fields:
@@ -1060,40 +1079,96 @@ def _build_native_eval_runner(
             flat_obs,
             action_mask,
             intent_context,
+            controlled_player_ids,
+            ball_holder,
             key,
             deterministic: bool,
         ):
-            forward_out = actor_critic_forward(
-                params,
-                flat_obs,
-                policy_spec,
-                jnp,
-                intent_context=intent_context,
-            )
-            masked_out = apply_action_mask(
-                forward_out["flat_policy_logits"],
-                action_mask,
-                policy_spec,
-                jax,
-                jnp,
-            )
-            if deterministic:
-                actions = masked_out["deterministic_actions"]
-            elif fixed_pool_rng_streams:
-                actions = jax.vmap(
-                    lambda row_key, row_logits: jax.random.categorical(
-                        row_key,
-                        row_logits,
+            if str(getattr(policy_spec, "team_action_mode", "independent")) == "independent":
+                forward_out = actor_critic_forward(
+                    params,
+                    flat_obs,
+                    policy_spec,
+                    jnp,
+                    intent_context=intent_context,
+                )
+                masked_out = apply_action_mask(
+                    forward_out["flat_policy_logits"],
+                    action_mask,
+                    policy_spec,
+                    jax,
+                    jnp,
+                )
+                if deterministic:
+                    actions = masked_out["deterministic_actions"]
+                elif fixed_pool_rng_streams:
+                    actions = jax.vmap(
+                        lambda row_key, row_logits: jax.random.categorical(
+                            row_key,
+                            row_logits,
+                            axis=-1,
+                        ).astype(jnp.int32)
+                    )(key, masked_out["masked_logits"])
+                else:
+                    actions = jax.random.categorical(
+                        key,
+                        masked_out["masked_logits"],
                         axis=-1,
                     ).astype(jnp.int32)
-                )(key, masked_out["masked_logits"])
-            else:
-                actions = jax.random.categorical(
+                return actions, forward_out["values"].astype(jnp.float32)
+
+            if fixed_pool_rng_streams:
+                def _run_one(obs, mask, intent_index, intent_gate, holder, row_key):
+                    out = run_actor_critic(
+                        params,
+                        obs[None, :],
+                        mask[None, :, :],
+                        policy_spec,
+                        row_key,
+                        jax,
+                        jnp,
+                        intent_context={
+                            "intent_index": intent_index[None],
+                            "intent_gate": intent_gate[None],
+                        },
+                        ball_holder=holder[None],
+                        controlled_player_ids=controlled_player_ids,
+                    )
+                    selected = (
+                        out["deterministic_actions"]
+                        if deterministic
+                        else out["sampled_actions"]
+                    )
+                    return selected[0], out["values"][0]
+
+                actions, values = jax.vmap(_run_one)(
+                    flat_obs,
+                    action_mask,
+                    intent_context["intent_index"],
+                    intent_context["intent_gate"],
+                    ball_holder,
                     key,
-                    masked_out["masked_logits"],
-                    axis=-1,
-                ).astype(jnp.int32)
-            return actions, forward_out["values"].astype(jnp.float32)
+                )
+            else:
+                out = run_actor_critic(
+                    params,
+                    flat_obs,
+                    action_mask,
+                    policy_spec,
+                    key,
+                    jax,
+                    jnp,
+                    intent_context=intent_context,
+                    ball_holder=ball_holder,
+                    controlled_player_ids=controlled_player_ids,
+                )
+                actions = (
+                    out["deterministic_actions"]
+                    if deterministic
+                    else out["sampled_actions"]
+                )
+                values = out["values"]
+            return actions, values.astype(jnp.float32)
 
         def _zero_selector_trace(state):
             batch_shape = state.intent_index.shape
@@ -1424,6 +1499,8 @@ def _build_native_eval_runner(
                 team_a_obs,
                 team_a_mask,
                 team_a_intent_context,
+                offense_ids,
+                policy_state.ball_holder,
                 offense_key,
                 offense_deterministic,
             )
@@ -1433,6 +1510,8 @@ def _build_native_eval_runner(
                 team_b_obs,
                 team_b_mask,
                 team_b_intent_context,
+                defense_ids,
+                policy_state.ball_holder,
                 defense_key,
                 defense_deterministic,
             )

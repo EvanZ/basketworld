@@ -1584,14 +1584,40 @@ class JaxDevRuntime:
             role_flag,
             self.jnp,
         )
-        masked_out = raw._masked_runner(
-            raw.params,
-            flat_obs,
-            team_action_mask,
-            intent_context,
+        autoregressive = (
+            str(getattr(raw.spec, "team_action_mode", "independent"))
+            == "autoregressive"
         )
+        if autoregressive:
+            raw._sample_key, sample_key = raw.jax.random.split(raw._sample_key)
+            masked_out = raw._autoregressive_runner(
+                raw.params,
+                flat_obs,
+                team_action_mask,
+                intent_context,
+                sample_key,
+                self.state.ball_holder,
+                team_ids_device,
+            )
+        else:
+            masked_out = raw._masked_runner(
+                raw.params,
+                flat_obs,
+                team_action_mask,
+                intent_context,
+            )
         if deterministic:
             team_actions_device = masked_out["deterministic_actions"]
+            if autoregressive:
+                masked_out = {
+                    **masked_out,
+                    "masked_logits": masked_out["deterministic_masked_logits"],
+                    "log_probs": masked_out["deterministic_log_probs"],
+                    "probs": masked_out["deterministic_probs"],
+                    "entropy": masked_out["deterministic_entropy"],
+                }
+        elif autoregressive:
+            team_actions_device = masked_out["sampled_actions"]
         else:
             raw._sample_key, sample_key = raw.jax.random.split(raw._sample_key)
             team_actions_device = raw.jax.random.categorical(

@@ -12,6 +12,11 @@ PASS_ACTION_START = 8
 PASS_ACTION_END = 14
 ACTION_HEAD_MODE_FLAT = "flat"
 ACTION_HEAD_MODE_POINTER_TARGETED = "pointer_targeted"
+TEAM_ACTION_MODE_INDEPENDENT = "independent"
+TEAM_ACTION_MODE_AUTOREGRESSIVE = "autoregressive"
+TEAM_ACTION_ORDER_RANDOM = "random"
+TEAM_ACTION_ORDER_BALL_HANDLER_LAST = "ball_handler_last"
+TEAM_ACTION_ORDER_CANONICAL = "canonical"
 
 
 @dataclass(frozen=True)
@@ -34,6 +39,9 @@ class ActorCriticSpec:
     attention_vf_head_hidden_dims: tuple[int, ...] = ()
     attention_head_activation: str = "tanh"
     action_head_mode: str = ACTION_HEAD_MODE_FLAT
+    team_action_mode: str = TEAM_ACTION_MODE_INDEPENDENT
+    offense_action_order: str = TEAM_ACTION_ORDER_RANDOM
+    defense_action_order: str = TEAM_ACTION_ORDER_RANDOM
     pass_action_start: int = PASS_ACTION_START
     pass_action_end: int = PASS_ACTION_END
     intent_embedding_enabled: bool = False
@@ -67,6 +75,9 @@ def build_actor_critic_spec(
     attention_vf_head_hidden_dims: Sequence[int] = (),
     attention_head_activation: str = "tanh",
     action_head_mode: str = ACTION_HEAD_MODE_FLAT,
+    team_action_mode: str = TEAM_ACTION_MODE_INDEPENDENT,
+    offense_action_order: str = TEAM_ACTION_ORDER_RANDOM,
+    defense_action_order: str = TEAM_ACTION_ORDER_RANDOM,
     pass_action_start: int = PASS_ACTION_START,
     pass_action_end: int = PASS_ACTION_END,
     intent_embedding_enabled: bool = False,
@@ -94,12 +105,34 @@ def build_actor_critic_spec(
     action_dim_per_player = int(action_mask_batch.shape[2])
     normalized_model_type = str(model_type).lower()
     normalized_action_head_mode = str(action_head_mode).lower()
+    normalized_team_action_mode = str(team_action_mode).lower()
+    normalized_offense_action_order = str(offense_action_order).lower()
+    normalized_defense_action_order = str(defense_action_order).lower()
     if normalized_model_type not in {"mlp", "attention"}:
         raise ValueError(f"Unsupported JAX policy model type {model_type!r}.")
     if normalized_action_head_mode not in {ACTION_HEAD_MODE_FLAT, ACTION_HEAD_MODE_POINTER_TARGETED}:
         raise ValueError(f"Unsupported JAX action head mode {action_head_mode!r}.")
     if normalized_action_head_mode == ACTION_HEAD_MODE_POINTER_TARGETED and normalized_model_type != "attention":
         raise ValueError("Pointer-targeted JAX action head currently requires --policy-model attention.")
+    if normalized_team_action_mode not in {
+        TEAM_ACTION_MODE_INDEPENDENT,
+        TEAM_ACTION_MODE_AUTOREGRESSIVE,
+    }:
+        raise ValueError(f"Unsupported JAX team action mode {team_action_mode!r}.")
+    valid_action_orders = {
+        TEAM_ACTION_ORDER_RANDOM,
+        TEAM_ACTION_ORDER_BALL_HANDLER_LAST,
+        TEAM_ACTION_ORDER_CANONICAL,
+    }
+    if normalized_offense_action_order not in valid_action_orders:
+        raise ValueError(f"Unsupported JAX offense action order {offense_action_order!r}.")
+    if normalized_defense_action_order not in {
+        TEAM_ACTION_ORDER_RANDOM,
+        TEAM_ACTION_ORDER_CANONICAL,
+    }:
+        raise ValueError(f"Unsupported JAX defense action order {defense_action_order!r}.")
+    if normalized_team_action_mode == TEAM_ACTION_MODE_AUTOREGRESSIVE and normalized_model_type != "attention":
+        raise ValueError("Autoregressive JAX team actions require --policy-model attention.")
     intent_embedding_enabled = bool(intent_embedding_enabled)
     intent_embedding_dim = int(intent_embedding_dim)
     intent_conditioning_scale = float(intent_conditioning_scale)
@@ -164,6 +197,9 @@ def build_actor_critic_spec(
         attention_vf_head_hidden_dims=tuple(int(v) for v in attention_vf_head_hidden_dims),
         attention_head_activation=str(attention_head_activation).lower(),
         action_head_mode=normalized_action_head_mode,
+        team_action_mode=normalized_team_action_mode,
+        offense_action_order=normalized_offense_action_order,
+        defense_action_order=normalized_defense_action_order,
         pass_action_start=int(pass_action_start),
         pass_action_end=int(pass_action_end),
         intent_embedding_enabled=bool(intent_embedding_enabled),
@@ -480,32 +516,38 @@ def build_actor_critic_module(spec: ActorCriticSpec):
                 )
             return flat.reshape(batch_size, int(spec.total_action_dim))
 
-        def _pointer_pass_target_logits(self, pi_player_tokens, selected_player_ids, role_flag):
-            embed_dim = int(pi_player_tokens.shape[-1])
+        def _pointer_pass_target_logits(
+            self,
+            query_player_tokens,
+            key_player_tokens,
+            selected_player_ids,
+            role_flag,
+        ):
+            embed_dim = int(query_player_tokens.shape[-1])
             q_offense = nn.Dense(
                 embed_dim,
                 use_bias=False,
                 kernel_init=kernel_init,
                 name="pointer_query_head_offense",
-            )(pi_player_tokens)
+            )(query_player_tokens)
             k_offense = nn.Dense(
                 embed_dim,
                 use_bias=False,
                 kernel_init=kernel_init,
                 name="pointer_key_head_offense",
-            )(pi_player_tokens)
+            )(key_player_tokens)
             q_defense = nn.Dense(
                 embed_dim,
                 use_bias=False,
                 kernel_init=kernel_init,
                 name="pointer_query_head_defense",
-            )(pi_player_tokens)
+            )(query_player_tokens)
             k_defense = nn.Dense(
                 embed_dim,
                 use_bias=False,
                 kernel_init=kernel_init,
                 name="pointer_key_head_defense",
-            )(pi_player_tokens)
+            )(key_player_tokens)
             is_offense = (role_flag > 0.0)[:, None, :]
             query = jnp.where(is_offense, q_offense, q_defense)
             key = jnp.where(is_offense, k_offense, k_defense)
@@ -516,9 +558,7 @@ def build_actor_critic_module(spec: ActorCriticSpec):
             slot_target_ids = slot_table[selected_player_ids]
             valid_slots = slot_target_ids >= 0
             safe_target_ids = jnp.clip(slot_target_ids, 0, int(spec.token_player_count) - 1)
-            batch_idx = jnp.arange(pi_player_tokens.shape[0], dtype=jnp.int32)[:, None, None]
-            passer_idx = selected_player_ids[:, :, None]
-            slot_logits = pair_scores[batch_idx, passer_idx, safe_target_ids]
+            slot_logits = jnp.take_along_axis(pair_scores, safe_target_ids, axis=-1)
             slot_logits = jnp.where(
                 valid_slots,
                 slot_logits,
@@ -530,7 +570,129 @@ def build_actor_critic_module(spec: ActorCriticSpec):
             return jnp.where(has_valid, slot_logits, fallback)
 
         @nn.compact
-        def _attention_forward(self, flat_obs, intent_context=None, include_rebound_critic=False):
+        def _autoregressive_team_decode(self, selected_tokens, action_order, teacher_actions):
+            batch_size = selected_tokens.shape[0]
+            player_count = int(spec.training_player_count)
+            embed_dim = int(spec.attention_embed_dim)
+            if action_order is None:
+                action_order = jnp.broadcast_to(
+                    jnp.arange(player_count, dtype=jnp.int32)[None, :],
+                    (batch_size, player_count),
+                )
+            else:
+                action_order = jnp.asarray(action_order, dtype=jnp.int32).reshape(
+                    batch_size, player_count
+                )
+            if teacher_actions is None:
+                teacher_actions = jnp.zeros(
+                    (batch_size, player_count), dtype=jnp.int32
+                )
+            else:
+                teacher_actions = jnp.asarray(teacher_actions, dtype=jnp.int32).reshape(
+                    batch_size, player_count
+                )
+
+            ordered_tokens = jnp.take_along_axis(
+                selected_tokens, action_order[..., None], axis=1
+            )
+            ordered_actions = jnp.take_along_axis(teacher_actions, action_order, axis=1)
+            action_embedding = nn.Embed(
+                num_embeddings=int(spec.action_dim_per_player),
+                features=embed_dim,
+                embedding_init=nn.initializers.normal(stddev=0.02),
+                name="team_action_embedding",
+            )(ordered_actions)
+            decoder_state = nn.Dense(
+                embed_dim,
+                kernel_init=kernel_init,
+                bias_init=bias_init,
+                name="team_decoder_state_projection",
+            )(ordered_tokens)
+
+            start_token = self.param(
+                "team_decoder_start_token",
+                nn.initializers.zeros_init(),
+                (1, embed_dim),
+            )
+            start_batch = jnp.broadcast_to(
+                start_token[None, :, :],
+                (batch_size, 1, embed_dim),
+            )
+            key_value_input = jnp.concatenate(
+                [start_batch, decoder_state + action_embedding], axis=1
+            )
+            num_heads = int(spec.attention_num_heads)
+            head_dim = embed_dim // num_heads
+            query = nn.Dense(
+                embed_dim,
+                kernel_init=kernel_init,
+                bias_init=bias_init,
+                name="team_decoder_query",
+            )(decoder_state).reshape(batch_size, player_count, num_heads, head_dim)
+            key = nn.Dense(
+                embed_dim,
+                kernel_init=kernel_init,
+                bias_init=bias_init,
+                name="team_decoder_key",
+            )(key_value_input).reshape(batch_size, player_count + 1, num_heads, head_dim)
+            value = nn.Dense(
+                embed_dim,
+                kernel_init=kernel_init,
+                bias_init=bias_init,
+                name="team_decoder_value",
+            )(key_value_input).reshape(batch_size, player_count + 1, num_heads, head_dim)
+            scale = jnp.asarray(head_dim, dtype=jnp.float32) ** -0.5
+            scores = jnp.einsum("bphd,bshd->bhps", query, key) * scale
+            query_positions = jnp.arange(player_count, dtype=jnp.int32)[:, None]
+            key_positions = jnp.arange(player_count + 1, dtype=jnp.int32)[None, :]
+            causal_mask = (key_positions == 0) | (key_positions <= query_positions)
+            scores = jnp.where(
+                causal_mask[None, None, :, :],
+                scores,
+                jnp.full_like(scores, MASKED_LOGIT_FLOOR),
+            )
+            weights = nn.softmax(scores, axis=-1)
+            attended = jnp.einsum("bhps,bshd->bphd", weights, value).reshape(
+                batch_size, player_count, embed_dim
+            )
+            attended = nn.Dense(
+                embed_dim,
+                kernel_init=kernel_init,
+                bias_init=bias_init,
+                name="team_decoder_output",
+            )(attended)
+            decoded = nn.LayerNorm(name="team_decoder_attention_norm")(
+                ordered_tokens + attended
+            )
+            feed_forward = nn.Dense(
+                4 * embed_dim,
+                kernel_init=kernel_init,
+                bias_init=bias_init,
+                name="team_decoder_mlp_in",
+            )(decoded)
+            feed_forward = nn.gelu(feed_forward)
+            feed_forward = nn.Dense(
+                embed_dim,
+                kernel_init=kernel_init,
+                bias_init=bias_init,
+                name="team_decoder_mlp_out",
+            )(feed_forward)
+            decoded = nn.LayerNorm(name="team_decoder_mlp_norm")(
+                decoded + feed_forward
+            )
+            canonical_tokens = jnp.zeros_like(decoded)
+            batch_index = jnp.arange(batch_size, dtype=jnp.int32)[:, None]
+            return canonical_tokens.at[batch_index, action_order].set(decoded)
+
+        @nn.compact
+        def _attention_forward(
+            self,
+            flat_obs,
+            intent_context=None,
+            include_rebound_critic=False,
+            action_order=None,
+            teacher_actions=None,
+        ):
             players, globals_vec, role_flag = self._unpack_token_observation(flat_obs)
             globals_expanded = jnp.broadcast_to(
                 globals_vec[:, None, :],
@@ -585,6 +747,12 @@ def build_actor_critic_module(spec: ActorCriticSpec):
             )
             selected_player_ids = self._select_training_player_indices(player_tokens.shape[0], role_flag)
             selected_tokens = self._select_training_player_tokens(pi_player_tokens, role_flag)
+            if str(spec.team_action_mode) == TEAM_ACTION_MODE_AUTOREGRESSIVE:
+                selected_tokens = self._autoregressive_team_decode(
+                    selected_tokens,
+                    action_order,
+                    teacher_actions,
+                )
             policy_logits_offense = nn.Dense(
                 int(spec.action_dim_per_player),
                 kernel_init=kernel_init,
@@ -618,6 +786,7 @@ def build_actor_critic_module(spec: ActorCriticSpec):
                     action_type_logits_defense,
                 )
                 pass_target_logits = self._pointer_pass_target_logits(
+                    selected_tokens,
                     pi_player_tokens,
                     selected_player_ids,
                     role_flag,
@@ -746,9 +915,22 @@ def build_actor_critic_module(spec: ActorCriticSpec):
                 "selector_values": selector_values,
             }
 
-        def __call__(self, flat_obs, intent_context=None, include_rebound_critic=False):
+        def __call__(
+            self,
+            flat_obs,
+            intent_context=None,
+            include_rebound_critic=False,
+            action_order=None,
+            teacher_actions=None,
+        ):
             if str(spec.model_type) == "attention":
-                return self._attention_forward(flat_obs, intent_context, include_rebound_critic)
+                return self._attention_forward(
+                    flat_obs,
+                    intent_context,
+                    include_rebound_critic,
+                    action_order,
+                    teacher_actions,
+                )
             return self._mlp_forward(flat_obs, include_rebound_critic)
 
     return ActorCriticModule()
@@ -775,6 +957,8 @@ def actor_critic_forward(
     *,
     intent_context=None,
     include_rebound_critic: bool = False,
+    action_order=None,
+    teacher_actions=None,
 ):
     module = build_actor_critic_module(spec)
     return module.apply(
@@ -782,7 +966,87 @@ def actor_critic_forward(
         flat_obs.astype(jnp.float32),
         intent_context,
         include_rebound_critic,
+        action_order,
+        teacher_actions,
     )
+
+
+def team_action_order_uses_rng(spec: ActorCriticSpec) -> bool:
+    if str(spec.team_action_mode) != TEAM_ACTION_MODE_AUTOREGRESSIVE:
+        return False
+    return (
+        str(spec.offense_action_order)
+        in {TEAM_ACTION_ORDER_RANDOM, TEAM_ACTION_ORDER_BALL_HANDLER_LAST}
+        or str(spec.defense_action_order) == TEAM_ACTION_ORDER_RANDOM
+    )
+
+
+def build_team_action_order(
+    flat_obs,
+    spec: ActorCriticSpec,
+    order_key,
+    jax,
+    jnp,
+    *,
+    ball_holder=None,
+    controlled_player_ids=None,
+):
+    batch_size = int(flat_obs.shape[0])
+    player_count = int(spec.training_player_count)
+    canonical = jnp.broadcast_to(
+        jnp.arange(player_count, dtype=jnp.int32)[None, :],
+        (batch_size, player_count),
+    )
+    if str(spec.team_action_mode) != TEAM_ACTION_MODE_AUTOREGRESSIVE:
+        return canonical
+
+    if team_action_order_uses_rng(spec):
+        random_scores = jax.random.uniform(
+            order_key,
+            shape=(batch_size, player_count),
+            dtype=jnp.float32,
+        )
+        random_order = jnp.argsort(random_scores, axis=-1).astype(jnp.int32)
+    else:
+        random_order = canonical
+
+    offense_order = random_order
+    if str(spec.offense_action_order) == TEAM_ACTION_ORDER_CANONICAL:
+        offense_order = canonical
+    elif str(spec.offense_action_order) == TEAM_ACTION_ORDER_BALL_HANDLER_LAST:
+        if ball_holder is not None and controlled_player_ids is not None:
+            holder = jnp.asarray(ball_holder, dtype=jnp.int32).reshape(-1)
+            if holder.shape[0] == 1 and batch_size != 1:
+                holder = jnp.broadcast_to(holder, (batch_size,))
+            player_ids = jnp.asarray(controlled_player_ids, dtype=jnp.int32)
+            if player_ids.ndim == 1:
+                player_ids = jnp.broadcast_to(
+                    player_ids[None, :], (batch_size, player_count)
+                )
+            holder_matches = player_ids == holder[:, None]
+            holder_local = jnp.argmax(holder_matches, axis=-1).astype(jnp.int32)
+            holder_local = jnp.where(jnp.any(holder_matches, axis=-1), holder_local, -1)
+            is_holder = random_order == holder_local[:, None]
+            stable_rank = jnp.broadcast_to(
+                jnp.arange(player_count, dtype=jnp.int32)[None, :],
+                (batch_size, player_count),
+            )
+            move_to_end_rank = jnp.where(is_holder, player_count, stable_rank)
+            reorder_index = jnp.argsort(move_to_end_rank, axis=-1)
+            offense_order = jnp.take_along_axis(
+                random_order, reorder_index, axis=-1
+            )
+
+    defense_order = (
+        canonical
+        if str(spec.defense_action_order) == TEAM_ACTION_ORDER_CANONICAL
+        else random_order
+    )
+    role_index = (
+        int(spec.token_player_count) * int(spec.token_dim) + int(spec.global_dim)
+    )
+    is_offense = flat_obs[:, role_index] > 0.0
+    return jnp.where(is_offense[:, None], offense_order, defense_order)
 
 
 def apply_action_mask(flat_policy_logits, action_mask, spec: ActorCriticSpec, jax, jnp):
@@ -841,7 +1105,101 @@ def run_actor_critic(
     *,
     intent_context=None,
     include_rebound_critic: bool = False,
+    ball_holder=None,
+    controlled_player_ids=None,
+    action_order=None,
+    generate_deterministic_actions: bool = True,
 ):
+    if str(spec.team_action_mode) == TEAM_ACTION_MODE_AUTOREGRESSIVE:
+        if action_order is None:
+            if team_action_order_uses_rng(spec):
+                order_key, sample_key = jax.random.split(sample_key)
+            else:
+                order_key = sample_key
+            action_order = build_team_action_order(
+                flat_obs,
+                spec,
+                order_key,
+                jax,
+                jnp,
+                ball_holder=ball_holder,
+                controlled_player_ids=controlled_player_ids,
+            )
+        batch_size = int(flat_obs.shape[0])
+        player_count = int(spec.training_player_count)
+
+        def generate_actions(*, deterministic: bool):
+            actions = jnp.zeros((batch_size, player_count), dtype=jnp.int32)
+            selected_log_probs = jnp.zeros(
+                (batch_size, player_count), dtype=jnp.float32
+            )
+            final_forward = None
+            final_mask = None
+            batch_index = jnp.arange(batch_size, dtype=jnp.int32)
+            for step_index in range(player_count):
+                final_forward = actor_critic_forward(
+                    params,
+                    flat_obs,
+                    spec,
+                    jnp,
+                    intent_context=intent_context,
+                    include_rebound_critic=include_rebound_critic,
+                    action_order=action_order,
+                    teacher_actions=actions,
+                )
+                final_mask = apply_action_mask(
+                    final_forward["flat_policy_logits"],
+                    action_mask,
+                    spec,
+                    jax,
+                    jnp,
+                )
+                player_index = action_order[:, step_index]
+                player_logits = final_mask["masked_logits"][batch_index, player_index]
+                if deterministic:
+                    chosen_action = jnp.argmax(player_logits, axis=-1).astype(jnp.int32)
+                else:
+                    chosen_action = jax.random.categorical(
+                        jax.random.fold_in(sample_key, step_index),
+                        player_logits,
+                        axis=-1,
+                    ).astype(jnp.int32)
+                player_log_probs = jax.nn.log_softmax(player_logits, axis=-1)
+                chosen_log_prob = jnp.take_along_axis(
+                    player_log_probs,
+                    chosen_action[:, None],
+                    axis=-1,
+                )[:, 0]
+                actions = actions.at[batch_index, player_index].set(chosen_action)
+                selected_log_probs = selected_log_probs.at[
+                    batch_index, player_index
+                ].set(chosen_log_prob)
+            assert final_forward is not None and final_mask is not None
+            return actions, selected_log_probs, final_forward, final_mask
+
+        sampled_actions, selected_log_probs, forward_out, mask_out = generate_actions(
+            deterministic=False
+        )
+        if generate_deterministic_actions:
+            deterministic_actions, _, _, deterministic_mask_out = generate_actions(
+                deterministic=True
+            )
+        else:
+            deterministic_actions = mask_out["deterministic_actions"]
+            deterministic_mask_out = mask_out
+        return {
+            **forward_out,
+            **mask_out,
+            "sampled_actions": sampled_actions,
+            "deterministic_actions": deterministic_actions,
+            "deterministic_masked_logits": deterministic_mask_out["masked_logits"],
+            "deterministic_log_probs": deterministic_mask_out["log_probs"],
+            "deterministic_probs": deterministic_mask_out["probs"],
+            "deterministic_entropy": deterministic_mask_out["entropy"],
+            "selected_log_probs": selected_log_probs,
+            "action_order": action_order,
+        }
+
     forward_out = actor_critic_forward(
         params,
         flat_obs,
@@ -868,4 +1226,11 @@ def run_actor_critic(
         **mask_out,
         "sampled_actions": sampled_actions,
         "selected_log_probs": selected_log_probs,
+        "action_order": build_team_action_order(
+            flat_obs,
+            spec,
+            sample_key,
+            jax,
+            jnp,
+        ),
     }

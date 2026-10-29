@@ -374,6 +374,33 @@ def test_attention_layer_count_cli_defaults_overrides_and_validates():
         validate_train_args(parse_args(["--attention-num-layers", "0"]))
 
 
+def test_autoregressive_team_action_cli_defaults_overrides_and_validates():
+    defaults = parse_args([])
+    assert defaults.team_action_mode == "independent"
+    assert defaults.offense_action_order == "random"
+    assert defaults.defense_action_order == "random"
+
+    configured = parse_args(
+        [
+            "--policy-model",
+            "attention",
+            "--team-action-mode",
+            "autoregressive",
+            "--offense-action-order",
+            "ball_handler_last",
+            "--defense-action-order",
+            "canonical",
+        ]
+    )
+    validate_train_args(configured)
+    assert configured.team_action_mode == "autoregressive"
+    assert configured.offense_action_order == "ball_handler_last"
+    assert configured.defense_action_order == "canonical"
+
+    with pytest.raises(SystemExit, match="requires --policy-model attention"):
+        validate_train_args(parse_args(["--team-action-mode", "autoregressive"]))
+
+
 def test_legacy_policy_spec_defaults_to_one_attention_layer():
     legacy = ActorCriticSpec(
         flat_obs_dim=5,
@@ -383,10 +410,16 @@ def test_legacy_policy_spec_defaults_to_one_attention_layer():
         hidden_dims=(8,),
     ).__dict__.copy()
     legacy.pop("attention_num_layers")
+    legacy.pop("team_action_mode")
+    legacy.pop("offense_action_order")
+    legacy.pop("defense_action_order")
 
     normalized = _normalize_policy_spec_dict(legacy)
 
     assert normalized["attention_num_layers"] == 1
+    assert normalized["team_action_mode"] == "independent"
+    assert normalized["offense_action_order"] == "random"
+    assert normalized["defense_action_order"] == "random"
 
 
 def test_historical_eval_milestones_are_additive_and_validate():
@@ -1980,6 +2013,8 @@ def test_intent_policy_sensitivity_runner_compares_all_intents():
         flat_obs,
         action_mask,
         jnp.ones((2, 1), dtype=jnp.bool_),
+        jnp.zeros((2, 1, 1), dtype=jnp.int32),
+        jnp.zeros((2, 1, 1), dtype=jnp.int32),
     )
     metrics = {key: float(np.asarray(value)) for key, value in metrics.items()}
 
@@ -1999,6 +2034,8 @@ def test_intent_policy_sensitivity_runner_compares_all_intents():
         flat_obs,
         action_mask,
         jnp.ones((2, 1), dtype=jnp.bool_),
+        jnp.zeros((2, 1, 1), dtype=jnp.int32),
+        jnp.zeros((2, 1, 1), dtype=jnp.int32),
     )
     assert float(stronger_metrics["intent_policy_sensitivity_tv_mean"]) > (
         2.0 * metrics["intent_policy_sensitivity_tv_mean"]

@@ -1121,6 +1121,13 @@ def load_jax_counterfactual_runtime(
         raise ValueError(
             "Evaluated and opponent checkpoints are not JAX cross-play compatible."
         )
+    if any(
+        str(getattr(spec, "team_action_mode", "independent")) != "independent"
+        for spec in (evaluated_spec, opponent_spec)
+    ):
+        raise ValueError(
+            "MCTS regret evaluation does not yet support autoregressive team-action checkpoints."
+        )
 
     config = _resolve_native_environment_config(
         required_params={},

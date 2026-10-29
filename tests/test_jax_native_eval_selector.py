@@ -233,7 +233,7 @@ def test_native_eval_runner_applies_selector_at_episode_start():
         intent_selector_hidden_dim=8,
     )
     params = init_actor_critic_params(jax, jnp, spec, seed=123)
-    runner = _build_native_eval_runner(jax, jnp, spec)
+    runner = _build_native_eval_runner(jax, jnp, spec, spec)
 
     trace = runner(
         static,
@@ -262,3 +262,65 @@ def test_native_eval_runner_applies_selector_at_episode_start():
     )
     np.testing.assert_array_equal(np.asarray(trace["selector_intent_index"][0]), np.zeros(4, dtype=np.int32))
     np.testing.assert_array_equal(np.asarray(trace["intent_index"][0]), np.zeros(4, dtype=np.int32))
+
+
+def test_native_eval_runner_supports_autoregressive_actions_for_both_teams():
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+
+    env = _make_intent_env()
+    static = build_kernel_static_from_config(env, jnp)
+    initial_state = reset_batch_minimal(
+        static,
+        jax.random.split(jax.random.PRNGKey(20), 4),
+        jax,
+        jnp,
+    )
+    flat_obs = build_policy_observation_batch_with_role_flag(
+        static,
+        initial_state,
+        jnp.asarray(1.0, dtype=jnp.float32),
+        jnp,
+        model_type="attention",
+    )
+    action_mask = build_action_masks_batch(static, initial_state, jnp)[
+        :, static.offense_ids, :
+    ]
+    spec = build_actor_critic_spec(
+        np.asarray(flat_obs),
+        np.asarray(action_mask),
+        hidden_dims=(),
+        model_type="attention",
+        token_player_count=env.players * 2,
+        token_dim=TOKEN_OBS_PLAYER_DIM,
+        global_dim=TOKEN_OBS_GLOBAL_DIM,
+        attention_embed_dim=16,
+        attention_num_heads=4,
+        attention_token_mlp_dim=16,
+        attention_num_cls_tokens=2,
+        team_action_mode="autoregressive",
+        offense_action_order="ball_handler_last",
+        defense_action_order="random",
+    )
+    params = init_actor_critic_params(jax, jnp, spec, seed=124)
+    runner = _build_native_eval_runner(jax, jnp, spec, spec)
+    trace = jax.device_get(
+        runner(
+            static,
+            initial_state,
+            params,
+            params,
+            jax.random.PRNGKey(100),
+            jnp.asarray(1.0, dtype=jnp.float32),
+            jnp.asarray(-1.0, dtype=jnp.float32),
+            1,
+            True,
+            True,
+            False,
+            0.0,
+            False,
+            3,
+            1,
+        )
+    )
+    assert np.asarray(trace["full_actions"]).shape == (1, 4, env.players * 2)

@@ -24,6 +24,9 @@ def test_application_schema_excludes_sb3_only_fields(tmp_path):
         "kernel_batch_size",
         "policy_hidden_dims",
         "attention_num_layers",
+        "team_action_mode",
+        "offense_action_order",
+        "defense_action_order",
         "eval_deploy_every_updates",
         "shot_contest_skill_mean",
         "shot_contest_skill_std",
@@ -34,6 +37,13 @@ def test_application_schema_excludes_sb3_only_fields(tmp_path):
     assert fields["attention_num_layers"]["default"] == 1
     assert fields["attention_num_layers"]["editable"] is True
     assert fields["attention_num_layers"]["category"] == "Policy"
+    assert fields["team_action_mode"]["default"] == "independent"
+    assert fields["team_action_mode"]["choices"] == ["independent", "autoregressive"]
+    assert fields["offense_action_order"]["default"] == "random"
+    assert fields["defense_action_order"]["default"] == "random"
+    for name in ("team_action_mode", "offense_action_order", "defense_action_order"):
+        assert fields[name]["editable"] is True
+        assert fields[name]["category"] == "Policy"
     for name in (
         "shot_contest_skill_mean",
         "shot_contest_skill_std",
@@ -50,7 +60,11 @@ def test_application_preset_does_not_depend_on_inapplicable_fields(tmp_path):
 
 
 def test_application_preset_runs_ordinary_eval_every_250_updates(tmp_path):
-    assert application_preset_values(tmp_path)["eval_every_updates"] == 250
+    preset = application_preset_values(tmp_path)
+    assert preset["eval_every_updates"] == 250
+    assert preset["team_action_mode"] == "independent"
+    assert preset["offense_action_order"] == "random"
+    assert preset["defense_action_order"] == "random"
 
 
 def test_application_schema_rejects_excluded_sb3_override(tmp_path):
@@ -69,12 +83,21 @@ def test_resolve_run_config_schema_reports_effective_values():
             "321",
             "--gamma",
             "0.97",
+            "--team-action-mode",
+            "autoregressive",
+            "--offense-action-order",
+            "ball_handler_last",
+            "--defense-action-order",
+            "canonical",
         )
     )
     values = {field["name"]: field["value"] for field in fields}
 
     assert values["num_updates"] == 321
     assert values["gamma"] == 0.97
+    assert values["team_action_mode"] == "autoregressive"
+    assert values["offense_action_order"] == "ball_handler_last"
+    assert values["defense_action_order"] == "canonical"
 
 
 def test_resume_config_resolution_keeps_fields_hidden_from_the_ui():

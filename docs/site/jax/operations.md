@@ -33,6 +33,41 @@ python -m basketworld_jax.train.main \
   --checkpoint-every-updates 25
 ```
 
+### Autoregressive team actions
+
+Attention policies can decode a team's actions sequentially while the
+environment still executes the completed joint action simultaneously:
+
+```bash
+python -m basketworld_jax.train.main \
+  --run-train-loop \
+  --policy-model attention \
+  --team-action-mode autoregressive \
+  --offense-action-order random \
+  --defense-action-order random
+```
+
+`independent` remains the default team-action mode. In autoregressive mode,
+`random` samples a fresh within-team order for each state and stores that order
+with the rollout for teacher-forced PPO updates. Offense may instead use
+`ball_handler_last`, which shuffles the off-ball players and decodes the ball
+holder last. `canonical` is available as a controlled ordering experiment;
+defense supports `random` or `canonical`. Ordering flags have no effect and
+consume no ordering RNG in independent mode.
+
+The decoder conditions only on earlier actions from the same team. It does not
+observe the opponent's current-step actions, and the game still resolves both
+teams from the same pre-step state.
+
+Rollout inference is sequential within each team. PPO updates remain parallel:
+the stored order and actions are replayed through the causal decoder with
+teacher forcing, the conditional player log probabilities are summed into the
+existing joint-team PPO ratio, and clipping is applied once to that joint
+ratio. This intentionally keeps BasketWorld's current objective rather than
+adopting MAT's per-agent clipped objective. Entropy is the mean of the
+teacher-forced conditional action entropies for the recorded prefix; KL uses
+the change in the summed conditional joint log probability.
+
 For a large experiment with start templates, fitted rebounds, intent learning,
 scheduled shaping, grouped opponents, and MLflow, use
 `scripts/run_jax_5v5_rebound_continuation.sh` as a concrete configuration
