@@ -22,6 +22,7 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 
 from basketworld_jax.config.environment import JaxEnvironmentConfig
+from basketworld_jax.checkpoints import load_checkpoint
 from basketworld_jax.env.minimal import (
     TEAM_A,
     KernelState,
@@ -31,11 +32,16 @@ from basketworld_jax.env.minimal import (
     build_shot_profile_batch,
 )
 from basketworld_jax.eval.mcts_regret_jax import load_persisted_sample_states
+from basketworld_jax.models import (
+    ActorCriticSpec,
+    actor_critic_forward,
+    apply_action_mask,
+)
 from basketworld_jax.provenance import capture_source_provenance
 from basketworld_jax.train.cli import ensure_jax_available
 
 
-PROBE_SCHEMA_VERSION = 2
+PROBE_SCHEMA_VERSION = 3
 DEFENSIVE_ACTION_COUNT = 7
 FEATURE_VARIANTS = (
     "current_observation",
@@ -111,6 +117,7 @@ class DefensiveProbeDataset:
     extra_features: Mapping[str, np.ndarray]
     action_masks: np.ndarray
     labels: np.ndarray
+    policy_probabilities: np.ndarray | None
     policy_actions: np.ndarray
     regret: np.ndarray
     stable_labels: np.ndarray
@@ -119,6 +126,8 @@ class DefensiveProbeDataset:
     source_payload: Mapping[str, Any]
     source_metadata: Mapping[str, Any]
     feature_labels: Mapping[str, tuple[str, ...]]
+    soft_action_targets: np.ndarray | None
+    per_search_soft_action_targets: np.ndarray | None
 
 
 def _json_payload(path: str | Path) -> dict[str, Any]:
@@ -333,6 +342,18 @@ def _observation_kwargs(policy_spec: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _actor_critic_spec_from_mapping(values: Mapping[str, Any]) -> ActorCriticSpec:
+    normalized = dict(values)
+    for field in (
+        "hidden_dims",
+        "attention_pi_head_hidden_dims",
+        "attention_vf_head_hidden_dims",
+    ):
+        if field in normalized:
+            normalized[field] = tuple(int(value) for value in normalized[field])
+    return ActorCriticSpec(**normalized)
+
+
 def _planner_actions_by_state(
     payload: Mapping[str, Any], *, depth: int
 ) -> dict[str, tuple[int, ...]]:
@@ -350,6 +371,87 @@ def _planner_actions_by_state(
     return actions
 
 
+def mcts_visit_action_marginals(
+    payload: Mapping[str, Any],
+    *,
+    state_ids: Sequence[str],
+    depth: int,
+) -> np.ndarray:
+    """Return state x defender x action visit marginals for one search run."""
+
+    records_by_state = {
+        str(record.get("sample", {}).get("state_id", "")): record
+        for record in payload.get("records", [])
+    }
+    rows = []
+    player_count: int | None = None
+    for state_id in state_ids:
+        record = records_by_state.get(str(state_id))
+        if record is None:
+            raise ValueError(f"MCTS artifact is missing state {state_id!r}.")
+        depth_result = dict(record.get("depth_results", {})).get(str(int(depth)))
+        if not isinstance(depth_result, Mapping):
+            raise ValueError(
+                f"MCTS artifact state {state_id!r} has no depth-{depth} result."
+            )
+        action_stats = list(depth_result.get("search", {}).get("action_stats", []))
+        if not action_stats:
+            raise ValueError(f"State {state_id!r} has no root action statistics.")
+        first_action = tuple(int(value) for value in action_stats[0].get("action", []))
+        if not first_action:
+            raise ValueError(f"State {state_id!r} has an empty joint action.")
+        if player_count is None:
+            player_count = len(first_action)
+        if len(first_action) != player_count:
+            raise ValueError("MCTS artifacts contain inconsistent player counts.")
+        marginal = np.zeros((player_count, DEFENSIVE_ACTION_COUNT), dtype=np.float64)
+        total_visits = 0
+        for stat in action_stats:
+            action = tuple(int(value) for value in stat.get("action", []))
+            visits = int(stat.get("visits", 0))
+            if len(action) != player_count:
+                raise ValueError(
+                    f"State {state_id!r} contains an invalid joint action width."
+                )
+            if visits < 0:
+                raise ValueError(f"State {state_id!r} contains negative visits.")
+            if any(value < 0 or value >= DEFENSIVE_ACTION_COUNT for value in action):
+                raise ValueError(
+                    f"State {state_id!r} contains a non-defensive root action."
+                )
+            for defender_index, value in enumerate(action):
+                marginal[defender_index, value] += visits
+            total_visits += visits
+        if total_visits <= 0:
+            raise ValueError(f"State {state_id!r} contains no root visits.")
+        rows.append(marginal / float(total_visits))
+    return np.asarray(rows, dtype=np.float64)
+
+
+def average_mcts_visit_action_targets(
+    payloads: Sequence[Mapping[str, Any]],
+    *,
+    state_ids: Sequence[str],
+    depth: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the equal-run average and individual MCTS visit marginals."""
+
+    if len(payloads) < 3:
+        raise ValueError("Soft action targets require at least three search runs.")
+    per_search = np.stack(
+        [
+            mcts_visit_action_marginals(
+                payload,
+                state_ids=state_ids,
+                depth=int(depth),
+            )
+            for payload in payloads
+        ],
+        axis=0,
+    )
+    return np.mean(per_search, axis=0), per_search
+
+
 def _validate_stability_payload(
     source: Mapping[str, Any],
     candidate: Mapping[str, Any],
@@ -361,6 +463,8 @@ def _validate_stability_payload(
 
     source_provenance = dict(source.get("provenance", {}))
     candidate_provenance = dict(candidate.get("provenance", {}))
+    if dict(candidate.get("protocol", {})) != dict(source.get("protocol", {})):
+        raise ValueError("Stability artifact uses a different search protocol.")
     identity_fields = (
         "evaluated_checkpoint_update_index",
         "opponent_checkpoint_update_index",
@@ -390,6 +494,34 @@ def _validate_stability_payload(
             "Stability artifact is not complete over the source states; "
             f"missing {len(missing)} of {len(state_ids)} states."
         )
+    source_records = {
+        str(record.get("sample", {}).get("state_id", "")): record
+        for record in source.get("records", [])
+    }
+    candidate_records = {
+        str(record.get("sample", {}).get("state_id", "")): record
+        for record in candidate.get("records", [])
+    }
+    for state_id in state_ids:
+        source_record = source_records[str(state_id)]
+        candidate_record = candidate_records[str(state_id)]
+        source_sample = dict(source_record.get("sample", {}))
+        candidate_sample = dict(candidate_record.get("sample", {}))
+        for field in ("evaluated_role", "policy_action"):
+            if candidate_sample.get(field) != source_sample.get(field):
+                raise ValueError(
+                    f"State {state_id!r} differs in sample field {field!r}."
+                )
+        source_seed = int(
+            source_record["depth_results"][str(int(depth))]["search_seed"]
+        )
+        candidate_seed = int(
+            candidate_record["depth_results"][str(int(depth))]["search_seed"]
+        )
+        if source_seed == candidate_seed:
+            raise ValueError(
+                f"State {state_id!r} repeats the source MCTS search seed."
+            )
     return actions
 
 
@@ -558,6 +690,57 @@ def prepare_probe_dataset(
     )
     controlled_ids = team_a_ids if evaluated_team == "team_a" else team_b_ids
     controlled_masks = all_action_masks[:, controlled_ids, :DEFENSIVE_ACTION_COUNT]
+    policy_probabilities: np.ndarray | None = None
+    if len(stability_result_paths) >= 2:
+        checkpoint_path = Path(
+            str(provenance.get("evaluated_checkpoint_path", ""))
+        ).expanduser()
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                "The evaluated checkpoint is required for the soft-target policy "
+                f"baseline but was not found: {checkpoint_path}"
+            )
+        checkpoint_payload = load_checkpoint(checkpoint_path)
+        checkpoint_spec = _actor_critic_spec_from_mapping(
+            checkpoint_payload["policy_spec"]
+        )
+        provenance_spec = _actor_critic_spec_from_mapping(policy_spec)
+        if checkpoint_spec != provenance_spec:
+            raise ValueError(
+                "Evaluated checkpoint policy spec does not match MCTS provenance."
+            )
+        forward = actor_critic_forward(
+            jax.device_put(checkpoint_payload["params"]),
+            observation,
+            checkpoint_spec,
+            jnp,
+        )
+        masked_policy = apply_action_mask(
+            forward["flat_policy_logits"],
+            jnp.asarray(all_action_masks[:, controlled_ids, :], dtype=jnp.bool_),
+            checkpoint_spec,
+            jax,
+            jnp,
+        )
+        full_policy_probabilities = np.asarray(
+            jax.device_get(masked_policy["probs"]), dtype=np.float64
+        )
+        policy_probabilities = full_policy_probabilities[
+            ..., :DEFENSIVE_ACTION_COUNT
+        ]
+        policy_probability_total = policy_probabilities.sum(
+            axis=-1, keepdims=True
+        )
+        if np.any(policy_probability_total <= 0.0):
+            raise ValueError(
+                "Evaluated policy assigns no probability to defense actions."
+            )
+        policy_probabilities /= policy_probability_total
+        restored_policy_actions = np.argmax(policy_probabilities, axis=-1)
+        if not np.array_equal(restored_policy_actions, np.asarray(policy_actions)):
+            raise ValueError(
+                "Restored policy actions do not match the persisted MCTS samples."
+            )
 
     positions = np.asarray(jax.device_get(state_batch.positions), dtype=np.int32)
     cell_coords = np.asarray(jax.device_get(static.cell_coords), dtype=np.int32)
@@ -601,20 +784,58 @@ def prepare_probe_dataset(
     )
 
     source_actions = _planner_actions_by_state(source, depth=primary_depth)
+    comparison_payloads = [_json_payload(path) for path in stability_result_paths]
     comparison_actions = [
         _validate_stability_payload(
             source,
-            _json_payload(path),
+            candidate,
             state_ids=state_ids,
             depth=primary_depth,
         )
-        for path in stability_result_paths
+        for candidate in comparison_payloads
     ]
+    if comparison_payloads:
+        for state_id in state_ids:
+            candidate_seeds = []
+            for candidate in comparison_payloads:
+                candidate_record = next(
+                    record
+                    for record in candidate.get("records", [])
+                    if str(record.get("sample", {}).get("state_id", "")) == state_id
+                )
+                candidate_seeds.append(
+                    int(
+                        candidate_record["depth_results"][str(primary_depth)][
+                            "search_seed"
+                        ]
+                    )
+                )
+            if len(set(candidate_seeds)) != len(candidate_seeds):
+                raise ValueError(
+                    f"State {state_id!r} repeats a comparison MCTS search seed."
+                )
     stable_labels, stability_available = stable_action_mask(
         state_ids,
         source_actions,
         comparison_actions,
     )
+    soft_action_targets: np.ndarray | None = None
+    per_search_soft_action_targets: np.ndarray | None = None
+    if len(comparison_payloads) >= 2:
+        soft_action_targets, per_search_soft_action_targets = (
+            average_mcts_visit_action_targets(
+                [source, *comparison_payloads],
+                state_ids=state_ids,
+                depth=primary_depth,
+            )
+        )
+        illegal_mass = np.where(
+            controlled_masks,
+            0.0,
+            soft_action_targets,
+        ).sum()
+        if float(illegal_mass) > 1.0e-9:
+            raise ValueError("MCTS visit targets assign mass to illegal actions.")
     split = make_state_splits(
         state_ids,
         seed=int(split_seed),
@@ -632,6 +853,7 @@ def prepare_probe_dataset(
         },
         action_masks=controlled_masks,
         labels=np.asarray(labels, dtype=np.int32),
+        policy_probabilities=policy_probabilities,
         policy_actions=np.asarray(policy_actions, dtype=np.int32),
         regret=np.asarray(regrets, dtype=np.float32),
         stable_labels=stable_labels,
@@ -647,6 +869,8 @@ def prepare_probe_dataset(
                 *THREAT_FEATURE_LABELS,
             ),
         },
+        soft_action_targets=soft_action_targets,
+        per_search_soft_action_targets=per_search_soft_action_targets,
     )
 
 
@@ -1006,6 +1230,246 @@ def _frequency_baseline(
     return np.where(denominator > 0.0, out / np.maximum(denominator, 1.0e-12), fallback)
 
 
+def _collapse_action_distributions(
+    distributions: np.ndarray,
+    *,
+    granularity: str,
+) -> np.ndarray:
+    values = np.asarray(distributions, dtype=np.float64)
+    if values.shape[-1] != DEFENSIVE_ACTION_COUNT:
+        raise ValueError("Expected seven-way defensive action distributions.")
+    if granularity == "exact_action":
+        return values
+    if granularity == "move_vs_noop":
+        return np.stack([values[..., 0], values[..., 1:].sum(axis=-1)], axis=-1)
+    if granularity == "noop_plus_three_direction_buckets":
+        return np.stack(
+            [
+                values[..., 0],
+                values[..., [2, 3]].sum(axis=-1),
+                values[..., [1, 4]].sum(axis=-1),
+                values[..., [5, 6]].sum(axis=-1),
+            ],
+            axis=-1,
+        )
+    raise ValueError(f"Unknown soft-target granularity {granularity!r}.")
+
+
+def _bootstrap_state_mean(
+    values: np.ndarray,
+    *,
+    samples: int,
+    seed: int,
+) -> dict[str, Any]:
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 1 or not array.size or not np.all(np.isfinite(array)):
+        raise ValueError("Bootstrap state values must be a finite non-empty vector.")
+    rng = np.random.default_rng(int(seed))
+    draws = rng.integers(0, array.size, size=(int(samples), array.size))
+    estimates = np.mean(array[draws], axis=1)
+    return {
+        "estimate": float(np.mean(array)),
+        "ci95_low": float(np.quantile(estimates, 0.025)),
+        "ci95_high": float(np.quantile(estimates, 0.975)),
+        "state_count": int(array.size),
+    }
+
+
+def soft_target_metrics(
+    targets: np.ndarray,
+    probabilities: np.ndarray,
+    *,
+    bootstrap_samples: int = 2000,
+    bootstrap_seed: int = 17,
+) -> dict[str, Any]:
+    """Evaluate predicted distributions against visit-weighted MCTS targets."""
+
+    teacher = np.asarray(targets, dtype=np.float64)
+    student = np.asarray(probabilities, dtype=np.float64)
+    if teacher.shape != student.shape or teacher.ndim != 3:
+        raise ValueError("Soft targets and predictions must have matching 3-D shapes.")
+    if teacher.shape[-1] != DEFENSIVE_ACTION_COUNT:
+        raise ValueError("Soft-target metrics require seven defensive actions.")
+    if np.any(teacher < 0.0) or np.any(student < 0.0):
+        raise ValueError("Action distributions cannot contain negative values.")
+    if not np.allclose(teacher.sum(axis=-1), 1.0, atol=1.0e-6):
+        raise ValueError("Soft targets must be normalized.")
+    if not np.allclose(student.sum(axis=-1), 1.0, atol=1.0e-6):
+        raise ValueError("Predicted probabilities must be normalized.")
+
+    metrics: dict[str, Any] = {}
+    for offset, granularity in enumerate(
+        (
+            "move_vs_noop",
+            "noop_plus_three_direction_buckets",
+            "exact_action",
+        )
+    ):
+        collapsed_teacher = _collapse_action_distributions(
+            teacher, granularity=granularity
+        )
+        collapsed_student = _collapse_action_distributions(
+            student, granularity=granularity
+        )
+        clipped_student = np.clip(collapsed_student, 1.0e-12, 1.0)
+        clipped_teacher = np.clip(collapsed_teacher, 1.0e-12, 1.0)
+        cross_entropy = -np.sum(
+            collapsed_teacher * np.log(clipped_student), axis=-1
+        )
+        target_entropy = -np.sum(
+            collapsed_teacher * np.log(clipped_teacher), axis=-1
+        )
+        target_mode = np.argmax(collapsed_teacher, axis=-1)
+        predicted_mode = np.argmax(collapsed_student, axis=-1)
+        selected_mass = np.take_along_axis(
+            collapsed_teacher, predicted_mode[..., None], axis=-1
+        )[..., 0]
+        state_metrics = {
+            "cross_entropy": np.mean(cross_entropy, axis=1),
+            "kl_divergence": np.mean(cross_entropy - target_entropy, axis=1),
+            "target_entropy": np.mean(target_entropy, axis=1),
+            "probability_overlap": np.mean(
+                np.sum(np.minimum(collapsed_teacher, collapsed_student), axis=-1),
+                axis=1,
+            ),
+            "teacher_mass_at_selected_action": np.mean(selected_mass, axis=1),
+            "teacher_mode_agreement": np.mean(
+                predicted_mode == target_mode, axis=1
+            ),
+        }
+        metrics[granularity] = {
+            name: {
+                **_bootstrap_state_mean(
+                    values,
+                    samples=int(bootstrap_samples),
+                    seed=int(bootstrap_seed) + offset * 100 + metric_index,
+                ),
+                "decision_count": int(teacher.shape[0] * teacher.shape[1]),
+            }
+            for metric_index, (name, values) in enumerate(state_metrics.items())
+        }
+    return metrics
+
+
+def _soft_frequency_baseline(
+    targets: np.ndarray,
+    action_masks: np.ndarray,
+    train_mask: np.ndarray,
+) -> np.ndarray:
+    teacher = np.asarray(targets, dtype=np.float64)
+    probabilities = 1.0 + np.sum(teacher[np.asarray(train_mask, dtype=bool)], axis=0)
+    probabilities /= probabilities.sum(axis=-1, keepdims=True)
+    out = np.broadcast_to(probabilities[None, :, :], teacher.shape).copy()
+    out = np.where(action_masks, out, 0.0)
+    denominator = out.sum(axis=-1, keepdims=True)
+    fallback = np.zeros_like(out)
+    fallback[..., 0] = 1.0
+    return np.where(denominator > 0.0, out / np.maximum(denominator, 1.0e-12), fallback)
+
+
+def _paired_soft_cross_entropy_delta(
+    targets: np.ndarray,
+    baseline: np.ndarray,
+    student: np.ndarray,
+    mask: np.ndarray,
+    *,
+    bootstrap_samples: int,
+    bootstrap_seed: int,
+) -> dict[str, Any]:
+    selected = np.asarray(mask, dtype=bool)
+    teacher = np.asarray(targets, dtype=np.float64)[selected]
+    left = np.asarray(baseline, dtype=np.float64)[selected]
+    right = np.asarray(student, dtype=np.float64)[selected]
+    if not teacher.size:
+        return {
+            "estimate": None,
+            "ci95_low": None,
+            "ci95_high": None,
+            "state_count": 0,
+            "decision_count": 0,
+            "definition": "student_cross_entropy_minus_baseline_cross_entropy",
+        }
+    left_ce = -np.sum(teacher * np.log(np.clip(left, 1.0e-12, 1.0)), axis=-1)
+    right_ce = -np.sum(teacher * np.log(np.clip(right, 1.0e-12, 1.0)), axis=-1)
+    result = _bootstrap_state_mean(
+        np.mean(right_ce - left_ce, axis=1),
+        samples=int(bootstrap_samples),
+        seed=int(bootstrap_seed),
+    )
+    return {
+        **result,
+        "decision_count": int(teacher.shape[0] * teacher.shape[1]),
+        "definition": "student_cross_entropy_minus_baseline_cross_entropy",
+    }
+
+
+def soft_target_seed_diagnostics(
+    per_search_targets: np.ndarray,
+    *,
+    bootstrap_samples: int = 2000,
+    bootstrap_seed: int = 17,
+) -> dict[str, Any]:
+    """Measure pairwise Jensen-Shannon divergence between search distributions."""
+
+    from itertools import combinations
+
+    runs = np.asarray(per_search_targets, dtype=np.float64)
+    if runs.ndim != 4 or runs.shape[0] < 3:
+        raise ValueError("Seed diagnostics require at least three search targets.")
+    result = {}
+    for offset, granularity in enumerate(
+        (
+            "move_vs_noop",
+            "noop_plus_three_direction_buckets",
+            "exact_action",
+        )
+    ):
+        collapsed = _collapse_action_distributions(runs, granularity=granularity)
+        pair_values = []
+        for left_index, right_index in combinations(range(runs.shape[0]), 2):
+            left = collapsed[left_index]
+            right = collapsed[right_index]
+            midpoint = 0.5 * (left + right)
+            left_kl = np.sum(
+                np.where(
+                    left > 0.0,
+                    left
+                    * (
+                        np.log(np.clip(left, 1.0e-12, 1.0))
+                        - np.log(np.clip(midpoint, 1.0e-12, 1.0))
+                    ),
+                    0.0,
+                ),
+                axis=-1,
+            )
+            right_kl = np.sum(
+                np.where(
+                    right > 0.0,
+                    right
+                    * (
+                        np.log(np.clip(right, 1.0e-12, 1.0))
+                        - np.log(np.clip(midpoint, 1.0e-12, 1.0))
+                    ),
+                    0.0,
+                ),
+                axis=-1,
+            )
+            pair_values.append(0.5 * (left_kl + right_kl))
+        per_state = np.mean(np.stack(pair_values, axis=0), axis=(0, 2))
+        result[granularity] = {
+            "pairwise_jensen_shannon_divergence_nats": {
+                **_bootstrap_state_mean(
+                    per_state,
+                    samples=int(bootstrap_samples),
+                    seed=int(bootstrap_seed) + offset,
+                ),
+                "search_run_count": int(runs.shape[0]),
+                "search_pair_count": int(len(pair_values)),
+            }
+        }
+    return result
+
+
 def _build_probe_module(
     *,
     controlled_player_count: int,
@@ -1057,6 +1521,7 @@ def train_attention_probe(
     global_features: np.ndarray,
     action_masks: np.ndarray,
     labels: np.ndarray,
+    soft_targets: np.ndarray | None = None,
     train_indices: np.ndarray,
     validation_indices: np.ndarray,
     seed: int,
@@ -1079,6 +1544,21 @@ def train_attention_probe(
     globals_device = jnp.asarray(global_features, dtype=jnp.float32)
     masks_device = jnp.asarray(action_masks, dtype=jnp.bool_)
     labels_device = jnp.asarray(labels, dtype=jnp.int32)
+    soft_targets_device = (
+        None
+        if soft_targets is None
+        else jnp.asarray(soft_targets, dtype=jnp.float32)
+    )
+    if soft_targets is not None:
+        targets = np.asarray(soft_targets, dtype=np.float64)
+        if targets.shape != (*np.asarray(labels).shape, DEFENSIVE_ACTION_COUNT):
+            raise ValueError("Soft-target shape does not match defensive labels.")
+        if np.any(targets < 0.0) or not np.allclose(
+            targets.sum(axis=-1), 1.0, atol=1.0e-6
+        ):
+            raise ValueError("Soft targets must be normalized distributions.")
+        if np.any(np.where(action_masks, 0.0, targets) > 1.0e-9):
+            raise ValueError("Soft targets assign mass to illegal actions.")
     train_indices_device = jnp.asarray(train_indices, dtype=jnp.int32)
     validation_indices_device = jnp.asarray(validation_indices, dtype=jnp.int32)
     params = model.init(
@@ -1101,9 +1581,14 @@ def train_attention_probe(
 
     def loss_value(current_params, indices):
         logits = masked_logits(current_params, indices)
-        losses = optax.softmax_cross_entropy_with_integer_labels(
-            logits, labels_device[indices]
-        )
+        if soft_targets_device is None:
+            losses = optax.softmax_cross_entropy_with_integer_labels(
+                logits, labels_device[indices]
+            )
+        else:
+            losses = optax.softmax_cross_entropy(
+                logits, soft_targets_device[indices]
+            )
         return jnp.mean(losses)
 
     @jax.jit
@@ -1464,6 +1949,134 @@ def run_defensive_feature_probe(
             )
         learning_curves[variant] = curve_rows
 
+    soft_target_diagnostic: dict[str, Any]
+    soft_target_probabilities: np.ndarray | None = None
+    if (
+        dataset.soft_action_targets is None
+        or dataset.per_search_soft_action_targets is None
+        or dataset.policy_probabilities is None
+    ):
+        soft_target_diagnostic = {
+            "available": False,
+            "reason": "requires_source_plus_two_same_state_search_artifacts",
+            "minimum_search_run_count": 3,
+        }
+    else:
+        report("training current_observation soft-action probe")
+        soft_runs = []
+        soft_probabilities = []
+        for training_seed in config.training_seeds:
+            trained = train_attention_probe(
+                player_tokens=dataset.base_player_tokens,
+                global_features=dataset.global_features,
+                action_masks=dataset.action_masks,
+                labels=dataset.labels,
+                soft_targets=dataset.soft_action_targets,
+                train_indices=train_indices,
+                validation_indices=validation_indices,
+                seed=int(training_seed),
+                config=config,
+            )
+            soft_probabilities.append(np.asarray(trained.pop("probabilities")))
+            soft_runs.append({"seed": int(training_seed), **trained})
+        soft_target_probabilities = np.mean(
+            np.stack(soft_probabilities, axis=0), axis=0
+        )
+        soft_frequency_probabilities = _soft_frequency_baseline(
+            dataset.soft_action_targets,
+            dataset.action_masks,
+            dataset.split == "train",
+        )
+        soft_target_diagnostic = {
+            "available": True,
+            "target_definition": (
+                "equal-run average of per-defender marginals formed by normalizing "
+                "root joint-action MCTS visit counts within each search run"
+            ),
+            "search_run_count": int(dataset.per_search_soft_action_targets.shape[0]),
+            "granularities": [
+                "move_vs_noop",
+                "noop_plus_three_direction_buckets",
+                "exact_action",
+            ],
+            "seed_stability": soft_target_seed_diagnostics(
+                dataset.per_search_soft_action_targets,
+                bootstrap_samples=int(config.bootstrap_samples),
+                bootstrap_seed=int(config.split_seed) + 12000,
+            ),
+            "current_observation_student": {
+                "training_runs": soft_runs,
+                "test_metrics": soft_target_metrics(
+                    dataset.soft_action_targets[test_mask],
+                    soft_target_probabilities[test_mask],
+                    bootstrap_samples=int(config.bootstrap_samples),
+                    bootstrap_seed=int(config.split_seed) + 13000,
+                ),
+            },
+            "baselines": {
+                "restored_evaluated_policy": {
+                    "test_metrics": soft_target_metrics(
+                        dataset.soft_action_targets[test_mask],
+                        dataset.policy_probabilities[test_mask],
+                        bootstrap_samples=int(config.bootstrap_samples),
+                        bootstrap_seed=int(config.split_seed) + 14000,
+                    )
+                },
+                "train_soft_frequency": {
+                    "test_metrics": soft_target_metrics(
+                        dataset.soft_action_targets[test_mask],
+                        soft_frequency_probabilities[test_mask],
+                        bootstrap_samples=int(config.bootstrap_samples),
+                        bootstrap_seed=int(config.split_seed) + 15000,
+                    )
+                },
+            },
+            "paired_test_cross_entropy_deltas": {
+                "student_vs_restored_evaluated_policy": (
+                    _paired_soft_cross_entropy_delta(
+                        dataset.soft_action_targets,
+                        dataset.policy_probabilities,
+                        soft_target_probabilities,
+                        test_mask,
+                        bootstrap_samples=int(config.bootstrap_samples),
+                        bootstrap_seed=int(config.split_seed) + 16000,
+                    )
+                ),
+                "student_vs_train_soft_frequency": (
+                    _paired_soft_cross_entropy_delta(
+                        dataset.soft_action_targets,
+                        soft_frequency_probabilities,
+                        soft_target_probabilities,
+                        test_mask,
+                        bootstrap_samples=int(config.bootstrap_samples),
+                        bootstrap_seed=int(config.split_seed) + 17000,
+                    )
+                ),
+            },
+        }
+        policy_delta = soft_target_diagnostic["paired_test_cross_entropy_deltas"][
+            "student_vs_restored_evaluated_policy"
+        ]
+        frequency_delta = soft_target_diagnostic[
+            "paired_test_cross_entropy_deltas"
+        ]["student_vs_train_soft_frequency"]
+        soft_target_diagnostic["interpretation"] = {
+            "student_reliably_beats_policy_cross_entropy": bool(
+                policy_delta["ci95_high"] is not None
+                and float(policy_delta["ci95_high"]) < 0.0
+            ),
+            "student_reliably_beats_frequency_cross_entropy": bool(
+                frequency_delta["ci95_high"] is not None
+                and float(frequency_delta["ci95_high"]) < 0.0
+            ),
+            "outcome_rollout_gate_passed": bool(
+                policy_delta["ci95_high"] is not None
+                and frequency_delta["ci95_high"] is not None
+                and float(policy_delta["ci95_high"]) < 0.0
+                and float(frequency_delta["ci95_high"]) < 0.0
+            ),
+        }
+
     frequency_probabilities = _frequency_baseline(
         dataset.labels, dataset.action_masks, dataset.split == "train"
     )
@@ -1594,6 +2207,21 @@ def run_defensive_feature_probe(
                     if dataset.stability_available
                     else None
                 ),
+                "soft_action_target": (
+                    dataset.soft_action_targets[index].tolist()
+                    if dataset.soft_action_targets is not None
+                    else None
+                ),
+                "restored_policy_probabilities": (
+                    dataset.policy_probabilities[index].tolist()
+                    if dataset.policy_probabilities is not None
+                    else None
+                ),
+                "soft_target_student_probabilities": (
+                    soft_target_probabilities[index].tolist()
+                    if soft_target_probabilities is not None
+                    else None
+                ),
                 "variants": variants,
             }
         )
@@ -1615,7 +2243,10 @@ def run_defensive_feature_probe(
                 "simulations_per_action"
             ),
             "stability_results": [
-                str(Path(path).expanduser().resolve())
+                {
+                    "path": str(Path(path).expanduser().resolve()),
+                    "sha256": _sha256_file(Path(path).expanduser().resolve()),
+                }
                 for path in stability_result_paths
             ],
             "stability_available": bool(dataset.stability_available),
@@ -1656,6 +2287,7 @@ def run_defensive_feature_probe(
         "feature_variants": variant_results,
         "baselines": baselines,
         "paired_feature_differences": paired_differences,
+        "soft_target_diagnostic": soft_target_diagnostic,
         "interpretation": interpretation,
         "learning_curves": learning_curves,
         "per_state_predictions": per_state,
@@ -1679,11 +2311,15 @@ __all__ = [
     "THREAT_FEATURE_LABELS",
     "DefensiveProbeDataset",
     "ProbeTrainingConfig",
+    "average_mcts_visit_action_targets",
     "classification_metrics",
     "compute_defensive_relational_features",
     "make_state_splits",
+    "mcts_visit_action_marginals",
     "prepare_probe_dataset",
     "run_defensive_feature_probe",
+    "soft_target_metrics",
+    "soft_target_seed_diagnostics",
     "stable_action_mask",
     "train_attention_probe",
 ]

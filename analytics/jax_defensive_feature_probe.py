@@ -47,7 +47,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=[],
         help=(
             "Optional completed result over the same states at another budget "
-            "or seed. Repeat to require agreement across several artifacts."
+            "or seed. Repeat twice with search-seed reruns to enable the "
+            "visit-weighted soft-action diagnostic."
         ),
     )
     parser.add_argument("--split-seed", type=int, default=17)
@@ -118,6 +119,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"legal-action macro ROC-AUC {roc_auc['estimate']:.3f}; "
             f"macro PR-AUC {pr_auc['estimate']:.3f}"
         )
+    soft = payload.get("soft_target_diagnostic", {})
+    if soft.get("available"):
+        student = soft["current_observation_student"]["test_metrics"][
+            "exact_action"
+        ]["cross_entropy"]
+        policy = soft["baselines"]["restored_evaluated_policy"]["test_metrics"][
+            "exact_action"
+        ]["cross_entropy"]
+        delta = soft["paired_test_cross_entropy_deltas"][
+            "student_vs_restored_evaluated_policy"
+        ]
+        print(
+            "soft-action diagnostic: exact-action test cross-entropy "
+            f"student {student['estimate']:.4f}, policy {policy['estimate']:.4f}; "
+            f"paired delta {delta['estimate']:+.4f} "
+            f"(95% CI {delta['ci95_low']:+.4f} to {delta['ci95_high']:+.4f}); "
+            "outcome-rollout gate "
+            + (
+                "passed"
+                if soft["interpretation"]["outcome_rollout_gate_passed"]
+                else "not passed"
+            )
+        )
+    else:
+        print(f"soft-action diagnostic unavailable: {soft.get('reason', 'unknown')}")
     return 0
 
 

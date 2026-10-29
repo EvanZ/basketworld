@@ -3,9 +3,13 @@ from __future__ import annotations
 import numpy as np
 
 from basketworld_jax.eval.defensive_feature_probe import (
+    average_mcts_visit_action_targets,
     classification_metrics,
     compute_defensive_relational_features,
     make_state_splits,
+    mcts_visit_action_marginals,
+    soft_target_metrics,
+    soft_target_seed_diagnostics,
     stable_action_mask,
 )
 
@@ -140,3 +144,90 @@ def test_auc_metrics_condition_on_legal_actions_and_reward_correct_ranking() -> 
     assert metrics["legal_action_macro_pr_auc"]["estimate"] == 1.0
     assert metrics["move_vs_noop_roc_auc"]["estimate"] == 1.0
     assert metrics["move_vs_noop_pr_auc"]["estimate"] == 1.0
+
+
+def _search_payload(visits: tuple[int, int]) -> dict:
+    return {
+        "records": [
+            {
+                "sample": {"state_id": "state-a"},
+                "depth_results": {
+                    "5": {
+                        "search": {
+                            "action_stats": [
+                                {"action": [0, 1], "visits": visits[0]},
+                                {"action": [2, 0], "visits": visits[1]},
+                            ]
+                        }
+                    }
+                },
+            }
+        ]
+    }
+
+
+def test_mcts_visit_targets_preserve_per_defender_uncertainty() -> None:
+    marginal = mcts_visit_action_marginals(
+        _search_payload((3, 1)),
+        state_ids=["state-a"],
+        depth=5,
+    )
+
+    assert marginal.shape == (1, 2, 7)
+    np.testing.assert_allclose(marginal[0, 0, [0, 2]], [0.75, 0.25])
+    np.testing.assert_allclose(marginal[0, 1, [0, 1]], [0.25, 0.75])
+    np.testing.assert_allclose(marginal.sum(axis=-1), 1.0)
+
+
+def test_soft_action_targets_average_runs_equally() -> None:
+    average, per_search = average_mcts_visit_action_targets(
+        [
+            _search_payload((3, 1)),
+            _search_payload((1, 3)),
+            _search_payload((2, 2)),
+        ],
+        state_ids=["state-a"],
+        depth=5,
+    )
+
+    assert per_search.shape == (3, 1, 2, 7)
+    np.testing.assert_allclose(average[0, 0, [0, 2]], [0.5, 0.5])
+    np.testing.assert_allclose(average[0, 1, [0, 1]], [0.5, 0.5])
+
+
+def test_soft_target_metrics_reward_matching_distributions() -> None:
+    targets = np.zeros((2, 1, 7), dtype=np.float64)
+    targets[0, 0, :2] = [0.75, 0.25]
+    targets[1, 0, :2] = [0.25, 0.75]
+
+    metrics = soft_target_metrics(
+        targets,
+        targets,
+        bootstrap_samples=100,
+        bootstrap_seed=4,
+    )
+
+    exact = metrics["exact_action"]
+    assert abs(exact["kl_divergence"]["estimate"]) < 1.0e-12
+    assert exact["probability_overlap"]["estimate"] == 1.0
+    assert exact["teacher_mode_agreement"]["estimate"] == 1.0
+    assert metrics["move_vs_noop"]["kl_divergence"]["estimate"] == 0.0
+
+
+def test_soft_target_seed_diagnostics_are_zero_for_identical_runs() -> None:
+    targets = mcts_visit_action_marginals(
+        _search_payload((3, 1)),
+        state_ids=["state-a"],
+        depth=5,
+    )
+    diagnostics = soft_target_seed_diagnostics(
+        np.stack([targets, targets, targets], axis=0),
+        bootstrap_samples=20,
+        bootstrap_seed=8,
+    )
+
+    for granularity in diagnostics.values():
+        assert (
+            granularity["pairwise_jensen_shannon_divergence_nats"]["estimate"]
+            == 0.0
+        )

@@ -47,6 +47,11 @@ initialization seeds are ensembled for the final held-out metrics. Data-size
 learning curves use the first configured seed consistently at every fraction,
 so changing the sample size is not confounded with ensembling.
 
+When the soft-action diagnostic is enabled, the evaluated checkpoint path
+recorded in the MCTS artifact must remain available. The probe restores it to
+obtain the original policy's full legal action distribution for the held-out
+comparison. Ordinary hard-label probe runs do not require checkpoint restore.
+
 If completed searches over the same states are available at other budgets or
 seeds, include them to identify stable joint-action labels:
 
@@ -60,6 +65,34 @@ seeds, include them to identify stable joint-action labels:
 
 Without at least one comparison artifact, stability metrics are marked
 unavailable. A single MCTS budget is never silently treated as stable.
+
+### Visit-weighted soft-action diagnostic
+
+Supplying two `--stability-result` search-seed reruns, for three total searches
+over the same roots, also enables a soft-action learnability test. For each
+search and defender, the probe sums root joint-action visit counts by that
+defender's action and normalizes the resulting seven-way marginal. It then
+averages the three run-level marginals equally. This preserves uncertainty when
+different search seeds choose different hard argmax actions.
+
+The diagnostic trains one additional current-observation attention probe with
+soft cross-entropy. It deliberately does not retest the explicit feature
+variants, alter PPO, run MCTS, or change deployment. Held-out results cover:
+
+- move versus no-op;
+- no-op plus three directional move buckets;
+- exact seven-way defensive actions;
+- pairwise search-seed Jensen-Shannon divergence;
+- target cross-entropy, KL divergence, probability overlap, teacher mass at the
+  selected action, and teacher-mode agreement;
+- paired exact-action cross-entropy differences against the restored evaluated
+  policy and a training-set soft-frequency baseline.
+
+The outcome-rollout gate passes only when the student's paired held-out
+cross-entropy is reliably lower than both baselines (the complete 95% bootstrap
+interval is below zero). Passing that gate justifies a separate paired rollout
+test of whether student-selected actions close any MCTS regret. This offline
+diagnostic itself does not claim an outcome improvement.
 
 ### Same-state search-seed stability
 
@@ -107,6 +140,8 @@ stability cutoff.
 - paired bootstrap differences between feature variants;
 - stable-label subsets derived from completed same-state search artifacts when
   supplied;
+- the visit-weighted soft-action diagnostic when three same-state search runs
+  are supplied;
 - per-state ensemble probabilities and predictions;
 - input hashes and source-code provenance.
 
