@@ -116,6 +116,8 @@ def build_checkpoint_payload(
             "candidate_infos": list(pool_state.get("candidate_infos", [])),
             "rng_state": dict(pool_state.get("rng_state", {})),
             "enabled": bool(pool_state.get("enabled", False)),
+            "pfsp_state": pool_state.get("pfsp_state"),
+            "sampling_config": pool_state.get("sampling_config"),
         }
         payload["state"]["opponent_candidate_params"] = _tree_to_numpy(
             pool_state.get("candidate_params")

@@ -19,6 +19,9 @@ if __package__ in (None, ""):
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
+from basketworld_jax.train.pfsp import PFSPState, probabilities as pfsp_probabilities
+from basketworld_jax.train.pressure_metrics import summarize_pressure_diagnostics
+
 from basketworld.utils.mlflow_config import setup_mlflow
 from basketworld.utils.play_names import (
     PLAY_NAME_POOL_VERSION,
@@ -1748,6 +1751,14 @@ def _values_match(actual: Any, expected: Any) -> bool:
 
 
 def validate_train_args(args) -> None:
+    try:
+        pfsp_probabilities([], float(getattr(args, "opponent_pfsp_alpha", 0.5)),
+                           float(getattr(args, "opponent_pfsp_epsilon", 0.1)))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if getattr(args, "opponent_pool_sampling", "recency") == "pfsp":
+        if not getattr(args, "enable_multi_possession", False) or getattr(args, "disable_opponent_pool", False):
+            raise SystemExit("PFSP requires multi-possession games and an enabled opponent pool.")
     if int(getattr(args, "attention_num_layers", 1)) < 1:
         raise SystemExit("--attention-num-layers must be >= 1.")
     if (
@@ -3879,6 +3890,8 @@ def _build_opponent_pool_checkpoint_state(
     enabled: bool,
     jax,
     jnp,
+    pfsp_state=None,
+    sampling_config=None,
 ):
     return {
         "enabled": bool(enabled),
@@ -3891,6 +3904,8 @@ def _build_opponent_pool_checkpoint_state(
         "assignments": dict(assignments),
         "deterministic_modes": dict(deterministic_modes),
         "rng_state": dict(opponent_rng.bit_generator.state),
+        "pfsp_state": pfsp_state.payload() if pfsp_state is not None else None,
+        "sampling_config": sampling_config,
     }
 
 
@@ -4334,6 +4349,9 @@ def _log_mlflow_params(
             getattr(args, "disable_opponent_pool", False)
         ),
         "jax/opponent_pool_size": int(getattr(args, "opponent_pool_size", 10)),
+        "jax/opponent_pool_sampling": str(getattr(args, "opponent_pool_sampling", "recency")),
+        "jax/opponent_pfsp_alpha": float(getattr(args, "opponent_pfsp_alpha", 0.5)),
+        "jax/opponent_pfsp_epsilon": float(getattr(args, "opponent_pfsp_epsilon", 0.1)),
         "jax/opponent_pool_beta": float(getattr(args, "opponent_pool_beta", 0.7)),
         "jax/opponent_pool_exploration": float(
             getattr(args, "opponent_pool_exploration", 0.0)
@@ -4426,6 +4444,12 @@ def _log_mlflow_params(
 def _log_mlflow_metrics(
     mlflow, metrics: dict[str, Any], *, step: int, prefix: str
 ) -> None:
+    if callable(getattr(mlflow, "log_metrics", None)):
+        numeric = [(f"{prefix}/{key}", float(value)) for key, value in metrics.items()
+                   if isinstance(value, (int, float, np.integer, np.floating))]
+        for start in range(0, len(numeric), 500):
+            mlflow.log_metrics(dict(numeric[start:start + 500]), step=int(step))
+        return
     for key, value in metrics.items():
         if isinstance(value, (int, float, np.integer, np.floating)):
             mlflow.log_metric(f"{prefix}/{key}", float(value), step=int(step))
@@ -4724,7 +4748,8 @@ def _filter_mlflow_train_metrics(
         return dict(metrics)
     if profile != "core":
         raise ValueError(f"Unknown MLflow metric profile: {profile}")
-    return {key: value for key, value in metrics.items() if key in _CORE_TRAIN_METRICS}
+    return {key: value for key, value in metrics.items()
+            if key in _CORE_TRAIN_METRICS or key.startswith(("pfsp/", "pressure/"))}
 
 
 def _filter_mlflow_deploy_metrics(
@@ -4741,7 +4766,7 @@ def _filter_mlflow_deploy_metrics(
     return {
         key: value
         for key, value in metrics.items()
-        if key in _CORE_DEPLOY_METRICS or key.startswith("clock_")
+        if key in _CORE_DEPLOY_METRICS or key.startswith(("clock_", "pressure/"))
     }
 
 
@@ -4957,6 +4982,7 @@ def _historical_outcome_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "candidate_win_rate": (
             float(wins / completed_count) if completed_count else None
         ),
+        "w_eval": float((wins + 0.5 * ties) / completed_count) if completed_count else None,
         "candidate_tie_rate": (
             float(ties / completed_count) if completed_count else None
         ),
@@ -7638,6 +7664,13 @@ def run_training_loop(args) -> dict[str, Any]:
     intent_sample_artifacts: list[str] = []
     opponent_rng = np.random.default_rng(int(args.policy_seed) + 90_001)
     opponent_pool_enabled = not bool(getattr(args, "disable_opponent_pool", False))
+    pfsp_enabled = getattr(args, "opponent_pool_sampling", "recency") == "pfsp"
+    pfsp_state = PFSPState() if pfsp_enabled else None
+    sampling_config = {
+        "mode": getattr(args, "opponent_pool_sampling", "recency"),
+        "alpha": float(getattr(args, "opponent_pfsp_alpha", 0.5)),
+        "epsilon": float(getattr(args, "opponent_pfsp_epsilon", 0.1)),
+    }
     grouped_opponent_sampling_enabled = (
         opponent_pool_enabled and _uses_grouped_opponent_sampling(args)
     )
@@ -7855,6 +7888,17 @@ def run_training_loop(args) -> dict[str, Any]:
         else:
             base_key = jax.device_put(checkpoint_payload["base_key"])
         restored_opponent_pool = checkpoint_payload.get("opponent_pool_state")
+        saved_sampling = (restored_opponent_pool or {}).get("sampling_config")
+        if saved_sampling and saved_sampling["mode"] != sampling_config["mode"]:
+            raise SystemExit("Opponent sampling mode differs from the resume checkpoint.")
+        if pfsp_enabled:
+            pool = restored_opponent_pool or {}
+            saved_config = pool.get("sampling_config")
+            if saved_config and saved_config != sampling_config:
+                raise SystemExit("PFSP sampling config differs from the resume checkpoint.")
+            if pool.get("pfsp_state") is None:
+                print("[resume] No PFSP history in checkpoint; initializing neutral priors explicitly.")
+            pfsp_state = PFSPState(pool.get("pfsp_state"))
         if (
             pinned_opponent_pool_enabled
             and not reset_resume_env_state
@@ -8169,6 +8213,14 @@ def run_training_loop(args) -> dict[str, Any]:
                 if pinned_candidate_params is not None
                 else None
             )
+            pfsp_sampling_metrics = {}
+            if pfsp_enabled:
+                pfsp_probs, pfsp_sampling_metrics = pfsp_state.sampling_snapshot(
+                    opponent_candidates, update=update_idx,
+                    alpha=sampling_config["alpha"], epsilon=sampling_config["epsilon"],
+                )
+                if pinned_candidate_params is not None:
+                    pinned_candidate_probs = jnp.asarray(pfsp_probs)
             selector_multiselect_enabled = bool(
                 getattr(args, "intent_selector_multiselect_enabled", False)
             )
@@ -8251,6 +8303,11 @@ def run_training_loop(args) -> dict[str, Any]:
                         float(opponent_deterministic_episode_prob),
                     )
             block_until_ready_tree(role_rollouts)
+            if pfsp_enabled and pinned_candidate_params is not None:
+                pfsp_state.observe_rollouts(
+                    {role: role_rollouts[role].trajectory for role in TRAINING_ROLES},
+                    opponent_candidates, update=update_idx,
+                )
             if pinned_candidate_params is not None:
                 opponent_assignments = {
                     role: role_rollouts[role].final_opponent_assignment
@@ -8824,6 +8881,7 @@ def run_training_loop(args) -> dict[str, Any]:
             )
             if intent_disc_metrics:
                 last_metrics.update(intent_disc_metrics)
+            last_metrics.update(pfsp_sampling_metrics)
             if active_opponent_info is not None:
                 last_metrics["opponent_update_index"] = int(
                     active_opponent_info.get(
@@ -9120,6 +9178,7 @@ def run_training_loop(args) -> dict[str, Any]:
                             "mean_reward": float(np.asarray(eval_trace.rewards).mean()),
                         }
                         eval_metrics.update(eval_episode_metrics)
+                        eval_metrics.update(summarize_pressure_diagnostics(eval_trace.pressure_diagnostics))
                         eval_metrics.update(
                             summarize_lane_violation_metrics(
                                 terminal_episode_steps=eval_completed_terminal_steps,
@@ -9448,6 +9507,8 @@ def run_training_loop(args) -> dict[str, Any]:
                         enabled=pinned_opponent_pool_enabled,
                         jax=jax,
                         jnp=jnp,
+                        pfsp_state=pfsp_state,
+                        sampling_config=sampling_config,
                     )
                     if pinned_opponent_pool_enabled
                     else None
@@ -9703,6 +9764,16 @@ def run_training_loop(args) -> dict[str, Any]:
                             opponent_match_selector_active
                         )
                         historical_eval_history.append(match)
+                        if mlflow is not None:
+                            opponent_key = f"u{int(opponent_update)}/deterministic"
+                            _log_mlflow_metrics(mlflow, {
+                                f"w_eval/{opponent_key}": match["w_eval"],
+                                f"completed_games/{opponent_key}": match["completed_episode_count"],
+                                f"truncated_games/{opponent_key}": match["truncated_episode_count"],
+                                f"wins/{opponent_key}": match["candidate_wins"],
+                                f"ties/{opponent_key}": match["candidate_ties"],
+                                f"losses/{opponent_key}": match["candidate_losses"],
+                            }, step=update_idx, prefix="jax/eval_historical")
                         progress.update(1)
                         progress.set_postfix_str(
                             f"historical_eval:{update_idx}v{opponent_update}",

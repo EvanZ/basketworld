@@ -5,6 +5,10 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from basketworld_jax.train.pressure_metrics import (
+    PRESSURE_SHAPE, build_pressure_diagnostics, summarize_pressure_diagnostics,
+)
+
 from basketworld_jax.env import (
     SHOT_TYPE_DUNK,
     SHOT_TYPE_THREE,
@@ -907,6 +911,13 @@ def _build_spatial_step_metrics(static, state, active_step, jnp) -> dict[str, An
     }
 
 
+def _terminal_learner_win_score(static, state, jnp):
+    learner_team_a = static.training_player_mask[static.offense_ids[0]] > 0.5
+    difference = jnp.where(learner_team_a, state.team_a_score - state.team_b_score,
+                           state.team_b_score - state.team_a_score)
+    return jnp.where(difference > 0, 1.0, jnp.where(difference < 0, 0.0, 0.5))
+
+
 def _zero_selector_transition_metrics(state, jnp) -> dict[str, Any]:
     batch_shape = state.intent_index.shape
     return {
@@ -1350,6 +1361,20 @@ def update_pinned_opponent_episode_state(
     )
 
 
+def sample_pinned_opponent_assignment(probabilities, next_modes, key, jax, jnp):
+    """Select an opponent conditional on the next game's action mode."""
+    if probabilities.ndim == 2:
+        conditional = probabilities[next_modes.astype(jnp.int32)]
+        logits = jnp.where(conditional > 0, jnp.log(conditional), -jnp.inf)
+    else:
+        # Preserve the legacy recency runner's exact logits/RNG behavior.
+        logits = jnp.log(jnp.maximum(probabilities, 1.0e-12))
+    return jax.random.categorical(
+        key, logits,
+        shape=next_modes.shape,
+    ).astype(jnp.int32)
+
+
 def _truncation_bootstrap_values(
     static,
     final_state,
@@ -1648,6 +1673,8 @@ def build_compiled_rollout_runner(
                 jnp.zeros_like(env_out.done.astype(jnp.int8)),
             )
             transition = TrajectoryBatch(
+                pressure_diagnostics=build_pressure_diagnostics(static, policy_state, active_step, jnp),
+                terminal_learner_win_score=_terminal_learner_win_score(static, env_out.state, jnp),
                 active_mask=active_step.astype(jnp.float32),
                 episode_start=(active_step & (policy_state.step_count == 0)).astype(jnp.int8),
                 flat_obs=flat_obs,
@@ -1920,7 +1947,7 @@ def build_compiled_frozen_opponent_rollout_runner(
             0.0,
             1.0,
         )
-        candidate_count = int(opponent_candidate_probs.shape[0])
+        candidate_count = int(opponent_candidate_probs.shape[-1])
 
         def _sample_candidate_opponent_actions(
             opponent_flat_obs,
@@ -2140,11 +2167,12 @@ def build_compiled_frozen_opponent_rollout_runner(
                 opponent_deterministic_episode_prob,
                 (batch_size,),
             )
-            sampled_assignment = jax.random.categorical(
-                opponent_assignment_key,
-                jnp.log(jnp.maximum(opponent_candidate_probs, 1.0e-12)),
-                shape=(batch_size,),
-            ).astype(jnp.int32)
+            # PFSP distributions are conditional on the mode pinned for the
+            # NEXT game. A one-dimensional legacy distribution is unchanged.
+            sampled_assignment = sample_pinned_opponent_assignment(
+                opponent_candidate_probs, next_opponent_deterministic_episode_sample,
+                opponent_assignment_key, jax, jnp,
+            )
             (
                 next_opponent_assignment,
                 next_opponent_deterministic_episode,
@@ -2198,6 +2226,8 @@ def build_compiled_frozen_opponent_rollout_runner(
                 jnp.zeros_like(env_out.done.astype(jnp.int8)),
             )
             transition = TrajectoryBatch(
+                pressure_diagnostics=build_pressure_diagnostics(static, policy_state, active_step, jnp),
+                terminal_learner_win_score=_terminal_learner_win_score(static, env_out.state, jnp),
                 active_mask=active_step.astype(jnp.float32),
                 episode_start=(active_step & (policy_state.step_count == 0)).astype(jnp.int8),
                 flat_obs=flat_obs,
@@ -2769,6 +2799,8 @@ def build_compiled_grouped_opponent_rollout_runner(
                 jnp.zeros_like(env_out.done.astype(jnp.int8)),
             )
             transition = TrajectoryBatch(
+                pressure_diagnostics=build_pressure_diagnostics(static, policy_state, active_step, jnp),
+                terminal_learner_win_score=_terminal_learner_win_score(static, env_out.state, jnp),
                 active_mask=active_step.astype(jnp.float32),
                 episode_start=(active_step & (policy_state.step_count == 0)).astype(jnp.int8),
                 flat_obs=flat_obs,
@@ -3175,6 +3207,7 @@ def build_compiled_eval_runner(
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             rebound_metrics = _build_rebound_transition_metrics(env_out, jnp)
             trace = EvalTrace(
+                pressure_diagnostics=build_pressure_diagnostics(static, state, ~state.episode_ended.astype(jnp.bool_), jnp),
                 positions=state.positions,
                 ball_holder=state.ball_holder,
                 shot_clock=state.shot_clock,
@@ -3450,6 +3483,7 @@ def build_compiled_frozen_opponent_eval_runner(
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             rebound_metrics = _build_rebound_transition_metrics(env_out, jnp)
             trace = EvalTrace(
+                pressure_diagnostics=build_pressure_diagnostics(static, state, ~state.episode_ended.astype(jnp.bool_), jnp),
                 positions=state.positions,
                 ball_holder=state.ball_holder,
                 shot_clock=state.shot_clock,
@@ -4432,6 +4466,7 @@ def build_compiled_grouped_opponent_eval_runner(
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             rebound_metrics = _build_rebound_transition_metrics(env_out, jnp)
             trace = EvalTrace(
+                pressure_diagnostics=build_pressure_diagnostics(static, state, ~state.episode_ended.astype(jnp.bool_), jnp),
                 positions=state.positions,
                 ball_holder=state.ball_holder,
                 shot_clock=state.shot_clock,
@@ -4537,6 +4572,8 @@ def build_compiled_deploy_eval_runner(
         zero = jnp.asarray(0.0, dtype=jnp.float32)
         initial_totals = DeployEvalTotals(
             *(
+                jnp.zeros(PRESSURE_SHAPE, dtype=jnp.float32)
+                if field == "pressure_diagnostics" else
                 jnp.zeros(initial_state.episode_ended.shape, dtype=jnp.float32)
                 if field in _DEPLOY_EVAL_PER_EPISODE_CLOCK_FIELDS
                 else zero
@@ -4734,6 +4771,7 @@ def build_compiled_deploy_eval_runner(
             in_overtime = clock_transition["clock_period_index"] > 0
 
             step_totals = DeployEvalTotals(
+                pressure_diagnostics=jnp.sum(build_pressure_diagnostics(static, state, active_step, jnp), axis=0),
                 active_steps=jnp.sum(active_step.astype(jnp.float32)),
                 completed_episode_steps=_active_sum(env_out.terminal_episode_steps),
                 offense_reward=_active_sum(jnp.sum(env_out.rewards[:, offense_ids], axis=1)),
@@ -5408,6 +5446,10 @@ def summarize_deploy_eval_outputs(
     metrics["clock_overtime_team_a_point_differential"] = (
         overtime_team_a_points - overtime_team_b_points
     )
+    pressure_totals = [output.totals.pressure_diagnostics for output in outputs
+                       if output.totals.pressure_diagnostics is not None]
+    if pressure_totals:
+        metrics.update(summarize_pressure_diagnostics(np.asarray(pressure_totals)))
     return metrics
 
 
@@ -6752,6 +6794,7 @@ def summarize_training_step(
         "advantage_std": advantage_std,
     }
     summary.update(episode_metrics)
+    summary.update(summarize_pressure_diagnostics(getattr(rollout_out.trajectory, "pressure_diagnostics", None)))
     summary.update(
         summarize_completed_possession_pace(
             rollout_out.trajectory.possession_ended,

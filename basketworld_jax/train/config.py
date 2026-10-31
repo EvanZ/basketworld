@@ -545,6 +545,12 @@ def get_parser() -> argparse.ArgumentParser:
         default=10,
         help="Number of recent checkpoints to keep in opponent pool (K parameter).",
     )
+    parser.add_argument("--opponent-pool-sampling", choices=("recency", "pfsp"), default="recency",
+                        help="Opponent sampler: legacy recency or opt-in blended PFSP over all eligible checkpoints.")
+    parser.add_argument("--opponent-pfsp-alpha", type=float, default=0.5,
+                        help="PFSP blend in [0,1]: 0 favors even matches; 1 favors hard opponents.")
+    parser.add_argument("--opponent-pfsp-epsilon", type=float, default=0.1,
+                        help="PFSP uniform exploration fraction over the eligible archive, in [0,1].")
     parser.add_argument(
         "--opponent-pool-beta",
         type=float,

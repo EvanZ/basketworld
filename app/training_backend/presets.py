@@ -89,6 +89,14 @@ def build_halfcourt_multi_possession_preview(
     if mlflow_resume_run_id:
         values["mlflow_resume_run_id"] = str(mlflow_resume_run_id)
     trainer_argv = compile_config_values(values, schema, require_editable=False)
+    # Fail invalid PFSP controls at preview/save time, before launching a worker.
+    from basketworld_jax.train.pfsp import probabilities
+    probabilities([], float(values.get("opponent_pfsp_alpha", 0.5)),
+                  float(values.get("opponent_pfsp_epsilon", 0.1)))
+    if values.get("opponent_pool_sampling") == "pfsp" and (
+        not values.get("enable_multi_possession", True) or values.get("disable_opponent_pool", False)
+    ):
+        raise ValueError("PFSP requires multi-possession games and an enabled opponent pool.")
     argv = [
         str(python_bin),
         "-m",

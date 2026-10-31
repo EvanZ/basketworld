@@ -20,6 +20,7 @@ import {
   savedHistoricalEvalUpdates,
 } from './configEditing'
 import { launchGitCommit, launchWorktreeState } from './runProvenance'
+import { pfspRows, metricDefinition } from './pfsp'
 
 const defaultConfig = () => ({
   name: `halfcourt-${new Date().toISOString().slice(0, 10)}`,
@@ -45,8 +46,11 @@ const defaultConfig = () => ({
 
 const PIN_STORAGE_KEY = 'basketworld.training.pinned-configs.v1'
 const PIN_MIGRATION_KEY = 'basketworld.training.pinned-configs.migration.v1'
-const PIN_MIGRATION_VERSION = 'autoregressive-team-actions-v6'
+const PIN_MIGRATION_VERSION = 'pfsp-opponents-v7'
 const MIGRATED_PINNED_FIELDS = [
+  'opponent_pool_sampling',
+  'opponent_pfsp_alpha',
+  'opponent_pfsp_epsilon',
   'entropy_decay_updates',
   'attention_num_layers',
   'team_action_mode',
@@ -71,6 +75,9 @@ const DEFAULT_METRICS = [
   'jax/train/game_reward_mean',
 ]
 const DEFAULT_PINNED_FIELDS = [
+  'opponent_pool_sampling',
+  'opponent_pfsp_alpha',
+  'opponent_pfsp_epsilon',
   'mlflow_run_name',
   'mlflow_experiment_name',
   'num_updates',
@@ -174,6 +181,7 @@ const launching = ref(false)
 const error = ref('')
 const logs = ref('')
 const availableMetrics = ref([])
+const pfspOpponents = computed(() => pfspRows(availableMetrics.value))
 const selectedMetricNames = ref(loadSelectedMetricNames())
 const metricSeries = ref({})
 const metricToAdd = ref('')
@@ -282,7 +290,7 @@ const addableMetrics = computed(() => availableMetrics.value.filter((metric) => 
 const metricPickerResults = computed(() => {
   const query = metricToAdd.value.trim().toLowerCase()
   return addableMetrics.value
-    .filter((metric) => !query || metric.name.toLowerCase().includes(query))
+    .filter((metric) => !query || metric.name.toLowerCase().includes(query) || metricLabel(metric.name).toLowerCase().includes(query))
     .slice(0, 60)
 })
 const metricCards = computed(() => selectedMetricNames.value.map((name) => ({
@@ -380,7 +388,8 @@ async function copyMlflowRunId(runId) {
 }
 
 function metricLabel(name) {
-  return name.replace(/^jax\/(train|eval)\//, '').replaceAll('_', ' ')
+  return name.replace(/^jax\/(train|eval(?:_deploy|_offense|_defense|_historical)?)\//, '')
+    .replaceAll('_esv', '_expected_shot_value').replaceAll('_', ' ')
 }
 
 function formatMetricValue(value) {
@@ -1233,6 +1242,32 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <div class="panel metrics-panel">
+            <details v-if="eloSummary?.matchup_win_scores?.length">
+              <summary>Historical per-opponent win scores (w_eval)</summary>
+              <p>Empirical (wins + 0.5 × ties) / completed games. Truncations excluded; not Elo-predicted scores or training PFSP estimates.</p>
+              <table>
+                <thead><tr><th>Candidate</th><th>Opponent</th><th>Mode</th><th>w_eval</th><th>Games</th><th>W / T / L</th><th>Truncated</th></tr></thead>
+                <tbody><tr v-for="(match, index) in eloSummary.matchup_win_scores" :key="index">
+                  <td>U{{ match.candidate_update }}</td><td>U{{ match.opponent_update }}</td><td>{{ match.action_mode }}</td>
+                  <td>{{ formatMetricValue(match.w_eval) }}</td><td>{{ match.completed_games }}</td>
+                  <td>{{ match.wins }} / {{ match.ties }} / {{ match.losses }}</td><td>{{ match.truncated_games }}</td>
+                </tr></tbody>
+              </table>
+            </details>
+            <details v-if="pfspOpponents.length" open>
+              <summary>PFSP opponent sampling</summary>
+              <p>{{ metricDefinition('jax/train/pfsp/w') }}</p>
+              <table>
+                <thead><tr><th>Opponent</th><th>Mode</th><th>w</th><th>Games</th><th>Effective games</th><th>Age (updates)</th><th>Probability</th><th>History</th></tr></thead>
+                <tbody><tr v-for="opponent in pfspOpponents" :key="opponent.name">
+                  <td>{{ opponent.opponent }} (U{{ opponent.update }})</td><td>{{ opponent.mode }}</td>
+                  <td>{{ formatMetricValue(opponent.w) }}{{ opponent.priorOnly ? ' (prior only)' : '' }}</td>
+                  <td>{{ opponent.games }}</td><td>{{ formatMetricValue(opponent.effectiveGames) }}</td>
+                  <td>{{ opponent.priorOnly ? 'Unobserved' : opponent.age }}</td><td>{{ formatMetricValue(opponent.probability) }}</td>
+                  <td><button type="button" @click="chooseMetric(opponent.name)">Chart w</button></td>
+                </tr></tbody>
+              </table>
+            </details>
             <div class="detail-section-heading metrics-heading">
               <div><h3>MLflow metrics</h3><span>{{ selectedMetricNames.length }} pinned · {{ availableMetrics.length }} available</span></div>
               <div class="metric-picker">
@@ -1256,6 +1291,7 @@ onBeforeUnmount(() => {
                   <div><strong>{{ metricLabel(metric.name) }}</strong><small :title="metric.name">{{ metric.name }}</small></div>
                   <button type="button" :aria-label="`Unpin ${metric.name}`" :title="`Unpin ${metric.name}`" @click="removeMetric(metric.name)">×</button>
                 </div>
+                <small v-if="metricDefinition(metric.name)">{{ metricDefinition(metric.name) }}</small>
                 <template v-if="metric.points.length">
                   <div class="metric-value">{{ formatMetricValue(metricStats(metric.points).latest) }} <small>step {{ metricStats(metric.points).step.toLocaleString() }}</small></div>
                   <svg class="sparkline" viewBox="0 0 300 82" preserveAspectRatio="none" role="img" :aria-label="`${metric.name} trend`">

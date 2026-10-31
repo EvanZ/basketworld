@@ -575,6 +575,11 @@ class JobManager:
         if isinstance(saved_config, dict):
             saved_config = dict(saved_config)
             saved_config.setdefault("require_all_offense_clear", False)
+            # Old checkpoints used recency; introducing opt-in PFSP must not
+            # make unchanged legacy resumes fail the config comparison.
+            saved_config.setdefault("opponent_pool_sampling", "recency")
+            saved_config.setdefault("opponent_pfsp_alpha", 0.5)
+            saved_config.setdefault("opponent_pfsp_epsilon", 0.1)
             expected_config = self._resolved_config_from_preview(preview)
             changed = [
                 key

@@ -35,6 +35,7 @@ def _waiting_summary() -> dict[str, Any]:
         "anchor_rating": DEFAULT_ANCHOR_RATING,
         "latest": None,
         "points": [],
+        "matchup_win_scores": [],
         "next_evaluation_update": None,
         "warnings": [],
         "summary": {
@@ -181,6 +182,7 @@ def _compact_summary(
         ),
         "latest": latest,
         "points": points,
+        "matchup_win_scores": historical_win_scores(payload),
         "next_evaluation_update": next_evaluation_update,
         "warnings": warnings,
         "summary": {
@@ -198,6 +200,36 @@ def _compact_summary(
             "size_bytes": signature[1],
         },
     }
+
+
+def historical_win_scores(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Empirical per-match scores, including no-estimate/truncated-only rows.
+
+    Read old counts without changing raw artifacts; never use fitted Elo scores.
+    Keep modes separate even if a future artifact includes sampled matchups.
+    """
+    rows = []
+    for match in payload.get("matches", []) or []:
+        if not isinstance(match, dict) or match.get("self_match"):
+            continue
+        try:
+            candidate, opponent = int(match["candidate_update"]), int(match["opponent_update"])
+            completed, wins, ties, losses, truncated = [int(match[k]) for k in (
+                "completed_episode_count", "candidate_wins", "candidate_ties", "candidate_losses", "truncated_episode_count")]
+        except (KeyError, TypeError, ValueError):
+            continue
+        mode = match.get("action_mode")
+        if (candidate == opponent or mode not in ("sampled", "deterministic")
+                or min(completed, wins, ties, losses, truncated) < 0
+                or wins + ties + losses != completed):
+            continue
+        rows.append({
+            "candidate_update": candidate, "opponent_update": opponent,
+            "action_mode": mode, "completed_games": completed, "truncated_games": truncated,
+            "wins": wins, "ties": ties, "losses": losses,
+            "w_eval": (wins + 0.5 * ties) / completed if completed else None,
+        })
+    return sorted(rows, key=lambda row: (row["candidate_update"], row["opponent_update"], row["action_mode"]))
 
 
 def historical_elo_summary(artifact_path: str | Path) -> dict[str, Any]:

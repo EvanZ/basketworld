@@ -10,6 +10,23 @@ from app.training_backend.presets import (
 )
 
 
+def test_pfsp_controls_survive_create_copy_and_resume_preview(tmp_path):
+    overrides = {"opponent_pool_sampling": "pfsp", "opponent_pfsp_alpha": 0.75, "opponent_pfsp_epsilon": 0.2}
+    config = TrainingRunConfig(overrides=overrides)
+    copied = TrainingRunConfig.model_validate_json(config.model_dump_json())
+    for checkpoint in (None, str(tmp_path / "checkpoint")):
+        preview = build_halfcourt_multi_possession_preview(
+            config=copied, run_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            repo_root=tmp_path, data_dir=tmp_path / "data", resume_checkpoint=checkpoint)
+        for key, value in overrides.items():
+            assert preview.argv[preview.argv.index("--" + key.replace("_", "-")) + 1] == str(value)
+    for value in (float("nan"), -0.1, 1.1):
+        invalid = TrainingRunConfig(overrides={**overrides, "opponent_pfsp_epsilon": value})
+        with pytest.raises(ValueError, match="PFSP"):
+            build_halfcourt_multi_possession_preview(config=invalid,
+                run_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", repo_root=tmp_path, data_dir=tmp_path / "data")
+
+
 def test_short_run_filters_default_historical_milestones(tmp_path):
     config = TrainingRunConfig(num_updates=500)
     preview = build_halfcourt_multi_possession_preview(

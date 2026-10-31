@@ -5,6 +5,24 @@ import json
 from app.training_backend import historical_elo
 
 
+def test_empirical_win_score_includes_ties_and_separates_modes_without_rewriting(tmp_path):
+    artifact = tmp_path / historical_elo.HISTORICAL_EVAL_FILENAME
+    tied = _match(500, 100, wins=3, losses=1, truncated=7)
+    tied.update(candidate_ties=2, completed_episode_count=6)
+    sampled = {**tied, "action_mode": "sampled", "candidate_wins": 1, "candidate_losses": 3}
+    empty = _match(500, 250, wins=0, losses=0, truncated=10)
+    _write_payload(artifact, [tied, sampled, empty])
+    original = artifact.read_bytes()
+    result = historical_elo.historical_elo_summary(artifact)
+    rows = result["matchup_win_scores"]
+    assert len(rows) == 3
+    assert rows[0]["w_eval"] == 4 / 6
+    assert rows[1]["w_eval"] == 2 / 6
+    assert rows[2]["w_eval"] is None
+    assert rows[0]["truncated_games"] == 7
+    assert artifact.read_bytes() == original
+
+
 def _match(
     candidate: int,
     opponent: int,
