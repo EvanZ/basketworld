@@ -3121,6 +3121,7 @@ def run_native_jax_evaluation(
     evaluation_batch_size: int | None = None,
     progress_callback=None,
     progress_event_callback=None,
+    batch_result_callback=None,
     unified_checkpoint_payload: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     def _emit_progress_event(phase: str, **details: Any) -> None:
@@ -5232,6 +5233,12 @@ def run_native_jax_evaluation(
         )
         all_inbound_events.extend([int(v) for v in stats["inbound_events"].tolist()])
         completed_episodes += take
+        if batch_result_callback is not None:
+            batch_result_callback(
+                results[-take:],
+                int(completed_episodes),
+                int(num_episodes),
+            )
         _emit_progress_event(
             "batch_completed",
             completed_episodes=int(completed_episodes),

@@ -23,6 +23,7 @@ import {
   normalizeEpisodeFrameRange,
   updateEpisodeFrameBoundary,
 } from './utils/episodeFrameRange';
+import { usesBackendJointPolicyActions } from './utils/teamActionMode';
 
 function cloneState(state) {
   return state ? JSON.parse(JSON.stringify(state)) : null;
@@ -1782,7 +1783,15 @@ async function handleActionsSubmitted(actions) {
     if (shouldUseMcts) {
       isMctsStepRunning.value = true;
     }
-    const response = await stepGame(actions, playerDeterministic.value, opponentDeterministic.value, mctsOptionsForStep.value);
+    const backendSelectsJointActions = (
+      aiMode.value && usesBackendJointPolicyActions(gameState.value)
+    );
+    const response = await stepGame(
+      backendSelectsJointActions ? {} : actions,
+      playerDeterministic.value,
+      opponentDeterministic.value,
+      mctsOptionsForStep.value,
+    );
      if (response.status === 'success') {
       gameState.value = response.state;
       gameHistory.value.push(cloneState(response.state));
@@ -2460,6 +2469,7 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
   while (isCurrentGameSession(activeGameSessionId) && isCurrentSelfPlaySession(sessionId) && gameState.value && !gameState.value.done) {
     try {
       const visibleStepStartedAt = performance.now();
+      const backendSelectsJointActions = usesBackendJointPolicyActions(gameState.value);
       // Get AI actions for user-controlled players
       let aiActions = {};
       const mctsTargets = new Set();
@@ -2473,7 +2483,7 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
         }
       }
       
-      if (!useFastMode && policyProbs.value) {
+      if (!useFastMode && !backendSelectsJointActions && policyProbs.value) {
         // Determine which players are user-controlled
         const userControlledIds = Array.isArray(gameState.value.user_player_ids)
           ? gameState.value.user_player_ids
@@ -2635,7 +2645,7 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
         await nextTick();
       }
       const response = await stepGame(
-        useFastMode ? {} : aiActions,
+        (useFastMode || backendSelectsJointActions) ? {} : aiActions,
         playerDeterministic.value,
         opponentDeterministic.value,
         useFastMode ? null : mctsOptions,
@@ -2649,8 +2659,10 @@ async function handleSelfPlay(preselected = null, startTemplateOptions = null) {
           : response.state;
         gameState.value = nextState;
         gameHistory.value.push(cloneState(nextState));
-        if (useFastMode) {
+        if (useFastMode || backendSelectsJointActions) {
           currentSelections.value = buildDisplayActions(response.actions_taken, response.actions_taken_meta);
+        }
+        if (useFastMode) {
           if (response.fast_kernel) {
             applyFastKernelStatus(response.fast_kernel);
             if (fastSelfPlayWarming.value) startFastSelfPlayStatusPolling();

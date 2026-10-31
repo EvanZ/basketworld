@@ -2127,21 +2127,6 @@ function getActionIndicator(playerId, playerX, playerY, hasBall) {
     };
   }
   
-  if (action === 'SHOOT' && (hasBall || props.disableTransitions)) {
-    // Point toward basket
-    const basket = basketPosition.value;
-    const dx = basket.x - playerX;
-    const dy = basket.y - playerY;
-    const posAngle = Math.atan2(dy, dx) * 180 / Math.PI;
-    const rad = Math.atan2(dy, dx);
-    return {
-      type: 'shoot',
-      x: playerX + indicatorRadius * Math.cos(rad),
-      y: playerY + indicatorRadius * Math.sin(rad),
-      rotation: 0, // Target icon doesn't need rotation
-    };
-  }
-  
   return null;
 }
 
@@ -5584,7 +5569,7 @@ onBeforeUnmount(() => {
                 </g>
               </g>
             </g>
-            <!-- Action indicator (move arrow, pass hand, or shoot target) using native SVG -->
+            <!-- Action indicator (move arrow or pass hand) using native SVG -->
             <g 
               v-if="draggedPlayerId !== player.id && getActionIndicator(player.id, player.x, player.y, player.hasBall)"
               class="action-indicator"
@@ -5609,12 +5594,6 @@ onBeforeUnmount(() => {
                   d="M0,-7 L4,3 L1,1 L1,7 L-1,7 L-1,1 L-4,3 Z" 
                   class="action-pass"
                 />
-              </g>
-              <!-- Shoot indicator (bullseye style target) -->
-              <g v-if="getActionIndicator(player.id, player.x, player.y, player.hasBall).type === 'shoot'">
-                <circle r="6" class="action-shoot-outer" />
-                <circle r="3" class="action-shoot-middle" />
-                <circle r="1.5" class="action-shoot-inner" />
               </g>
             </g>
           </g>
@@ -7713,21 +7692,6 @@ onBeforeUnmount(() => {
   stroke-width: 1;
   filter: drop-shadow(0 0 2px rgba(0,0,0,0.8));
 }
-.action-shoot-outer {
-  fill: none;
-  stroke: #ff4500;
-  stroke-width: 2;
-  filter: drop-shadow(0 0 2px rgba(0,0,0,0.8));
-}
-.action-shoot-middle {
-  fill: none;
-  stroke: #ff4500;
-  stroke-width: 1.5;
-}
-.action-shoot-inner {
-  fill: #ff4500;
-}
-
 .ghost {
   stroke: none;
 }
