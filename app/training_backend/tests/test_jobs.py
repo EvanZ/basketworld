@@ -440,3 +440,28 @@ def test_resume_preflight_defaults_missing_team_clearance_to_false(tmp_path):
     )
     with pytest.raises(RuntimeError, match="require_all_offense_clear"):
         manager._preflight_resume(checkpoint=str(checkpoint), preview=enabled_preview)
+
+
+def test_legacy_resume_defaults_missing_snapshot_interval_to_zero(tmp_path):
+    settings = Settings(
+        repo_root=tmp_path / "repo", data_dir=tmp_path / "data",
+        database_path=tmp_path / "data" / "training.duckdb",
+        cors_origins=(), poll_interval_seconds=0.01,
+    )
+    settings.ensure_directories()
+    manager = JobManager(settings, TrainingRepository(settings.database_path))
+    config = TrainingRunConfig(overrides={"opponent_snapshot_every_updates": 0, "opponent_pool_size": 30})
+    run_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    preview = manager.preview(config, run_id=run_id)
+    checkpoint = tmp_path / "checkpoint"
+    _write_minimal_checkpoint_metadata(checkpoint)
+    metadata_path = checkpoint / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    saved = manager._resolved_config_from_preview(preview)
+    saved.pop("opponent_snapshot_every_updates")
+    metadata["resolved_training_config"] = saved
+    metadata_path.write_text(json.dumps(metadata))
+    manager._preflight_resume(checkpoint=str(checkpoint), preview=preview)
+    enabled = config.model_copy(update={"overrides": {**config.overrides, "opponent_snapshot_every_updates": 50}})
+    with pytest.raises(RuntimeError, match="opponent_snapshot_every_updates"):
+        manager._preflight_resume(checkpoint=str(checkpoint), preview=manager.preview(enabled, run_id=run_id))

@@ -91,6 +91,14 @@ def build_halfcourt_multi_possession_preview(
     trainer_argv = compile_config_values(values, schema, require_editable=False)
     # Fail invalid PFSP controls at preview/save time, before launching a worker.
     from basketworld_jax.train.pfsp import probabilities
+    from basketworld_jax.train.opponent_cache import validate_cache_config
+
+    validate_cache_config(
+        values.get("opponent_snapshot_every_updates", 0),
+        values.get("opponent_pool_size", 10),
+        multi_possession=values.get("enable_multi_possession", True),
+        disabled=values.get("disable_opponent_pool", False),
+    )
     probabilities([], float(values.get("opponent_pfsp_alpha", 0.5)),
                   float(values.get("opponent_pfsp_epsilon", 0.1)))
     if values.get("opponent_pool_sampling") == "pfsp" and (

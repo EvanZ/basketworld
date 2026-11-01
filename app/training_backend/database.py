@@ -123,6 +123,18 @@ class TrainingRepository:
             ("provenance_json", "provenance"),
         ):
             decoded[target] = json.loads(decoded.pop(source) or "{}")
+        command = decoded["command"]
+        if "basketworld_jax.train.main" in command:
+            overrides = decoded["config"].setdefault("overrides", {})
+            # Read-time compatibility only: immutable launch commands remain
+            # the source of truth; do not rewrite old stored configuration.
+            for name, legacy in (
+                ("opponent_snapshot_every_updates", 0),
+                ("opponent_pool_size", 10),
+            ):
+                flag = "--" + name.replace("_", "-")
+                value = command[command.index(flag) + 1] if flag in command else legacy
+                overrides.setdefault(name, int(value))
         return decoded
 
     def create_run(self, payload: dict[str, Any]) -> dict[str, Any]:

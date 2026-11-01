@@ -543,7 +543,14 @@ def get_parser() -> argparse.ArgumentParser:
         "--opponent-pool-size",
         type=int,
         default=10,
-        help="Number of recent checkpoints to keep in opponent pool (K parameter).",
+        help="Cache capacity with snapshot cadence > 0; legacy recent sampling window otherwise.",
+    )
+    parser.add_argument(
+        "--opponent-snapshot-every-updates",
+        type=int,
+        default=0,
+        help="Capture weight-only opponents at U1, then every N updates (recommended 50); "
+        "0 preserves legacy checkpoint-based pooling. Independent of disk/Elo schedules.",
     )
     parser.add_argument("--opponent-pool-sampling", choices=("recency", "pfsp"), default="recency",
                         help="Opponent sampler: legacy recency or opt-in blended PFSP over all eligible checkpoints.")

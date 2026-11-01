@@ -98,18 +98,31 @@ class PFSPState:
     def observe(
         self, identity, mode, scores, *, update, role, truncated=0, role_counts=None
     ):
-        entry = self._entry(identity, mode)
-        entry["truncated_games"] += int(truncated)
         scores = np.asarray(scores, dtype=np.float64)
-        if not scores.size:
-            return
         if role not in ("offense", "defense") or not np.all(
             np.isin(scores, [0.0, 0.5, 1.0])
         ):
             raise ValueError("Invalid PFSP game outcomes or starting side")
+        self._observe_totals(
+            identity,
+            mode,
+            float(scores.sum()),
+            int(scores.size),
+            update=update,
+            truncated=truncated,
+            role_counts=role_counts or {role: int(scores.size)},
+        )
+
+    def _observe_totals(
+        self, identity, mode, score_sum, games, *, update, truncated, role_counts
+    ):
+        entry = self._entry(identity, mode)
+        entry["truncated_games"] += int(truncated)
+        if not games:
+            return
         total, count = self._aged(entry, update)
-        total += float(scores.sum())
-        count += scores.size
+        total += score_sum
+        count += games
         scale = min(1.0, MAX_EFFECTIVE_GAMES / count)
         entry.update(
             score_sum=total * scale,
@@ -117,9 +130,9 @@ class PFSPState:
             evidence_update=int(update),
             last_observed_update=int(update),
         )
-        entry["completed_games"] += int(scores.size)
-        for side, games in (role_counts or {role: int(scores.size)}).items():
-            entry[f"{side}_start_games"] += int(games)
+        entry["completed_games"] += int(games)
+        for side, role_games in role_counts.items():
+            entry[f"{side}_start_games"] += int(role_games)
 
     def sampling_snapshot(self, candidates, *, update, alpha, epsilon):
         """Snapshot BEFORE the rollout: logged w equals the sampling input."""
@@ -133,12 +146,21 @@ class PFSPState:
                 rows.append(
                     (identity, entry, (score + 1.0) / (count + 2.0), count, candidate)
                 )
-            probs = probabilities([row[2] for row in rows], alpha, epsilon)
+            eligible = np.asarray(
+                [not row[4]["info"].get("cache_retiring", False) for row in rows],
+                dtype=bool,
+            )
+            probs = np.zeros(len(rows), dtype=np.float32)
+            probs[eligible] = probabilities(
+                [row[2] for row, keep in zip(rows, eligible) if keep], alpha, epsilon
+            )
             distributions.append(probs)
             for (identity, entry, w, count, candidate), probability in zip(
                 rows, probs, strict=True
             ):
                 values = {
+                    "snapshot_update": int(update),
+                    "retiring": float(candidate["info"].get("cache_retiring", False)),
                     "w": w,
                     "probability": float(probability),
                     "effective_games": count,
@@ -173,57 +195,68 @@ class PFSPState:
         self.observe_rollouts({role: trajectory}, candidates, update=update)
 
     def observe_rollouts(self, trajectories, candidates, *, update):
-        """Consume terminal PRE-reset scores/assignment; never infer from rewards."""
+        """Aggregate once per rollout, not one full-array scan per opponent."""
+        count = len(candidates)
+        if not count:
+            return
         batches = {}
         for role, trajectory in trajectories.items():
             active = np.asarray(trajectory.active_mask) > 0
-            batches[role] = (
-                active,
-                active & (np.asarray(trajectory.dones) > 0),
-                np.asarray(trajectory.truncated) > 0,
-                np.asarray(trajectory.opponent_assignment),
-                np.asarray(trajectory.opponent_deterministic_episode) > 0,
-                np.asarray(trajectory.terminal_learner_win_score),
-                np.asarray(getattr(trajectory, "episode_start", np.zeros_like(active)))
-                > 0,
+            assignments = np.asarray(trajectory.opponent_assignment, dtype=np.int32)
+            modes = (np.asarray(trajectory.opponent_deterministic_episode) > 0).astype(
+                np.int32
             )
+            valid = active & (assignments >= 0) & (assignments < count)
+            index = assignments * 2 + modes
+            ended = valid & (np.asarray(trajectory.dones) > 0)
+            truncated = np.asarray(trajectory.truncated) > 0
+            completed = ended & ~truncated
+            scores = np.asarray(trajectory.terminal_learner_win_score)
+            if not np.all(np.isin(scores[completed], [0.0, 0.5, 1.0])):
+                raise ValueError("Invalid PFSP game outcomes")
+            starts = (
+                np.asarray(getattr(trajectory, "episode_start", np.zeros_like(active)))
+                > 0
+            )
+
+            def aggregate(mask, weights=None):
+                return np.bincount(
+                    index[mask], weights=weights, minlength=count * 2
+                ).reshape(count, 2)
+
+            batches[role] = {
+                "games": aggregate(completed),
+                "scores": aggregate(completed, scores[completed]),
+                "truncated": aggregate(ended & truncated),
+                "assigned": aggregate(valid & starts),
+                "active": aggregate(valid),
+            }
         for index, candidate in enumerate(candidates):
             for deterministic, mode in enumerate(MODES):
-                outcomes, role_counts, truncated_count = [], {}, 0
                 entry = self._entry(opponent_id(candidate["info"]), mode)
-                for role, (
-                    active,
-                    ended,
-                    truncated,
-                    assignments,
-                    modes,
-                    scores,
-                    starts,
-                ) in batches.items():
-                    selected = (
-                        ended & (assignments == index) & (modes == bool(deterministic))
+
+                def total(name):
+                    return sum(
+                        batch[name][index, deterministic] for batch in batches.values()
                     )
-                    exposure = (
-                        active & (assignments == index) & (modes == bool(deterministic))
-                    )
-                    entry["assigned_games"] = entry.get("assigned_games", 0) + int(
-                        np.count_nonzero(exposure & starts)
-                    )
-                    entry["active_steps"] = entry.get("active_steps", 0) + int(
-                        np.count_nonzero(exposure)
-                    )
-                    result = scores[selected & ~truncated]
-                    outcomes.append(result)
-                    role_counts[role] = result.size
-                    truncated_count += int(np.count_nonzero(selected & truncated))
+
+                entry["assigned_games"] = entry.get("assigned_games", 0) + int(
+                    total("assigned")
+                )
+                entry["active_steps"] = entry.get("active_steps", 0) + int(
+                    total("active")
+                )
                 # Cap evidence once per update, not once per starting side:
                 # batched simultaneous games must not favor the second side.
-                self.observe(
+                self._observe_totals(
                     opponent_id(candidate["info"]),
                     mode,
-                    np.concatenate(outcomes),
+                    total("scores"),
+                    int(total("games")),
                     update=update,
-                    role="offense",
-                    role_counts=role_counts,
-                    truncated=truncated_count,
+                    truncated=int(total("truncated")),
+                    role_counts={
+                        role: int(batch["games"][index, deterministic])
+                        for role, batch in batches.items()
+                    },
                 )

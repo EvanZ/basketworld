@@ -19,7 +19,15 @@ if __package__ in (None, ""):
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-from basketworld_jax.train.pfsp import PFSPState, probabilities as pfsp_probabilities
+from basketworld_jax.train.pfsp import (
+    PFSPState,
+    opponent_id,
+    probabilities as pfsp_probabilities,
+)
+from basketworld_jax.train.opponent_cache import (
+    OpponentSnapshotCache,
+    validate_cache_config,
+)
 from basketworld_jax.train.pressure_metrics import summarize_pressure_diagnostics
 
 from basketworld.utils.mlflow_config import setup_mlflow
@@ -1752,6 +1760,12 @@ def _values_match(actual: Any, expected: Any) -> bool:
 
 def validate_train_args(args) -> None:
     try:
+        validate_cache_config(
+            getattr(args, "opponent_snapshot_every_updates", 0),
+            getattr(args, "opponent_pool_size", 10),
+            multi_possession=getattr(args, "enable_multi_possession", False),
+            disabled=getattr(args, "disable_opponent_pool", False),
+        )
         pfsp_probabilities([], float(getattr(args, "opponent_pfsp_alpha", 0.5)),
                            float(getattr(args, "opponent_pfsp_epsilon", 0.1)))
     except ValueError as exc:
@@ -3836,6 +3850,20 @@ def _opponent_candidate_probabilities(
     count = len(candidates)
     if count <= 0:
         return np.zeros((0,), dtype=np.float32)
+    if int(getattr(args, "opponent_snapshot_every_updates", 0)) > 0:
+        # Cache slot indices are stable, not chronological after replacement.
+        order = sorted(
+            range(count),
+            key=lambda i: int(candidates[i]["info"].get("update_index", 0)),
+        )
+        legacy_args = copy(args)
+        legacy_args.opponent_snapshot_every_updates = 0
+        ordered = _opponent_candidate_probabilities(
+            [candidates[i] for i in order], args=legacy_args
+        )
+        result = np.zeros(count, dtype=np.float32)
+        result[order] = ordered
+        return result
     recent_count = max(1, min(int(getattr(args, "opponent_pool_size", 10)), count))
     recent_start = count - recent_count
     beta = float(np.clip(float(getattr(args, "opponent_pool_beta", 0.7)), 0.0, 1.0))
@@ -3892,14 +3920,19 @@ def _build_opponent_pool_checkpoint_state(
     jnp,
     pfsp_state=None,
     sampling_config=None,
+    snapshot_cache=None,
 ):
     return {
         "enabled": bool(enabled),
         "candidate_infos": [dict(candidate["info"]) for candidate in candidates],
-        "candidate_params": _stack_opponent_candidate_params(
-            candidates,
-            jax=jax,
-            jnp=jnp,
+        "candidate_params": (
+            snapshot_cache.compact_params()
+            if snapshot_cache is not None
+            else _stack_opponent_candidate_params(candidates, jax=jax, jnp=jnp)
+        ),
+        "cache_state": None if snapshot_cache is None else snapshot_cache.payload(),
+        "pending_params": (
+            None if snapshot_cache is None else snapshot_cache.pending_params
         ),
         "assignments": dict(assignments),
         "deterministic_modes": dict(deterministic_modes),
@@ -4349,7 +4382,12 @@ def _log_mlflow_params(
             getattr(args, "disable_opponent_pool", False)
         ),
         "jax/opponent_pool_size": int(getattr(args, "opponent_pool_size", 10)),
-        "jax/opponent_pool_sampling": str(getattr(args, "opponent_pool_sampling", "recency")),
+        "jax/opponent_snapshot_every_updates": int(
+            getattr(args, "opponent_snapshot_every_updates", 0)
+        ),
+        "jax/opponent_pool_sampling": str(
+            getattr(args, "opponent_pool_sampling", "recency")
+        ),
         "jax/opponent_pfsp_alpha": float(getattr(args, "opponent_pfsp_alpha", 0.5)),
         "jax/opponent_pfsp_epsilon": float(getattr(args, "opponent_pfsp_epsilon", 0.1)),
         "jax/opponent_pool_beta": float(getattr(args, "opponent_pool_beta", 0.7)),
@@ -4748,8 +4786,12 @@ def _filter_mlflow_train_metrics(
         return dict(metrics)
     if profile != "core":
         raise ValueError(f"Unknown MLflow metric profile: {profile}")
-    return {key: value for key, value in metrics.items()
-            if key in _CORE_TRAIN_METRICS or key.startswith(("pfsp/", "pressure/"))}
+    return {
+        key: value
+        for key, value in metrics.items()
+        if key in _CORE_TRAIN_METRICS
+        or key.startswith(("pfsp/", "pressure/", "opponent_cache/"))
+    }
 
 
 def _filter_mlflow_deploy_metrics(
@@ -7664,6 +7706,9 @@ def run_training_loop(args) -> dict[str, Any]:
     intent_sample_artifacts: list[str] = []
     opponent_rng = np.random.default_rng(int(args.policy_seed) + 90_001)
     opponent_pool_enabled = not bool(getattr(args, "disable_opponent_pool", False))
+    cache_interval = int(getattr(args, "opponent_snapshot_every_updates", 0))
+    restored_cache_state = None
+    restored_pending_params = None
     pfsp_enabled = getattr(args, "opponent_pool_sampling", "recency") == "pfsp"
     pfsp_state = PFSPState() if pfsp_enabled else None
     sampling_config = {
@@ -7888,6 +7933,18 @@ def run_training_loop(args) -> dict[str, Any]:
         else:
             base_key = jax.device_put(checkpoint_payload["base_key"])
         restored_opponent_pool = checkpoint_payload.get("opponent_pool_state")
+        restored_cache_state = (restored_opponent_pool or {}).get("cache_state")
+        restored_pending_params = (restored_opponent_pool or {}).get("pending_params")
+        if bool(restored_cache_state) != bool(cache_interval):
+            raise SystemExit(
+                "Opponent snapshot cache mode differs from the resume checkpoint; "
+                "legacy runs require --opponent-snapshot-every-updates 0."
+            )
+        if restored_cache_state and reset_resume_env_state:
+            raise SystemExit(
+                "A cached-opponent resume must preserve its pinned game state; "
+                "start a fresh run for incompatible environment changes."
+            )
         saved_sampling = (restored_opponent_pool or {}).get("sampling_config")
         if saved_sampling and saved_sampling["mode"] != sampling_config["mode"]:
             raise SystemExit("Opponent sampling mode differs from the resume checkpoint.")
@@ -7915,17 +7972,37 @@ def run_training_loop(args) -> dict[str, Any]:
             restored_assignments = dict(
                 restored_opponent_pool.get("assignments", {}) or {}
             )
-            (
-                restored_infos,
-                restored_params,
-                restored_assignments,
-                removed_opponent_updates,
-            ) = _filter_restored_opponent_pool_candidates(
-                restored_infos,
-                restored_params,
-                restored_assignments,
-                scheduled_updates=scheduled_opponent_checkpoint_updates,
-            )
+            removed_opponent_updates = []
+            if restored_cache_state:
+                if any(
+                    info.get("opponent_pool_eligible") is False
+                    for info in restored_infos
+                ):
+                    raise SystemExit(
+                        "Invalid cached opponent eligibility in resume checkpoint."
+                    )
+                if any(
+                    np.any(
+                        (np.asarray(values) < -1)
+                        | (np.asarray(values) >= len(restored_infos))
+                    )
+                    for values in restored_assignments.values()
+                ):
+                    raise SystemExit(
+                        "Invalid cached opponent assignment in resume checkpoint."
+                    )
+            else:
+                (
+                    restored_infos,
+                    restored_params,
+                    restored_assignments,
+                    removed_opponent_updates,
+                ) = _filter_restored_opponent_pool_candidates(
+                    restored_infos,
+                    restored_params,
+                    restored_assignments,
+                    scheduled_updates=scheduled_opponent_checkpoint_updates,
+                )
             if removed_opponent_updates:
                 removed_labels = ", ".join(
                     str(update) for update in sorted(set(removed_opponent_updates))
@@ -8038,6 +8115,7 @@ def run_training_loop(args) -> dict[str, Any]:
     if (
         str(getattr(args, "continue_run_id", "") or "").strip()
         and opponent_pool_enabled
+        and not restored_cache_state
     ):
         continuation_candidates, continuation_pool_info = (
             _load_continuation_opponent_candidates(
@@ -8089,6 +8167,25 @@ def run_training_loop(args) -> dict[str, Any]:
                 f"{continuation_pool_info.get('run_id') if continuation_pool_info else ''}."
             )
 
+    snapshot_cache = None
+    if cache_interval:
+        snapshot_cache = OpponentSnapshotCache(
+            opponent_candidates,
+            capacity=int(args.opponent_pool_size),
+            interval=cache_interval,
+            template=params,
+            jax=jax,
+            jnp=jnp,
+            state=restored_cache_state,
+            pending_params=(
+                None
+                if restored_pending_params is None
+                else jax.device_put(restored_pending_params)
+            ),
+        )
+        opponent_params = grouped_opponent_params = None
+    cached_candidate_params = None
+    cached_candidate_count = -1
     cumulative_episode_usage = _init_cumulative_episode_usage(last_metrics)
 
     mlflow, mlflow_context = _maybe_start_mlflow_run(args, mode="train")
@@ -8193,15 +8290,19 @@ def run_training_loop(args) -> dict[str, Any]:
                     update_idx,
                 )
             )
-            pinned_candidate_params = (
-                _stack_opponent_candidate_params(
-                    opponent_candidates,
-                    jax=jax,
-                    jnp=jnp,
-                )
-                if pinned_opponent_pool_enabled and opponent_candidates
-                else None
-            )
+            if snapshot_cache is not None:
+                pinned_candidate_params = snapshot_cache.bank
+            else:
+                if (
+                    pinned_opponent_pool_enabled
+                    and opponent_candidates
+                    and len(opponent_candidates) != cached_candidate_count
+                ):
+                    cached_candidate_params = _stack_opponent_candidate_params(
+                        opponent_candidates, jax=jax, jnp=jnp
+                    )
+                    cached_candidate_count = len(opponent_candidates)
+                pinned_candidate_params = cached_candidate_params
             pinned_candidate_probs = (
                 jnp.asarray(
                     _opponent_candidate_probabilities(
@@ -8221,6 +8322,16 @@ def run_training_loop(args) -> dict[str, Any]:
                 )
                 if pinned_candidate_params is not None:
                     pinned_candidate_probs = jnp.asarray(pfsp_probs)
+            if snapshot_cache is not None:
+                pinned_candidate_probs = jnp.asarray(
+                    snapshot_cache.probabilities(pinned_candidate_probs)
+                )
+                pfsp_sampling_metrics.update(snapshot_cache.metrics(update_idx))
+                for index, candidate in enumerate(opponent_candidates):
+                    identity = opponent_id(candidate["info"])
+                    pfsp_sampling_metrics[
+                        f"opponent_cache/recent_assigned_games/{identity}"
+                    ] = float(snapshot_cache.usage[index])
             selector_multiselect_enabled = bool(
                 getattr(args, "intent_selector_multiselect_enabled", False)
             )
@@ -8303,6 +8414,12 @@ def run_training_loop(args) -> dict[str, Any]:
                         float(opponent_deterministic_episode_prob),
                     )
             block_until_ready_tree(role_rollouts)
+            if snapshot_cache is not None:
+                snapshot_cache.observe_rollouts(
+                    {role: role_rollouts[role].trajectory for role in TRAINING_ROLES},
+                    update=update_idx,
+                )
+                pfsp_sampling_metrics.update(snapshot_cache.usage_metrics())
             if pfsp_enabled and pinned_candidate_params is not None:
                 pfsp_state.observe_rollouts(
                     {role: role_rollouts[role].trajectory for role in TRAINING_ROLES},
@@ -9426,6 +9543,29 @@ def run_training_loop(args) -> dict[str, Any]:
                 progress.set_postfix_str(f"deploy_eval:{update_idx}", refresh=False)
 
             last_completed_update = int(update_idx)
+            if snapshot_cache is not None:
+                admission = snapshot_cache.advance(
+                    update=update_idx,
+                    assignments=opponent_assignments,
+                    snapshot_params=(
+                        params
+                        if update_idx == 1 or update_idx % cache_interval == 0
+                        else None
+                    ),
+                )
+                if admission is not None:
+                    print(f"[opponent-cache] {json.dumps(admission, sort_keys=True)}")
+                active_opponent_info = {
+                    "source": "snapshot_cache",
+                    "candidate_count": len(opponent_candidates),
+                    "latest_update_index": max(
+                        (
+                            int(c["info"].get("update_index", 0))
+                            for c in opponent_candidates
+                        ),
+                        default=-1,
+                    ),
+                }
             control_request = read_control_request(getattr(args, "control_file", ""))
             force_control_checkpoint = control_request is not None
             checkpoint_enabled = bool(checkpoint_dir) or mlflow is not None
@@ -9433,6 +9573,7 @@ def run_training_loop(args) -> dict[str, Any]:
             is_periodic_checkpoint = int(update_idx) in periodic_checkpoint_updates
             publish_opponent_candidate = (
                 opponent_pool_enabled
+                and snapshot_cache is None
                 and int(update_idx) in scheduled_opponent_checkpoint_updates
             )
             opponent_pool_checkpoint_reason = (
@@ -9509,6 +9650,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         jnp=jnp,
                         pfsp_state=pfsp_state,
                         sampling_config=sampling_config,
+                        snapshot_cache=snapshot_cache,
                     )
                     if pinned_opponent_pool_enabled
                     else None

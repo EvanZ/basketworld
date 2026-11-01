@@ -64,6 +64,27 @@ def test_repository_round_trip_and_events(tmp_path):
     assert repository.list_events(run_id)[0]["payload"] == {"pid": 123}
 
 
+def test_legacy_pool_config_is_recovered_from_immutable_command_without_conversion(
+    tmp_path,
+):
+    repository = TrainingRepository(tmp_path / "training.duckdb")
+    repository.initialize()
+    payload = _payload(str(uuid4()))
+    payload["command_json"] = json.dumps(
+        ["python", "-m", "basketworld_jax.train.main", "--opponent-pool-size", "30"]
+    )
+    run = repository.create_run(payload)
+    assert run["config"]["overrides"] == {
+        "opponent_pool_size": 30,
+        "opponent_snapshot_every_updates": 0,
+    }
+    with repository._connection() as connection:
+        stored = connection.execute(
+            "SELECT config_json FROM training_runs WHERE id = ?", [run["id"]]
+        ).fetchone()[0]
+    assert json.loads(stored) == {"num_updates": 5}
+
+
 def test_timing_history_is_complete_and_scoped_to_requested_runs(tmp_path):
     repository = TrainingRepository(tmp_path / "training.duckdb")
     repository.initialize()

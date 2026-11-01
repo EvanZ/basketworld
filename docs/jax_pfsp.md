@@ -18,8 +18,97 @@ These numeric defaults are initial implementation choices, not experimentally
 validated settings. Alpha and epsilon must be finite and in [0,1]. PFSP requires
 multi-possession games and an enabled opponent pool. It ignores the legacy
 recency size/beta/exploration weights when selecting among archived candidates.
-It does not change which checkpoints are eligible: unscheduled pause/stop
-snapshots remain resume artifacts, not training opponents.
+With the legacy snapshot interval of zero, it does not change which checkpoints
+are eligible. The independent snapshot cache below uses its own explicit schedule;
+unscheduled pause/stop checkpoints still do not create training opponents.
+
+## In-memory opponent snapshot cache
+
+New trainer runs default to:
+
+- `opponent_snapshot_every_updates=50` (`--opponent-snapshot-every-updates`):
+  capture at **U1, U50, U100, ...**. U1 bootstraps self-play; until then an
+  unseeded run uses uniformly sampled legal actions. Existing games retain that
+  random opponent until reset. Explicit frozen opponents can seed the pool.
+- `opponent_pool_size=600` (`--opponent-pool-size`): maximum resident opponent
+  slots in cache mode, not the number selected each update. Both recency and
+  PFSP sampling can use the cache. Capacity must be at least two.
+
+CLI defaults retain interval zero for compatibility. Zero selects the original
+disk-checkpoint-based admission schedule and keeps pool size's old recent-window
+meaning. Saved legacy trainer runs and imported legacy configs explicitly retain
+zero; they are never silently converted. Editing a copied config to interval 50
+and capacity 600 starts a new cache experiment; resuming an existing run cannot
+change its cache mode, capacity, cadence, or PFSP configuration.
+
+Snapshots contain frozen policy weights, **not optimizer or environment state**.
+There is no per-snapshot file, upload, deploy evaluation, or Elo match. Disk and
+evaluation schedules are unchanged. An ordinary recovery checkpoint contains
+the active pool and any pending weights, so resume remains exact; multiple
+durable checkpoints still each include their pool state (no deduplication claim).
+
+The weight bank has a fixed allocated shape from the start. Admission/replacement
+writes a slot; unchanged updates reuse the same bank object. Small probability
+vectors and outcome statistics still update every rollout. Unused and retiring
+slots have exactly zero sampling probability. A completely empty cache keeps the
+legal-random fallback. Legacy pools also reuse their stacked bank between
+admissions, although their shape still grows when candidates are added.
+
+### Eviction and pinned games
+
+When full, choose the least recently used **eligible** opponent. Usage is the
+number of newly assigned games across both modes/sides, exponentially decayed
+with a 500-update half-life—not lifetime games, episode length, or win score.
+Protect newly admitted opponents for two snapshot intervals, the newest one or
+two snapshots depending on capacity, and up to three spread-out historical
+anchors when capacity permits. These are fixed implementation rules, not extra
+tuning knobs.
+
+A victim first stops receiving new games; its weights remain unchanged until
+all pinned games finish. At most one pending snapshot waits outside the resident
+cache. If another scheduled snapshot arrives while waiting, it replaces the
+pending snapshot, not an active opponent. Admission may therefore be delayed
+under capacity/protection pressure; pending/superseded counts make this visible.
+Resident storage never exceeds capacity, plus one bounded pending weight tree.
+
+Resume restores slot identities/weights, usage, retirement and pending state,
+admission/eviction history, PFSP evidence, pinned games/modes, and RNG. A cache is
+a bounded opponent population, **not full-history FSP**; pruning can remove a
+strategy that would become useful later.
+
+### Usage chart and cache diagnostics
+
+The trainer's primary pool view is a bar chart: **opponent snapshot update** on
+the x-axis and **percentage of newly assigned games in the latest logged rollout**
+on the y-axis. Both starting sides/action modes are combined; legal-random games
+are excluded. Zero assignments show an unavailable sample, not invented usage.
+This is observed usage, not the next-game PFSP selection probability. Old runs
+without per-rollout counters fall back to clearly labeled lifetime assignments.
+PFSP evidence and probabilities remain in collapsed details; inactive modes and
+evicted identities are hidden from the current-pool view. History remains intact.
+
+`jax/train/opponent_cache/` includes `capacity`, `size`, `interval_updates`,
+`newest_snapshot_update`, `pending_snapshot_update`, `retiring_count`, `admissions`,
+`evictions`, `bank_writes`, `bank_bytes`, and `superseded_pending`.
+Per-opponent `usage_percent/<id>`, `assigned_games_latest/<id>`,
+`checkpoint_update/<id>`, and `snapshot_update/<id>` identify the observed rollout.
+`recent_assigned_games/<id>` is the decayed eviction score. Pool/PFSP snapshots
+describe the pre-rollout population; observed usage is collected during that
+rollout. End-of-update admissions appear in the next rollout's metrics.
+
+For the measured 4v4, one-layer AR policy: 98,480 float32 parameters = 393,920
+bytes (0.376 MiB) per snapshot. A 600-slot bank is 225.4 MiB; resident individual
+trees plus the bank are about 450.8 MiB, excluding pending/checkpoint copies,
+temporary buffers, compilation, and other training memory. U1 plus every 50
+updates produces 601 snapshot requests over 30K updates, so a 600-slot cache
+eventually evicts or stages one. This is a storage calculation, not a measured
+whole-training throughput improvement.
+
+A warmed CPU-only bank-maintenance check using that exact tensor shape and 600
+slots measured 0.00055 ms median for an unchanged `advance` call and 0.185 ms
+median / 0.313 ms p95 for a donated slot write (30 samples, one compiled variant).
+Compilation, rollout/PPO work, logging, eviction bookkeeping, and disk IO were
+excluded. This is not a production throughput benchmark.
 
 For recent win score `w` against each candidate:
 

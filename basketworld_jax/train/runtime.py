@@ -1369,10 +1369,16 @@ def sample_pinned_opponent_assignment(probabilities, next_modes, key, jax, jnp):
     else:
         # Preserve the legacy recency runner's exact logits/RNG behavior.
         logits = jnp.log(jnp.maximum(probabilities, 1.0e-12))
-    return jax.random.categorical(
-        key, logits,
+    sampled = jax.random.categorical(
+        key,
+        logits,
         shape=next_modes.shape,
     ).astype(jnp.int32)
+    if probabilities.ndim == 2:
+        # An empty fixed-capacity cache keeps legal-random opponents until a
+        # real reset after the first admission. Unused slots have exact zero.
+        return jnp.where(jnp.sum(conditional, axis=-1) > 0, sampled, -1)
+    return sampled
 
 
 def _truncation_bootstrap_values(

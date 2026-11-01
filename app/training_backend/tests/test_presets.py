@@ -11,7 +11,13 @@ from app.training_backend.presets import (
 
 
 def test_pfsp_controls_survive_create_copy_and_resume_preview(tmp_path):
-    overrides = {"opponent_pool_sampling": "pfsp", "opponent_pfsp_alpha": 0.75, "opponent_pfsp_epsilon": 0.2}
+    overrides = {
+        "opponent_pool_sampling": "pfsp",
+        "opponent_pfsp_alpha": 0.75,
+        "opponent_pfsp_epsilon": 0.2,
+        "opponent_snapshot_every_updates": 50,
+        "opponent_pool_size": 600,
+    }
     config = TrainingRunConfig(overrides=overrides)
     copied = TrainingRunConfig.model_validate_json(config.model_dump_json())
     for checkpoint in (None, str(tmp_path / "checkpoint")):

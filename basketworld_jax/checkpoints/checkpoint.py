@@ -118,9 +118,13 @@ def build_checkpoint_payload(
             "enabled": bool(pool_state.get("enabled", False)),
             "pfsp_state": pool_state.get("pfsp_state"),
             "sampling_config": pool_state.get("sampling_config"),
+            "cache_state": pool_state.get("cache_state"),
         }
         payload["state"]["opponent_candidate_params"] = _tree_to_numpy(
             pool_state.get("candidate_params")
+        )
+        payload["state"]["opponent_pending_params"] = _tree_to_numpy(
+            pool_state.get("pending_params")
         )
         payload["state"]["opponent_assignments"] = _tree_to_numpy(
             pool_state.get("assignments", {})
@@ -238,10 +242,9 @@ def _payload_from_metadata(metadata: dict[str, Any], state: dict[str, Any]) -> d
         payload["opponent_pool_state"] = {
             **pool_meta,
             "candidate_params": state.get("opponent_candidate_params"),
+            "pending_params": state.get("opponent_pending_params"),
             "assignments": state.get("opponent_assignments", {}),
-            "deterministic_modes": state.get(
-                "opponent_deterministic_modes", {}
-            ),
+            "deterministic_modes": state.get("opponent_deterministic_modes", {}),
         }
     if "env_config" in metadata:
         payload["env_config"] = _from_jsonable(metadata["env_config"])

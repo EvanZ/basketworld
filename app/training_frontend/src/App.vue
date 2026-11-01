@@ -21,6 +21,7 @@ import {
 } from './configEditing'
 import { launchGitCommit, launchWorktreeState } from './runProvenance'
 import { pfspRows, metricDefinition } from './pfsp'
+import OpponentUsageChart from './OpponentUsageChart.vue'
 
 const defaultConfig = () => ({
   name: `halfcourt-${new Date().toISOString().slice(0, 10)}`,
@@ -46,8 +47,10 @@ const defaultConfig = () => ({
 
 const PIN_STORAGE_KEY = 'basketworld.training.pinned-configs.v1'
 const PIN_MIGRATION_KEY = 'basketworld.training.pinned-configs.migration.v1'
-const PIN_MIGRATION_VERSION = 'pfsp-opponents-v7'
+const PIN_MIGRATION_VERSION = 'opponent-cache-v8'
 const MIGRATED_PINNED_FIELDS = [
+  'opponent_snapshot_every_updates',
+  'opponent_pool_size',
   'opponent_pool_sampling',
   'opponent_pfsp_alpha',
   'opponent_pfsp_epsilon',
@@ -75,6 +78,8 @@ const DEFAULT_METRICS = [
   'jax/train/game_reward_mean',
 ]
 const DEFAULT_PINNED_FIELDS = [
+  'opponent_snapshot_every_updates',
+  'opponent_pool_size',
   'opponent_pool_sampling',
   'opponent_pfsp_alpha',
   'opponent_pfsp_epsilon',
@@ -1254,8 +1259,9 @@ onBeforeUnmount(() => {
                 </tr></tbody>
               </table>
             </details>
-            <details v-if="pfspOpponents.length" open>
-              <summary>PFSP opponent sampling</summary>
+            <OpponentUsageChart :metrics="availableMetrics" @select-metric="chooseMetric" />
+            <details v-if="pfspOpponents.length">
+              <summary>PFSP scores and sampling details</summary>
               <p>{{ metricDefinition('jax/train/pfsp/w') }}</p>
               <table>
                 <thead><tr><th>Opponent</th><th>Mode</th><th>w</th><th>Games</th><th>Effective games</th><th>Age (updates)</th><th>Probability</th><th>History</th></tr></thead>

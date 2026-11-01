@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Opponent usage component fixture</title></head>
+<body style="min-width:0">
+  <main id="app" style="max-width:900px;margin:24px auto;padding:16px"></main>
+  <script type="module">
+    import { createApp, h } from 'vue'
+    import OpponentUsageChart from '../../src/OpponentUsageChart.vue'
+    import '../../src/styles.css'
+    const dense = new URLSearchParams(location.search).has('dense')
+    const count = dense ? 600 : 3
+    const prefix = 'jax/train/opponent_cache/'
+    const metrics = [
+      { name: prefix + 'usage_update', latest: 1001 },
+      { name: prefix + 'assigned_games_latest', latest: 1000 },
+      { name: prefix + 'capacity', latest: 600 },
+    ]
+    for (let i = 0; i < count; i++) {
+      const update = i ? i * 50 : 1
+      const id = `self_u${update}`
+      for (const [field, latest] of [['snapshot_update', 1001], ['checkpoint_update', update], ['usage_percent', dense ? 100 / count : [15, 30, 55][i]]]) {
+        metrics.push({ name: `${prefix}${field}/${id}`, latest })
+      }
+    }
+    createApp({ render: () => h(OpponentUsageChart, { metrics }) }).mount('#app')
+    setTimeout(() => {
+      document.body.dataset.barCount = document.querySelectorAll('.usage-bar').length
+      document.body.dataset.horizontalOverflow = document.documentElement.scrollWidth > innerWidth
+    }, 300)
+  </script>
+</body>
+</html>

@@ -123,6 +123,20 @@ class JobManager:
                 )
             run_id = str(uuid4())
             preview = self.preview(config, run_id=run_id)
+            # Freeze new defaults in saved configs so future copies/resumes do
+            # not depend on a later application recipe.
+            resolved = resolve_run_training_config(tuple(preview.argv))
+            config = config.model_copy(
+                update={
+                    "overrides": {
+                        **config.overrides,
+                        "opponent_snapshot_every_updates": resolved[
+                            "opponent_snapshot_every_updates"
+                        ],
+                        "opponent_pool_size": resolved["opponent_pool_size"],
+                    }
+                }
+            )
             now = utc_now()
             created = self.repository.create_run(
                 {
@@ -580,6 +594,7 @@ class JobManager:
             saved_config.setdefault("opponent_pool_sampling", "recency")
             saved_config.setdefault("opponent_pfsp_alpha", 0.5)
             saved_config.setdefault("opponent_pfsp_epsilon", 0.1)
+            saved_config.setdefault("opponent_snapshot_every_updates", 0)
             expected_config = self._resolved_config_from_preview(preview)
             changed = [
                 key

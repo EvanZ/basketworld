@@ -112,6 +112,9 @@ def config_from_mlflow_values(
         for name, value in recovered.items()
         if name not in application_field_names and fields[name].get("editable", False)
     }
+    if "opponent_snapshot_every_updates" in fields:
+        base["overrides"].setdefault("opponent_snapshot_every_updates", 0)
+        base["overrides"].setdefault("opponent_pool_size", 10)
     config = TrainingRunConfig.model_validate(base)
     matched = sorted(recovered)
     missing = sorted(name for name in fields if name not in recovered)
