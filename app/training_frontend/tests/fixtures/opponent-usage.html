@@ -7,7 +7,8 @@
     import { createApp, h } from 'vue'
     import OpponentUsageChart from '../../src/OpponentUsageChart.vue'
     import '../../src/styles.css'
-    const dense = new URLSearchParams(location.search).has('dense')
+    const query = new URLSearchParams(location.search)
+    const dense = query.has('dense')
     const count = dense ? 600 : 3
     const prefix = 'jax/train/opponent_cache/'
     const metrics = [
@@ -18,13 +19,33 @@
     for (let i = 0; i < count; i++) {
       const update = i ? i * 50 : 1
       const id = `self_u${update}`
-      for (const [field, latest] of [['snapshot_update', 1001], ['checkpoint_update', update], ['usage_percent', dense ? 100 / count : [15, 30, 55][i]]]) {
+      for (const [field, latest] of [['snapshot_update', 1001], ['checkpoint_update', update],
+        ['usage_percent', dense ? 100 / count : [15, 30, 55][i]],
+        ['assigned_games_latest', dense ? (i < 400 ? 2 : 1) : [150, 300, 550][i]]]) {
         metrics.push({ name: `${prefix}${field}/${id}`, latest })
+      }
+      if (!query.has('legacy') && !(query.has('missing') && i === 1)) {
+        const scored = dense ? 1.8 - i / count * 0.6 : [1.8, 1.5, 1.2][i]
+        const allowed = dense ? 0.8 + i / count * 0.3 : [0.8, 1.0, 1.1][i]
+        for (const [field, latest] of Object.entries({ w: 0.6, snapshot_update: 1001, checkpoint_update: update,
+          ppp_scored: scored, ppp_allowed: allowed,
+          ppp_points_scored: scored * 1000, ppp_offensive_possessions: 1000,
+          ppp_points_allowed: allowed * 1000, ppp_defensive_possessions: 1000, ppp_tracking_start_update: update })) {
+          metrics.push({ name: `jax/train/pfsp/${field}/${id}/sampled`, latest })
+        }
+        if (!query.has('no-current')) {
+          for (const [field, latest] of Object.entries({ update: 1001,
+            points_scored: dense ? scored * 10 : [18, 9, 5][i], offensive_possessions: 10,
+            points_allowed: dense ? allowed * 10 : [4, 10, 15][i], defensive_possessions: 10 })) {
+            metrics.push({ name: `jax/train/pfsp/current_ppp_${field}/${id}/sampled`, latest })
+          }
+        }
       }
     }
     createApp({ render: () => h(OpponentUsageChart, { metrics }) }).mount('#app')
     setTimeout(() => {
       document.body.dataset.barCount = document.querySelectorAll('.usage-bar').length
+      document.body.dataset.pppPointCount = document.querySelectorAll('.ppp-series circle').length
       document.body.dataset.horizontalOverflow = document.documentElement.scrollWidth > innerWidth
     }, 300)
   </script>

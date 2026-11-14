@@ -16,6 +16,12 @@ import numpy as np
 MODES = ("sampled", "deterministic")
 HALF_LIFE_UPDATES = 500.0
 MAX_EFFECTIVE_GAMES = 256.0
+PPP_COUNTERS = (
+    "points_scored",
+    "points_allowed",
+    "offensive_possessions",
+    "defensive_possessions",
+)
 
 
 def probabilities(win_scores, alpha: float, epsilon: float) -> np.ndarray:
@@ -73,7 +79,7 @@ class PFSPState:
     def _entry(self, identity, mode):
         if mode not in MODES:
             raise ValueError(f"Unknown opponent action mode: {mode}")
-        return self.entries.setdefault(identity, {}).setdefault(
+        entry = self.entries.setdefault(identity, {}).setdefault(
             mode,
             {
                 "score_sum": 0.0,
@@ -88,6 +94,16 @@ class PFSPState:
                 "active_steps": 0,
             },
         )
+        # Older checkpoints have only weighted scores, not recoverable win counts.
+        # Track the denominator separately so resumed runs never treat unknown
+        # historical outcomes as losses.
+        entry.setdefault("wins", 0)
+        entry.setdefault("win_rate_games", 0)
+        entry.setdefault(
+            "possession_stats",
+            {**dict.fromkeys(PPP_COUNTERS, 0.0), "tracking_start_update": None},
+        )
+        return entry
 
     @staticmethod
     def _aged(entry, update):
@@ -108,13 +124,14 @@ class PFSPState:
             mode,
             float(scores.sum()),
             int(scores.size),
+            wins=int(np.count_nonzero(scores == 1.0)),
             update=update,
             truncated=truncated,
             role_counts=role_counts or {role: int(scores.size)},
         )
 
     def _observe_totals(
-        self, identity, mode, score_sum, games, *, update, truncated, role_counts
+        self, identity, mode, score_sum, games, *, wins, update, truncated, role_counts
     ):
         entry = self._entry(identity, mode)
         entry["truncated_games"] += int(truncated)
@@ -131,6 +148,8 @@ class PFSPState:
             last_observed_update=int(update),
         )
         entry["completed_games"] += int(games)
+        entry["wins"] += int(wins)
+        entry["win_rate_games"] += int(games)
         for side, role_games in role_counts.items():
             entry[f"{side}_start_games"] += int(role_games)
 
@@ -165,6 +184,8 @@ class PFSPState:
                     "probability": float(probability),
                     "effective_games": count,
                     "completed_games": entry["completed_games"],
+                    "wins": entry["wins"],
+                    "win_rate_games": entry["win_rate_games"],
                     "truncated_games": entry["truncated_games"],
                     "prior_only": float(entry["last_observed_update"] is None),
                     "last_observed_update": (
@@ -183,6 +204,22 @@ class PFSPState:
                     "assigned_games": entry.get("assigned_games", 0),
                     "active_steps": entry.get("active_steps", 0),
                 }
+                if entry["win_rate_games"]:
+                    values["win_rate"] = entry["wins"] / entry["win_rate_games"]
+                possession_stats = entry["possession_stats"]
+                values.update(
+                    {f"ppp_{key}": possession_stats[key] for key in PPP_COUNTERS}
+                )
+                start = possession_stats["tracking_start_update"]
+                values["ppp_tracking_start_update"] = -1 if start is None else start
+                for label, points, possessions in (
+                    ("scored", "points_scored", "offensive_possessions"),
+                    ("allowed", "points_allowed", "defensive_possessions"),
+                ):
+                    if possession_stats[possessions] > 0:
+                        values[f"ppp_{label}"] = (
+                            possession_stats[points] / possession_stats[possessions]
+                        )
                 metrics.update(
                     {
                         f"pfsp/{name}/{identity}/{mode}": float(value)
@@ -192,15 +229,17 @@ class PFSPState:
         return np.asarray(distributions, dtype=np.float32), metrics
 
     def observe_rollout(self, trajectory, candidates, *, update, role):
-        self.observe_rollouts({role: trajectory}, candidates, update=update)
+        return self.observe_rollouts({role: trajectory}, candidates, update=update)
 
     def observe_rollouts(self, trajectories, candidates, *, update):
-        """Aggregate once per rollout, not one full-array scan per opponent."""
+        """Update evidence and return PPP metrics for this update's rollouts only."""
         count = len(candidates)
         if not count:
-            return
+            return {}
         batches = {}
         for role, trajectory in trajectories.items():
+            if role not in ("offense", "defense"):
+                raise ValueError(f"Unknown starting side: {role}")
             active = np.asarray(trajectory.active_mask) > 0
             assignments = np.asarray(trajectory.opponent_assignment, dtype=np.int32)
             modes = (np.asarray(trajectory.opponent_deterministic_episode) > 0).astype(
@@ -227,13 +266,54 @@ class PFSPState:
             batches[role] = {
                 "games": aggregate(completed),
                 "scores": aggregate(completed, scores[completed]),
+                "wins": aggregate(completed & (scores == 1.0)),
                 "truncated": aggregate(ended & truncated),
                 "assigned": aggregate(valid & starts),
                 "active": aggregate(valid),
             }
+            # Match the existing training efficiency metrics: actual team score
+            # deltas (including violation points), divided by completed offensive
+            # possessions. The starting side maps stable teams; training_role
+            # identifies the actual attacking side before each transition.
+            fields = (
+                "offense_score_delta",
+                "defense_score_delta",
+                "training_role",
+                "possession_ended",
+            )
+            if all(getattr(trajectory, field, None) is not None for field in fields):
+                own = (
+                    "offense_score_delta"
+                    if role == "offense"
+                    else "defense_score_delta"
+                )
+                other = (
+                    "defense_score_delta"
+                    if role == "offense"
+                    else "offense_score_delta"
+                )
+                possession_ended = valid & (np.asarray(trajectory.possession_ended) > 0)
+                attacking = np.asarray(trajectory.training_role)
+                batches[role]["possession_stats"] = {
+                    "points_scored": aggregate(
+                        valid, np.asarray(getattr(trajectory, own))[valid]
+                    ),
+                    "points_allowed": aggregate(
+                        valid, np.asarray(getattr(trajectory, other))[valid]
+                    ),
+                    "offensive_possessions": aggregate(
+                        possession_ended & (attacking > 0)
+                    ),
+                    "defensive_possessions": aggregate(
+                        possession_ended & (attacking < 0)
+                    ),
+                }
+        metrics = {}
+        has_possession_stats = any("possession_stats" in batch for batch in batches.values())
         for index, candidate in enumerate(candidates):
             for deterministic, mode in enumerate(MODES):
-                entry = self._entry(opponent_id(candidate["info"]), mode)
+                identity = opponent_id(candidate["info"])
+                entry = self._entry(identity, mode)
 
                 def total(name):
                     return sum(
@@ -246,6 +326,41 @@ class PFSPState:
                 entry["active_steps"] = entry.get("active_steps", 0) + int(
                     total("active")
                 )
+                if has_possession_stats:
+                    # Reuse this update's already-aggregated arrays. No running
+                    # average, previous-rollout carryover, or new device work.
+                    current = {
+                        name: float(sum(
+                            batch["possession_stats"][name][index, deterministic]
+                            for batch in batches.values() if "possession_stats" in batch
+                        ))
+                        for name in PPP_COUNTERS
+                    }
+                    values = dict(current)
+                    for label, numerator, denominator in (
+                        ("scored", "points_scored", "offensive_possessions"),
+                        ("allowed", "points_allowed", "defensive_possessions"),
+                    ):
+                        if current[denominator] > 0:
+                            values[label] = current[numerator] / current[denominator]
+                    values["update"] = int(update)
+                    metrics.update({
+                        f"pfsp/current_ppp_{name}/{identity}/{mode}": float(value)
+                        for name, value in values.items()
+                    })
+                for batch in batches.values():
+                    if (
+                        "possession_stats" not in batch
+                        or not batch["active"][index, deterministic]
+                    ):
+                        continue
+                    stats = entry["possession_stats"]
+                    if stats["tracking_start_update"] is None:
+                        stats["tracking_start_update"] = int(update)
+                    for name in PPP_COUNTERS:
+                        stats[name] += float(
+                            batch["possession_stats"][name][index, deterministic]
+                        )
                 # Cap evidence once per update, not once per starting side:
                 # batched simultaneous games must not favor the second side.
                 self._observe_totals(
@@ -253,6 +368,7 @@ class PFSPState:
                     mode,
                     total("scores"),
                     int(total("games")),
+                    wins=int(total("wins")),
                     update=update,
                     truncated=int(total("truncated")),
                     role_counts={
@@ -260,3 +376,4 @@ class PFSPState:
                         for role, batch in batches.items()
                     },
                 )
+        return metrics

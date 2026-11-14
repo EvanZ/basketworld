@@ -84,8 +84,79 @@ on the y-axis. Both starting sides/action modes are combined; legal-random games
 are excluded. Zero assignments show an unavailable sample, not invented usage.
 This is observed usage, not the next-game PFSP selection probability. Old runs
 without per-rollout counters fall back to clearly labeled lifetime assignments.
+Two overlaid lines show **PPP scored** (green, solid) and **PPP allowed**
+(amber, dashed) on a separate right-hand PPP axis; usage retains the left-hand
+percentage axis. To match the combined-mode usage bars, the chart sums points and
+possession counts across sampled/deterministic modes before dividing, rather
+than averaging their ratios or weighting by usage. The details table still
+separates modes. Hover or focus a bar/point for both PPP values and usage.
+Missing or zero-denominator PPP stays blank and breaks the corresponding line;
+measured zero PPP is plotted.
+The **PPP view** selector has only two choices, both with opponent snapshot
+update on the x-axis and just two PPP lines:
+
+- **Current update** (default): score deltas and completed offensive possessions
+  from that one logged training update's rollouts, separately for each opponent.
+  It is not a difference between sparse cumulative logs or a multi-update window.
+- **Pooled (cumulative)**: all tracked training history for each opponent since
+  PPP tracking began, preserving the original overview.
+
+Usage bars stay based on the latest rollout in both views. The current-update
+view requires `pfsp/current_ppp_*` metrics from the same update as usage; absent
+or stale data stays unavailable rather than falling back to cumulative values.
+Hover/focus shows current possession sample counts. One update can have few or
+no completed possessions against a particular opponent, making PPP noisy or
+unavailable. Scores retain the existing training PPP convention, including
+violation points and unfinished/truncated games; no new evaluations are run.
+Current metrics reuse the existing per-rollout aggregates with a small host-side
+logging addition. Existing workers need a pause/resume with the updated code.
+There is no opponent-history overlay or extra history-fetching UI.
 PFSP evidence and probabilities remain in collapsed details; inactive modes and
 evicted identities are hidden from the current-pool view. History remains intact.
+
+The **Win %** column is actual learner wins divided by tracked completed games,
+separately per opponent and action mode. Ties count as non-wins; truncations are
+excluded. Unlike `w`, this is cumulative, with no decay, cap, or prior, and does
+not affect sampling. `pfsp/wins`, `pfsp/win_rate_games`, and `pfsp/win_rate`
+(each suffixed with `/<opponent>/<mode>`) expose the numerator, denominator, and
+ratio. Zero tracked games or missing legacy metrics display as unavailable.
+New checkpoints preserve the counters. Resuming an older checkpoint starts
+these counters at zero without altering its PFSP evidence or total Games;
+the UI labels this **Partial history** and shows the counted games on hover.
+Existing workers must resume/relaunch with the new code to collect these metrics;
+old raw win counts cannot be reconstructed from the smoothed `w` score.
+
+**PPP scored** and **PPP allowed** are cumulative per-opponent training diagnostics:
+learner points / learner completed offensive possessions, and opponent points /
+opponent completed offensive possessions, respectively. They combine both starting
+sides but use the actual possession role, and remain separate by opponent action
+mode. These use actual team score, including awarded violation points, not PPO
+rewards or expected shot value. Higher scored and lower allowed are preferable,
+but these are evolving-training-policy results, not fixed-checkpoint evaluations.
+
+Like the existing training efficiency metrics, they count observed active steps
+and completed possessions, including those in ongoing or later truncated games;
+they do not wait for a completed game. Unfinished possessions do not enter the
+denominator. Scores and possession counts accumulate across rollout boundaries.
+Zero possessions display `—`, not zero efficiency. Counters have no decay, cap,
+or prior and do not change opponent selection. Hover over each value to see its
+points, possession denominator, and first tracked update.
+
+Metrics under `jax/train/pfsp/` include `ppp_scored`, `ppp_allowed`,
+`ppp_points_scored`, `ppp_points_allowed`, `ppp_offensive_possessions`,
+`ppp_defensive_possessions`, and `ppp_tracking_start_update`, each followed by
+`/<opponent>/<mode>`. They persist with the PFSP checkpoint state. Legacy resumes
+initialize only these new counters; existing win estimates, histories, and pool
+state remain intact. PPP collection starts after resuming with the new code,
+without backfilling earlier results.
+
+`jax/train/pfsp/current_ppp_` metrics include `points_scored`, `points_allowed`,
+`offensive_possessions`, `defensive_possessions`, `scored`, `allowed`, and `update`,
+again followed by `/<opponent>/<mode>`. Unlike the cumulative pre-rollout PFSP
+snapshot, these are emitted after observing exactly that update's two starting-
+side rollouts. Counts reset for every update, including unobserved opponents;
+ratios are absent with zero denominators. They need no checkpoint state and do
+not affect sampling, rewards, or model updates.
 
 `jax/train/opponent_cache/` includes `capacity`, `size`, `interval_updates`,
 `newest_snapshot_update`, `pending_snapshot_update`, `retiring_count`, `admissions`,
@@ -158,7 +229,7 @@ update's probabilities, not a post-rollout estimate. Fields include `probability
 `defense_start_games`, `assigned_games`, and `active_steps`. Age/last-observed
 are -1 for unobserved entries; this is not a zero-game measured win rate.
 
-The trainer shows a per-opponent snapshot and a Chart w button. All fields are
+The trainer shows the combined usage/PPP chart and a per-opponent details table. All fields are
 independently selectable in the existing metric picker. The core MLflow profile
 retains PFSP/pressure diagnostics. Metric writes are batched to avoid one HTTP
 request per opponent-field pair.

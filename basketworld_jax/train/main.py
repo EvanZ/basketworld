@@ -44,6 +44,11 @@ from basketworld_jax.checkpoints import (
 )
 from basketworld_jax.eval.fixed_pool_study import run_fixed_pool_study
 from basketworld_jax.eval.clock_metrics import summarize_clock_metrics
+from basketworld_jax.eval.artifacts import (
+    compact_historical_match,
+    compact_historical_payload,
+    write_historical_artifact,
+)
 from basketworld_jax.config import TRAIN_FROZEN_VALUES, JaxEnvironmentConfig
 from basketworld_jax.provenance import (
     capture_source_provenance,
@@ -124,6 +129,7 @@ from basketworld_jax.train.runtime import (
     concatenate_rollout_outputs,
     serialize_eval_trace,
     summarize_deploy_eval_outputs,
+    summarize_check_pickup_metrics,
     summarize_episode_events,
     summarize_intent_metrics,
     summarize_lane_violation_metrics,
@@ -936,7 +942,7 @@ def build_train_parser():
         type=int,
         default=0,
         help=(
-            "How often to run fixed-seed same-policy argmax-vs-argmax deploy eval. "
+            "How often to run fixed-seed same-policy sampled-action deploy eval. "
             "Set <=0 to disable."
         ),
     )
@@ -4549,6 +4555,12 @@ _CORE_TRAIN_METRICS = frozenset(
         "offensive_three_seconds_rate_per_step",
         "defensive_lane_violation_rate_per_step",
         "check_pickup_rate",
+        "learner_check_opportunity_count",
+        "learner_check_pickup_count",
+        "learner_check_pickup_rate",
+        "opponent_check_opportunity_count",
+        "opponent_check_pickup_count",
+        "opponent_check_pickup_rate",
         "check_mean_pickup_steps",
         "check_violation_count",
         "check_space_defense_violation_count",
@@ -4729,6 +4741,8 @@ _CORE_DEPLOY_METRICS = frozenset(
         "update_index",
         "action_argmax_offense",
         "action_argmax_defense",
+        "action_sampled_offense",
+        "action_sampled_defense",
         "same_policy_both_sides",
         "episode_count",
         "completed_episode_count",
@@ -4759,6 +4773,12 @@ _CORE_DEPLOY_METRICS = frozenset(
         "offensive_rebound_rate",
         "defensive_rebound_rate",
         "check_pickup_rate",
+        "learner_check_opportunity_count",
+        "learner_check_pickup_count",
+        "learner_check_pickup_rate",
+        "opponent_check_opportunity_count",
+        "opponent_check_pickup_count",
+        "opponent_check_pickup_rate",
         "check_mean_pickup_steps",
         "check_violation_count",
         "check_space_defense_violation_count",
@@ -5583,7 +5603,7 @@ def _historical_eval_artifact_payload(
             str(int(update)): dict(record)
             for update, record in sorted(milestone_records.items())
         },
-        "matches": [dict(record) for record in match_history],
+        "matches": [compact_historical_match(record) for record in match_history],
         "evaluation_update_artifacts": {
             str(int(update)): str(path)
             for update, path in sorted((update_artifact_paths or {}).items())
@@ -5600,7 +5620,7 @@ def _persist_historical_eval_artifact(
     local_path = None
     if checkpoint_dir:
         local_path = Path(checkpoint_dir) / HISTORICAL_EVAL_ARTIFACT_NAME
-        write_json(local_path, payload)
+        write_historical_artifact(local_path, to_builtin(payload), save_details=False)
     if mlflow is not None:
         if local_path is not None:
             mlflow.log_artifact(
@@ -5611,7 +5631,7 @@ def _persist_historical_eval_artifact(
                 prefix="basketworld_jax_historical_eval_"
             ) as tmpdir:
                 path = Path(tmpdir) / HISTORICAL_EVAL_ARTIFACT_NAME
-                write_json(path, payload)
+                write_historical_artifact(path, to_builtin(payload), save_details=False)
                 mlflow.log_artifact(
                     str(path), artifact_path=TRAIN_LOOP_SUMMARY_ARTIFACT_DIR
                 )
@@ -5665,23 +5685,19 @@ def _persist_historical_eval_update_artifact(
     local_path = None
     if checkpoint_dir:
         local_path = Path(checkpoint_dir) / "historical_opponent_evaluations" / filename
-        write_json(local_path, payload)
+        local_artifacts = write_historical_artifact(local_path, to_builtin(payload), save_details=True)
     if mlflow is not None:
         if local_path is not None:
-            mlflow.log_artifact(
-                str(local_path),
-                artifact_path=HISTORICAL_EVAL_UPDATE_ARTIFACT_DIR,
-            )
+            for artifact in reversed(local_artifacts):
+                mlflow.log_artifact(str(artifact), artifact_path=HISTORICAL_EVAL_UPDATE_ARTIFACT_DIR)
         else:
             with TemporaryDirectory(
                 prefix="basketworld_jax_historical_eval_update_"
             ) as tmpdir:
                 path = Path(tmpdir) / filename
-                write_json(path, payload)
-                mlflow.log_artifact(
-                    str(path),
-                    artifact_path=HISTORICAL_EVAL_UPDATE_ARTIFACT_DIR,
-                )
+                artifacts = write_historical_artifact(path, to_builtin(payload), save_details=True)
+                for artifact in reversed(artifacts):
+                    mlflow.log_artifact(str(artifact), artifact_path=HISTORICAL_EVAL_UPDATE_ARTIFACT_DIR)
         return artifact_path
     return str(local_path)
 
@@ -5713,7 +5729,7 @@ def _load_historical_eval_artifact(
     )
     if local_path is not None and local_path.is_file():
         with local_path.open("r", encoding="utf-8") as handle:
-            return dict(json.load(handle))
+            return compact_historical_payload(json.load(handle))
     if not continuation_run_id:
         return None
 
@@ -5733,7 +5749,7 @@ def _load_historical_eval_artifact(
     if not downloaded.is_file():
         return None
     with downloaded.open("r", encoding="utf-8") as handle:
-        return dict(json.load(handle))
+        return compact_historical_payload(json.load(handle))
 
 
 def _restore_historical_milestone_params(
@@ -8421,10 +8437,10 @@ def run_training_loop(args) -> dict[str, Any]:
                 )
                 pfsp_sampling_metrics.update(snapshot_cache.usage_metrics())
             if pfsp_enabled and pinned_candidate_params is not None:
-                pfsp_state.observe_rollouts(
+                pfsp_sampling_metrics.update(pfsp_state.observe_rollouts(
                     {role: role_rollouts[role].trajectory for role in TRAINING_ROLES},
                     opponent_candidates, update=update_idx,
-                )
+                ))
             if pinned_candidate_params is not None:
                 opponent_assignments = {
                     role: role_rollouts[role].final_opponent_assignment
@@ -9366,6 +9382,16 @@ def run_training_loop(args) -> dict[str, Any]:
                                 ),
                             }
                         )
+                        eval_metrics.update(
+                            summarize_check_pickup_metrics(
+                                eval_trace.check_opportunities,
+                                eval_trace.check_pickups,
+                                getattr(eval_trace, "learner_check_opportunities", None),
+                                getattr(eval_trace, "learner_check_pickups", None),
+                                getattr(eval_trace, "opponent_check_opportunities", None),
+                                getattr(eval_trace, "opponent_check_pickups", None),
+                            )
+                        )
                         eval_rebound_attempts = float(
                             np.asarray(
                                 eval_trace.rebound_attempts, dtype=np.float32
@@ -9517,8 +9543,11 @@ def run_training_loop(args) -> dict[str, Any]:
                         "update_index": int(update_idx),
                         "horizon": int(args.eval_deploy_horizon),
                         "seed": int(args.eval_deploy_seed),
-                        "action_argmax_offense": 1,
-                        "action_argmax_defense": 1,
+                        "action_mode": "sampled",
+                        "action_argmax_offense": 0,
+                        "action_argmax_defense": 0,
+                        "action_sampled_offense": 1,
+                        "action_sampled_defense": 1,
                         "same_policy_both_sides": 1,
                         "multi_possession_limit_active": int(
                             active_possession_limit
@@ -9943,6 +9972,9 @@ def run_training_loop(args) -> dict[str, Any]:
                             update_artifact_paths=historical_eval_update_artifact_paths,
                         ),
                     )
+                    # Full rows now live once in compressed per-update artifacts,
+                    # not in every later cumulative index or the worker's history.
+                    historical_eval_history = [compact_historical_match(row) for row in historical_eval_history]
                 _print_checkpoint_summary(
                     update_index=update_idx,
                     last_metrics=last_metrics,

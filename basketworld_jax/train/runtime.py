@@ -844,6 +844,25 @@ def _build_turnover_transition_metrics(static, env_out, jnp) -> dict[str, Any]:
     }
 
 
+def _build_check_transition_metrics(static, env_out, active_step, jnp) -> dict[str, Any]:
+    """Split role-neutral check events by the team receiving the possession."""
+    learner_is_team_a = static.training_player_mask[static.offense_ids[0]] > 0.5
+    learner_is_offense = jnp.where(
+        env_out.state.offense_team == TEAM_A,
+        learner_is_team_a,
+        ~learner_is_team_a,
+    )
+    active = active_step.astype(jnp.bool_)
+    opportunity = active & env_out.check_opportunity.astype(jnp.bool_)
+    pickup = active & env_out.check_pickup.astype(jnp.bool_)
+    return {
+        "learner_check_opportunities": (opportunity & learner_is_offense).astype(jnp.int8),
+        "opponent_check_opportunities": (opportunity & (~learner_is_offense)).astype(jnp.int8),
+        "learner_check_pickups": (pickup & learner_is_offense).astype(jnp.int8),
+        "opponent_check_pickups": (pickup & (~learner_is_offense)).astype(jnp.int8),
+    }
+
+
 def _build_skill_calibration_transition_metrics(static, state, env_out, jnp) -> dict[str, Any]:
     pressure_risks = build_turnover_probabilities_batch(static, state, jnp)
     pressure_expected = jnp.max(pressure_risks, axis=1).astype(jnp.float32)
@@ -1763,6 +1782,7 @@ def build_compiled_rollout_runner(
                 check_setup_opportunities=jnp.where(active_step, env_out.check_setup_opportunity.astype(jnp.int8), 0),
                 check_setup_steps=jnp.where(active_step, env_out.check_setup_step.astype(jnp.int8), 0),
                 check_pickups=jnp.where(active_step, env_out.check_pickup.astype(jnp.int8), 0),
+                **_build_check_transition_metrics(static, env_out, active_step, jnp),
                 check_violations=jnp.where(active_step, env_out.check_violation.astype(jnp.int8), 0),
                 check_space_offense_violations=jnp.where(active_step, env_out.check_space_offense_violation.astype(jnp.int8), 0),
                 check_space_defense_violations=jnp.where(active_step, env_out.check_space_defense_violation.astype(jnp.int8), 0),
@@ -2322,6 +2342,7 @@ def build_compiled_frozen_opponent_rollout_runner(
                 check_setup_opportunities=jnp.where(active_step, env_out.check_setup_opportunity.astype(jnp.int8), 0),
                 check_setup_steps=jnp.where(active_step, env_out.check_setup_step.astype(jnp.int8), 0),
                 check_pickups=jnp.where(active_step, env_out.check_pickup.astype(jnp.int8), 0),
+                **_build_check_transition_metrics(static, env_out, active_step, jnp),
                 check_violations=jnp.where(active_step, env_out.check_violation.astype(jnp.int8), 0),
                 check_space_offense_violations=jnp.where(active_step, env_out.check_space_offense_violation.astype(jnp.int8), 0),
                 check_space_defense_violations=jnp.where(active_step, env_out.check_space_defense_violation.astype(jnp.int8), 0),
@@ -2891,6 +2912,7 @@ def build_compiled_grouped_opponent_rollout_runner(
                 check_setup_opportunities=jnp.where(active_step, env_out.check_setup_opportunity.astype(jnp.int8), 0),
                 check_setup_steps=jnp.where(active_step, env_out.check_setup_step.astype(jnp.int8), 0),
                 check_pickups=jnp.where(active_step, env_out.check_pickup.astype(jnp.int8), 0),
+                **_build_check_transition_metrics(static, env_out, active_step, jnp),
                 check_violations=jnp.where(active_step, env_out.check_violation.astype(jnp.int8), 0),
                 check_space_offense_violations=jnp.where(active_step, env_out.check_space_offense_violation.astype(jnp.int8), 0),
                 check_space_defense_violations=jnp.where(active_step, env_out.check_space_defense_violation.astype(jnp.int8), 0),
@@ -3244,6 +3266,9 @@ def build_compiled_eval_runner(
                 check_setup_opportunities=env_out.check_setup_opportunity.astype(jnp.int8),
                 check_setup_steps=env_out.check_setup_step.astype(jnp.int8),
                 check_pickups=env_out.check_pickup.astype(jnp.int8),
+                **_build_check_transition_metrics(
+                    static, env_out, ~state.episode_ended.astype(jnp.bool_), jnp
+                ),
                 check_violations=env_out.check_violation.astype(jnp.int8),
                 check_space_offense_violations=env_out.check_space_offense_violation.astype(jnp.int8),
                 check_space_defense_violations=env_out.check_space_defense_violation.astype(jnp.int8),
@@ -3520,6 +3545,9 @@ def build_compiled_frozen_opponent_eval_runner(
                 check_setup_opportunities=env_out.check_setup_opportunity.astype(jnp.int8),
                 check_setup_steps=env_out.check_setup_step.astype(jnp.int8),
                 check_pickups=env_out.check_pickup.astype(jnp.int8),
+                **_build_check_transition_metrics(
+                    static, env_out, ~state.episode_ended.astype(jnp.bool_), jnp
+                ),
                 check_violations=env_out.check_violation.astype(jnp.int8),
                 check_space_offense_violations=env_out.check_space_offense_violation.astype(jnp.int8),
                 check_space_defense_violations=env_out.check_space_defense_violation.astype(jnp.int8),
@@ -4503,6 +4531,9 @@ def build_compiled_grouped_opponent_eval_runner(
                 check_setup_opportunities=env_out.check_setup_opportunity.astype(jnp.int8),
                 check_setup_steps=env_out.check_setup_step.astype(jnp.int8),
                 check_pickups=env_out.check_pickup.astype(jnp.int8),
+                **_build_check_transition_metrics(
+                    static, env_out, ~state.episode_ended.astype(jnp.bool_), jnp
+                ),
                 check_violations=env_out.check_violation.astype(jnp.int8),
                 check_space_offense_violations=env_out.check_space_offense_violation.astype(jnp.int8),
                 check_space_defense_violations=env_out.check_space_defense_violation.astype(jnp.int8),
@@ -4561,7 +4592,7 @@ def build_compiled_deploy_eval_runner(
 ):
     step_batch = step_batch_game_clock if game_clock_mode else step_batch_minimal
 
-    """Build fixed-seed, same-policy, argmax-vs-argmax deploy evaluation."""
+    """Build fixed-seed, same-policy, sampled-action deploy evaluation."""
 
     def _runner(
         static,
@@ -4737,8 +4768,8 @@ def build_compiled_deploy_eval_runner(
                 controlled_player_ids=defense_ids,
             )
             full_actions = assemble_full_actions_jax(
-                offense_out["deterministic_actions"],
-                defense_out["deterministic_actions"],
+                offense_out["sampled_actions"],
+                defense_out["sampled_actions"],
                 offense_ids,
                 defense_ids,
                 n_players,
@@ -4756,6 +4787,9 @@ def build_compiled_deploy_eval_runner(
             turnover_metrics = _build_turnover_transition_metrics(static, env_out, jnp)
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             spatial_metrics = _build_spatial_step_metrics(static, state, active_step, jnp)
+            check_role_metrics = _build_check_transition_metrics(
+                static, env_out, active_step, jnp
+            )
 
             def _active_sum(value):
                 value = jnp.asarray(value, dtype=jnp.float32)
@@ -4954,6 +4988,18 @@ def build_compiled_deploy_eval_runner(
                 overtime_team_b_points=jnp.where(
                     in_overtime, env_out.team_b_score_delta, 0.0
                 ).astype(jnp.float32),
+                learner_check_opportunities=_active_sum(
+                    check_role_metrics["learner_check_opportunities"]
+                ),
+                opponent_check_opportunities=_active_sum(
+                    check_role_metrics["opponent_check_opportunities"]
+                ),
+                learner_check_pickups=_active_sum(
+                    check_role_metrics["learner_check_pickups"]
+                ),
+                opponent_check_pickups=_active_sum(
+                    check_role_metrics["opponent_check_pickups"]
+                ),
             )
             next_totals = DeployEvalTotals(
                 *(
@@ -5280,6 +5326,16 @@ def summarize_deploy_eval_outputs(
             totals["selector_boundary_offensive_rebound"]
         ),
     }
+    metrics.update(
+        summarize_check_pickup_metrics(
+            totals["check_opportunities"],
+            totals["check_pickups"],
+            totals["learner_check_opportunities"],
+            totals["learner_check_pickups"],
+            totals["opponent_check_opportunities"],
+            totals["opponent_check_pickups"],
+        )
+    )
     reason_fields = {
         "pass_out_of_bounds": "turnover_pass_out_of_bounds",
         "intercepted": "turnover_intercepted",
@@ -6607,6 +6663,43 @@ def summarize_intent_metrics(
     return metrics
 
 
+def summarize_check_pickup_metrics(
+    check_opportunities,
+    check_pickups,
+    learner_check_opportunities=None,
+    learner_check_pickups=None,
+    opponent_check_opportunities=None,
+    opponent_check_pickups=None,
+) -> dict[str, float | int]:
+    """Summarize combined and policy-role check pickup outcomes."""
+    def _total(values) -> float:
+        if values is None:
+            return 0.0
+        return float(np.asarray(values, dtype=np.float32).sum())
+
+    combined_opportunities = _total(check_opportunities)
+    combined_pickups = _total(check_pickups)
+    learner_opportunities = _total(learner_check_opportunities)
+    learner_pickups = _total(learner_check_pickups)
+    opponent_opportunities = _total(opponent_check_opportunities)
+    opponent_pickups = _total(opponent_check_pickups)
+
+    def _rate(pickups: float, opportunities: float) -> float:
+        return float(pickups / max(1.0, opportunities))
+
+    return {
+        "check_opportunity_count": int(combined_opportunities),
+        "check_pickup_count": int(combined_pickups),
+        "check_pickup_rate": _rate(combined_pickups, combined_opportunities),
+        "learner_check_opportunity_count": int(learner_opportunities),
+        "learner_check_pickup_count": int(learner_pickups),
+        "learner_check_pickup_rate": _rate(learner_pickups, learner_opportunities),
+        "opponent_check_opportunity_count": int(opponent_opportunities),
+        "opponent_check_pickup_count": int(opponent_pickups),
+        "opponent_check_pickup_rate": _rate(opponent_pickups, opponent_opportunities),
+    }
+
+
 def summarize_training_step(
     rollout_out: RolloutOutput,
     ppo_batch: PPOBatch,
@@ -6945,6 +7038,16 @@ def summarize_training_step(
                 check_pickup_steps / max(1.0, check_pickups)
             ),
         }
+    )
+    summary.update(
+        summarize_check_pickup_metrics(
+            rollout_out.trajectory.check_opportunities,
+            rollout_out.trajectory.check_pickups,
+            getattr(rollout_out.trajectory, "learner_check_opportunities", None),
+            getattr(rollout_out.trajectory, "learner_check_pickups", None),
+            getattr(rollout_out.trajectory, "opponent_check_opportunities", None),
+            getattr(rollout_out.trajectory, "opponent_check_pickups", None),
+        )
     )
     summary.update(
         summarize_turnover_diagnostics(

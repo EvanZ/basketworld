@@ -121,7 +121,21 @@ label.toggle { display: flex; flex-direction: row; align-items: center; gap: 9px
 .mlflow-run-copy:hover strong, .mlflow-run-copy:focus-visible strong { color: #50d7ff; }
 .mlflow-run-copy:focus-visible { outline: 1px solid #3dcdf6; outline-offset: 5px; border-radius: 3px; }
 .run-command-panel, .run-config-panel { padding: 20px; }
-.metrics-panel { padding: 20px; }
+.metrics-panel { min-width: 0; padding: 20px; }
+.pfsp-details { min-width: 0; margin-bottom: 22px; }
+.pfsp-details summary { cursor: pointer; padding: 10px 0; font-weight: 650; }
+.pfsp-description { max-width: 100ch; margin: 0 0 14px; color: #91a4c0; font-size: 12px; line-height: 1.6; }
+.pfsp-table-scroll { max-height: 440px; overflow: auto; border: 1px solid #2a3f60; border-radius: 8px; }
+.pfsp-table-scroll:focus-visible { outline: 2px solid #45d6ff; outline-offset: 3px; }
+.pfsp-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
+.pfsp-table th, .pfsp-table td { padding: 12px 16px; text-align: left; white-space: nowrap; border-bottom: 1px solid #243650; }
+.pfsp-table thead th { position: sticky; top: 0; z-index: 1; color: #b9cce7; background: #16253e; font-size: 12px; font-weight: 650; }
+.pfsp-table tbody th { font-weight: 550; }
+.pfsp-table tbody tr:nth-child(even) { background: #122139; }
+.pfsp-table tbody tr:hover { background: #1a2d48; }
+.pfsp-table tbody tr:last-child > * { border-bottom: 0; }
+.pfsp-table .numeric { text-align: right; font-variant-numeric: tabular-nums; }
+.pfsp-table small { display: block; margin-top: 3px; color: #91a4c0; font-size: 11px; font-weight: 400; }
 .elo-panel { padding: 20px; }
 .elo-anchor { padding: 5px 8px; border: 1px solid #2e6583; border-radius: 999px; color: #9de9ff !important; background: #0b2639; font: 10px "SFMono-Regular", Consolas, monospace; }
 .elo-content { margin-top: 16px; display: grid; grid-template-columns: minmax(520px, 1fr) minmax(320px, .72fr); gap: 15px 20px; align-items: center; }

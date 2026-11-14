@@ -91,6 +91,27 @@ def test_compiled_pfsp_training_resume_and_metrics(tmp_path, snapshot_interval):
         key.startswith("pressure/learner_defending/") for key in first["final_metrics"]
     )
     assert any(key.startswith("pfsp/w/") for key in first["final_metrics"])
+    assert any(
+        key.startswith("pfsp/current_ppp_update/") and value == target_update
+        for key, value in first["final_metrics"].items()
+    )
+    for label, denominator in (
+        ("scored", "offensive_possessions"),
+        ("allowed", "defensive_possessions"),
+    ):
+        values = [
+            value
+            for key, value in first["final_metrics"].items()
+            if key.startswith(f"pfsp/ppp_{label}/")
+        ]
+        assert values and all(np.isfinite(value) for value in values)
+        assert (
+            sum(
+                row["sampled"]["possession_stats"][denominator]
+                for row in state["entries"].values()
+            )
+            > 0
+        )
     if snapshot_interval:
         assert sorted(path.name for path in directory.iterdir()) == [
             "latest",

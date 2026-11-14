@@ -158,6 +158,8 @@ function loadSelectedMetricNames() {
 }
 
 const runs = ref([])
+const loadingRuns = ref(false)
+const runsLoaded = ref(false)
 const runStatusFilter = ref('all')
 const runStatuses = ['queued', 'starting', 'running', 'pausing', 'paused', 'stopping', 'stopped', 'completed', 'failed']
 const filteredRuns = computed(() => runStatusFilter.value === 'all'
@@ -207,7 +209,7 @@ const activeRun = computed(() => runs.value.find((run) =>
 ))
 const canPause = computed(() => selected.value?.status === 'running')
 const canResume = computed(() => selected.value?.status === 'paused')
-const canRecover = computed(() => selected.value?.status === 'stopped')
+const canRecover = computed(() => ['stopped', 'failed'].includes(selected.value?.status))
 const resumeHistoricalEvalUpdates = ref('')
 const resumeHistoricalEvalInput = computed(() => parseHistoricalEvalUpdates(resumeHistoricalEvalUpdates.value))
 const resumeHistoricalEvalSchedule = computed(() => {
@@ -742,9 +744,12 @@ async function importFromMlflow() {
 }
 
 async function loadRuns({ preserveSelection = true } = {}) {
+  if (loadingRuns.value) return
+  loadingRuns.value = true
   try {
     const nextRuns = await api.listRuns()
     runs.value = nextRuns
+    runsLoaded.value = true
     if (preserveSelection && selected.value) {
       const refreshed = nextRuns.find((run) => run.id === selected.value.id)
       if (refreshed) {
@@ -762,6 +767,8 @@ async function loadRuns({ preserveSelection = true } = {}) {
     }
   } catch (cause) {
     error.value = cause.message
+  } finally {
+    loadingRuns.value = false
   }
 }
 
@@ -966,7 +973,8 @@ onBeforeUnmount(() => {
           </label>
           <span>{{ filteredRuns.length }} of {{ runs.length }} experiments</span>
         </div>
-        <div v-if="!runs.length" class="empty">No training runs yet.</div>
+        <div v-if="!runsLoaded" class="empty">{{ loadingRuns ? 'Loading training runs…' : 'Unable to load training runs. Use Refresh to retry.' }}</div>
+        <div v-else-if="!runs.length" class="empty">No training runs yet.</div>
         <div v-else-if="!filteredRuns.length" class="empty">No {{ runStatusFilter }} experiments.</div>
         <button v-for="run in filteredRuns" :key="run.id" class="run-row" @click="selectRun(run)">
           <span class="status-dot" :class="run.status"></span>
@@ -1259,20 +1267,47 @@ onBeforeUnmount(() => {
                 </tr></tbody>
               </table>
             </details>
-            <OpponentUsageChart :metrics="availableMetrics" @select-metric="chooseMetric" />
-            <details v-if="pfspOpponents.length">
+            <OpponentUsageChart :key="selected.id" :metrics="availableMetrics" @select-metric="chooseMetric" />
+            <details v-if="pfspOpponents.length" class="pfsp-details">
               <summary>PFSP scores and sampling details</summary>
-              <p>{{ metricDefinition('jax/train/pfsp/w') }}</p>
-              <table>
-                <thead><tr><th>Opponent</th><th>Mode</th><th>w</th><th>Games</th><th>Effective games</th><th>Age (updates)</th><th>Probability</th><th>History</th></tr></thead>
-                <tbody><tr v-for="opponent in pfspOpponents" :key="opponent.name">
-                  <td>{{ opponent.opponent }} (U{{ opponent.update }})</td><td>{{ opponent.mode }}</td>
-                  <td>{{ formatMetricValue(opponent.w) }}{{ opponent.priorOnly ? ' (prior only)' : '' }}</td>
-                  <td>{{ opponent.games }}</td><td>{{ formatMetricValue(opponent.effectiveGames) }}</td>
-                  <td>{{ opponent.priorOnly ? 'Unobserved' : opponent.age }}</td><td>{{ formatMetricValue(opponent.probability) }}</td>
-                  <td><button type="button" @click="chooseMetric(opponent.name)">Chart w</button></td>
-                </tr></tbody>
-              </table>
+              <p class="pfsp-description">{{ metricDefinition('jax/train/pfsp/w') }}</p>
+              <div class="pfsp-table-scroll" role="region" aria-label="PFSP opponent details" tabindex="0">
+                <table class="pfsp-table" aria-label="PFSP scores and sampling probabilities">
+                  <thead>
+                    <tr>
+                      <th scope="col">Opponent</th>
+                      <th scope="col">Mode</th>
+                      <th scope="col" class="numeric">w</th>
+                      <th scope="col" class="numeric" title="Actual learner wins / tracked completed games. Ties are non-wins; truncations excluded. No smoothing.">Win %</th>
+                      <th scope="col" class="numeric" :title="metricDefinition('jax/train/pfsp/ppp_scored')">PPP scored</th>
+                      <th scope="col" class="numeric" :title="metricDefinition('jax/train/pfsp/ppp_allowed')">PPP allowed</th>
+                      <th scope="col" class="numeric">Games</th>
+                      <th scope="col" class="numeric">Effective games</th>
+                      <th scope="col" class="numeric">Probability</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="opponent in pfspOpponents" :key="opponent.name">
+                      <th scope="row">{{ opponent.opponent }} <small v-if="opponent.update !== null">U{{ opponent.update.toLocaleString() }}</small></th>
+                      <td>{{ opponent.mode }}</td>
+                      <td class="numeric">{{ formatMetricValue(opponent.w) }}<small v-if="opponent.priorOnly">Prior only</small></td>
+                      <td class="numeric" :title="opponent.winRate === null ? 'Raw win counts unavailable or no tracked completed games yet.' : `${opponent.wins.toLocaleString()} wins / ${opponent.winRateGames.toLocaleString()} tracked completed games`">
+                        {{ opponent.winRate === null ? '—' : `${(opponent.winRate * 100).toFixed(1)}%` }}
+                        <small v-if="opponent.winRate !== null && opponent.winRateGames < opponent.games">Partial history</small>
+                      </td>
+                      <td class="numeric" :title="opponent.pppScored === null ? 'PPP tracking unavailable or no completed offensive possessions yet.' : `${opponent.pointsScored?.toLocaleString() ?? '—'} points / ${opponent.offensivePossessions.toLocaleString()} offensive possessions · tracked since U${opponent.pppStartUpdate?.toLocaleString() ?? '—'}`">
+                        {{ opponent.pppScored === null ? '—' : opponent.pppScored.toFixed(2) }}
+                      </td>
+                      <td class="numeric" :title="opponent.pppAllowed === null ? 'PPP tracking unavailable or no completed defensive possessions yet.' : `${opponent.pointsAllowed?.toLocaleString() ?? '—'} points allowed / ${opponent.defensivePossessions.toLocaleString()} opponent offensive possessions · tracked since U${opponent.pppStartUpdate?.toLocaleString() ?? '—'}`">
+                        {{ opponent.pppAllowed === null ? '—' : opponent.pppAllowed.toFixed(2) }}
+                      </td>
+                      <td class="numeric">{{ opponent.games?.toLocaleString() ?? '—' }}</td>
+                      <td class="numeric">{{ formatMetricValue(opponent.effectiveGames) }}</td>
+                      <td class="numeric">{{ opponent.probability === null ? '—' : `${(opponent.probability * 100).toFixed(2)}%` }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
             </details>
             <div class="detail-section-heading metrics-heading">
               <div><h3>MLflow metrics</h3><span>{{ selectedMetricNames.length }} pinned · {{ availableMetrics.length }} available</span></div>

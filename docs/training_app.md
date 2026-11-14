@@ -63,6 +63,27 @@ means no completed matchups are available yet; **Elo unavailable** indicates an
 evaluation read/calculation error. Hover over the badge for details and any
 evaluation warnings.
 
+Historical evaluation JSON now contains compact matchup summaries: all outcomes,
+counts, histograms, clock aggregates (including truncations), rules, seeds, and
+checkpoint provenance are retained. Per-step `clock_events` and per-episode
+`episode_diagnostics` are stored once in each update's `.full.json.gz` companion,
+referenced by `full_results_artifact`. Both files are uploaded for new evaluations.
+The cumulative index and in-memory history no longer duplicate these raw rows.
+Elo and the trainer UI read only the small summaries; their calculations are unchanged.
+Running workers need a pause/resume to adopt this storage format.
+
+To compact existing **local** trainer artifacts, first preview:
+
+```bash
+.env/bin/python scripts/compact_historical_evaluations.py var/training_app/runs
+```
+
+Add `--apply` to convert, or `--indices-only` to limit conversion to cumulative
+indices. Conversion retains each exact original in a hash-named `.gz` sibling,
+verifies its SHA-256 after decompression, and atomically replaces only the summary.
+It refuses to replace a source changed by a live writer during conversion.
+Already compact summaries are skipped. Existing remote MLflow artifacts are not changed.
+
 For a nonzero check-clearance radius, checks use one deterministic safe anchor
 by default. **Randomize check location** is an opt-in that samples each check
 uniformly from safe outside-arc pickup tiles; either setting retains the same
@@ -85,6 +106,8 @@ up freely but cannot pick up until the countdown ends.
 Every durable JAX checkpoint records its Git commit, tracked-worktree cleanliness, and (when dirty) a SHA-256 fingerprint of the tracked diff. The trainer app compares that record with the current checkout before Resume, Recover, or Continue. An exact match proceeds normally; a mismatch or unavailable Git metadata requires explicit confirmation. Non-JAX checkpoints are rejected. This provenance is diagnostic only—it does not guarantee dependency or runtime compatibility.
 
 For check-based made-basket restarts, the trainer configuration exposes **Pre-check setup steps**, **Check pickup seconds**, and **Check-clearance rings**. New configurations use five seconds for setup and five seconds for pickup. A nonzero clearance uses a deterministic eligible pickup anchor outside the clearance arc by default; **Randomize check location** is an opt-in that instead samples an eligible tile. In either mode, the protected disk, plus one inbounds ring, must fit on the court. During setup, the offense may position freely but cannot pick up; defenders outside the disk cannot enter it, and defenders inside must use unoccupied outward moves whenever available. The defense receives the entire setup period to clear, and only a defender remaining inside at the final setup boundary is penalized. During pickup, defenders cannot enter the disk until the offense collects the ball. A defensive violation awards the offense one point and restarts the same possession with a defensive technical. Nonzero-clearance policies use the check-clearance observation schema and should train from scratch.
+
+The combined `check_pickup_rate` remains available for continuity. Training, policy-versus-opponent evaluation, and deploy summaries also report learner and opponent pickup opportunities, completed pickups, and pickup rates separately; ownership follows the team receiving the checked possession, independent of Team A/Team B assignment. In same-policy deploy evaluation, both labeled sides still use the same policy parameters.
 
 Run detail shows the full Git commit and worktree state captured for the most
 recent worker launch. For a resumed or continued run, these fields describe the

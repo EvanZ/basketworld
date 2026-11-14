@@ -293,7 +293,12 @@ class JobManager:
         additional_historical_eval_updates: list[int] | None = None,
     ) -> dict[str, Any]:
         run = self._require_status(
-            run_id, {RunStatus.PAUSED.value, RunStatus.STOPPED.value}
+            run_id,
+            {
+                RunStatus.PAUSED.value,
+                RunStatus.STOPPED.value,
+                RunStatus.FAILED.value,
+            },
         )
         config = TrainingRunConfig.model_validate(run["config"])
         self._require_available_worker_slot(run_id)
@@ -330,9 +335,9 @@ class JobManager:
             run,
             config,
             event_type=(
-                "stopped_recovery_requested"
-                if run["status"] == RunStatus.STOPPED.value
-                else "resume_requested"
+                "resume_requested"
+                if run["status"] == RunStatus.PAUSED.value
+                else f"{run['status']}_recovery_requested"
             ),
             event_payload=schedule_event,
             confirm_provenance_mismatch=confirm_provenance_mismatch,

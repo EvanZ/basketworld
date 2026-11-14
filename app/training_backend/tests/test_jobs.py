@@ -364,7 +364,10 @@ def test_job_manager_continues_completed_run_in_same_mlflow_run(tmp_path):
     }
 
 
-def test_job_manager_recovers_stopped_run_from_validated_checkpoint(tmp_path):
+@pytest.mark.parametrize("recoverable_status", ["stopped", "failed"])
+def test_job_manager_recovers_inactive_run_from_validated_checkpoint(
+    tmp_path, recoverable_status,
+):
     repo_root = tmp_path / "repo"
     python_bin = repo_root / ".env" / "bin" / "python"
     python_bin.parent.mkdir(parents=True)
@@ -401,7 +404,7 @@ def test_job_manager_recovers_stopped_run_from_validated_checkpoint(tmp_path):
     checkpoint = data_dir / "runs" / run["id"] / "checkpoints" / "latest"
     _write_minimal_checkpoint_metadata(checkpoint)
     repository.update_run(
-        run["id"], status="stopped", checkpoint_path=str(checkpoint)
+        run["id"], status=recoverable_status, checkpoint_path=str(checkpoint)
     )
 
     recovered = manager.resume(
@@ -410,7 +413,11 @@ def test_job_manager_recovers_stopped_run_from_validated_checkpoint(tmp_path):
 
     assert recovered["status"] == "running"
     events = repository.list_events(run["id"])
-    recovery = next(event for event in events if event["event_type"] == "stopped_recovery_requested")
+    recovery = next(
+        event
+        for event in events
+        if event["event_type"] == f"{recoverable_status}_recovery_requested"
+    )
     assert recovery["payload"]["checkpoint_path"] == str(checkpoint)
     assert recovery["payload"]["provenance_confirmation"]["confirmed"] is True
 

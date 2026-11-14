@@ -33,6 +33,7 @@ from basketworld_jax.env.minimal import (
     TEAM_A,
     TEAM_B,
     _defender_guarding_offense_mask,
+    build_shot_profile_batch,
     step_batch_minimal,
 )
 
@@ -745,6 +746,14 @@ def test_jax_dev_runtime_fast_self_play_returns_board_state_with_value_overlay_o
         rtol=1e-6,
         atol=1e-6,
     )
+    profile = build_shot_profile_batch(runtime.static, runtime.state, runtime.jnp)
+    expected_shot_probability = np.asarray(
+        runtime.jax.device_get(profile["probability"][0]),
+        dtype=np.float32,
+    )[state["ball_holder"]]
+    assert state["ball_handler_shot_probability"] == pytest.approx(
+        float(expected_shot_probability)
+    )
 
     # The compact payload must be live rather than episode metadata retained
     # by the frontend's Fast Mode state merge.
@@ -759,6 +768,7 @@ def test_jax_dev_runtime_fast_self_play_returns_board_state_with_value_overlay_o
         positions=jnp.asarray(positions, dtype=jnp.int32),
     )
     runtime._fast_ep_by_player = None
+    runtime._fast_shot_probability = None
     near_ep = runtime._fast_game_state(game_state)["ep_by_player"][player_id]
 
     cells = np.asarray(runtime.static.cell_coords, dtype=np.int32)
@@ -773,9 +783,39 @@ def test_jax_dev_runtime_fast_self_play_returns_board_state_with_value_overlay_o
         positions=jnp.asarray(positions, dtype=jnp.int32),
     )
     runtime._fast_ep_by_player = None
+    runtime._fast_shot_probability = None
     far_ep = runtime._fast_game_state(game_state)["ep_by_player"][player_id]
 
     assert near_ep != pytest.approx(far_ep)
+
+
+def test_jax_dev_runtime_fast_mode_warmup_accepts_shot_probability_output(monkeypatch):
+    runtime = _make_runtime()
+
+    class _ImmediateThread:
+        def __init__(self, *, target, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    def _runner(*_args):
+        return (
+            None,
+            jnp.zeros((1, runtime.n_players, 14), dtype=jnp.int8),
+            jnp.zeros((1, runtime.n_players), dtype=jnp.float32),
+            jnp.zeros((1, runtime.n_players), dtype=jnp.float32),
+        )
+
+    monkeypatch.setattr(runtime, "_compiled_step_batch_minimal", lambda: _runner)
+    monkeypatch.setattr(
+        "app.backend.jax_dev_runtime.threading.Thread",
+        _ImmediateThread,
+    )
+
+    status = runtime.prepare_fast_mode()
+
+    assert status == {"ready": True, "warming": False, "error": None}
 
 
 def _make_selector_runtime_and_state():

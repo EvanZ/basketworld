@@ -591,6 +591,7 @@ class JaxDevRuntime:
         self._clearance_zone_cells_cache: tuple[tuple[int, int], ...] | None = None
         self._step_batch_runner = None
         self._fast_action_mask = None
+        self._fast_shot_probability = None
         self._fast_ep_by_player = None
         self._fast_episode_metadata_cache: dict[str, Any] | None = None
         self._fast_kernel_lock = threading.RLock()
@@ -654,6 +655,7 @@ class JaxDevRuntime:
         with self._fast_kernel_lock:
             self._step_batch_runner = None
             self._fast_action_mask = None
+            self._fast_shot_probability = None
             self._fast_ep_by_player = None
             self._fast_kernel_generation += 1
             self._fast_kernel_ready = False
@@ -695,14 +697,16 @@ class JaxDevRuntime:
                 # Fast Mode needs the next action mask only for a compact
                 # board payload.  Produce it in the compiled transition rather
                 # than launching another eager JAX program after every frame.
+                shot_profile = build_shot_profile_batch(
+                    runtime_static,
+                    output.state,
+                    jnp,
+                )
                 return (
                     output,
                     build_action_masks_batch(runtime_static, output.state, jnp),
-                    build_shot_profile_batch(
-                        runtime_static,
-                        output.state,
-                        jnp,
-                    )["expected_points"],
+                    shot_profile["probability"],
+                    shot_profile["expected_points"],
                 )
 
             self._step_batch_runner = jax.jit(_runner)
@@ -738,7 +742,7 @@ class JaxDevRuntime:
 
         def _warm() -> None:
             try:
-                _, next_mask, next_ep = runner(
+                _, next_mask, next_probability, next_ep = runner(
                     state,
                     actions,
                     keys,
@@ -748,6 +752,7 @@ class JaxDevRuntime:
                     self.static.check_setup_steps,
                 )
                 self.jax.block_until_ready(next_mask)
+                self.jax.block_until_ready(next_probability)
                 self.jax.block_until_ready(next_ep)
             except Exception as exc:
                 with self._fast_kernel_lock:
@@ -1799,6 +1804,7 @@ class JaxDevRuntime:
             (
                 out,
                 self._fast_action_mask,
+                self._fast_shot_probability,
                 self._fast_ep_by_player,
             ) = self._compiled_step_batch_minimal()(
                 self.state,
@@ -1811,6 +1817,7 @@ class JaxDevRuntime:
             )
         else:
             self._fast_action_mask = None
+            self._fast_shot_probability = None
             self._fast_ep_by_player = None
             out = step_batch_minimal(
                 self.static,
@@ -1955,6 +1962,7 @@ class JaxDevRuntime:
     def _start_self_play_locked(self, request: Any, game_state: Any) -> dict[str, Any]:
         fast_mode = bool(getattr(request, "fast_mode", False))
         self._fast_action_mask = None
+        self._fast_shot_probability = None
         self._fast_ep_by_player = None
         self._fast_episode_metadata_cache = None
         requested_seed = getattr(request, "template_seed", None)
@@ -3701,6 +3709,11 @@ class JaxDevRuntime:
         """
         # A compact Fast Mode payload comes from one JAX state snapshot instead
         # of the individual device-to-host reads used by the inspector view.
+        uncached_shot_profile = (
+            build_shot_profile_batch(self.static, self.state, self.jnp)
+            if self._fast_shot_probability is None or self._fast_ep_by_player is None
+            else None
+        )
         device_values: dict[str, Any] = {
             "positions": _field0(self.state, "positions"),
             "ball_holder": _field0(self.state, "ball_holder"),
@@ -3767,11 +3780,12 @@ class JaxDevRuntime:
             "ep_by_player": (
                 self._fast_ep_by_player[0]
                 if self._fast_ep_by_player is not None
-                else build_shot_profile_batch(
-                    self.static,
-                    self.state,
-                    self.jnp,
-                )["expected_points"][0]
+                else uncached_shot_profile["expected_points"][0]
+            ),
+            "shot_probability_by_player": (
+                self._fast_shot_probability[0]
+                if self._fast_shot_probability is not None
+                else uncached_shot_profile["probability"][0]
             ),
         }
         if self._fast_action_mask is not None:
@@ -4069,6 +4083,16 @@ class JaxDevRuntime:
                     dtype=np.float32,
                 ).reshape(-1).tolist()
             ],
+            "ball_handler_shot_probability": (
+                float(
+                    np.asarray(
+                        host["shot_probability_by_player"],
+                        dtype=np.float32,
+                    ).reshape(-1)[ball_holder]
+                )
+                if ball_holder is not None
+                else None
+            ),
             "pass_mode": self.environment.pass_mode or "directional",
         }
         episode_metadata = self._fast_episode_metadata(game_state)

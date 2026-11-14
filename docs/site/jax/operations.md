@@ -242,7 +242,7 @@ life of each episode row.
 Training supports:
 
 - periodic compiled role evaluation through `--eval-every-updates`;
-- fixed-seed same-policy argmax-versus-argmax deploy evaluation through
+- fixed-seed same-policy sampled-action deploy evaluation through
   `--eval-deploy-every-updates`;
 - a maximum number of serialized trajectory examples for summaries.
 

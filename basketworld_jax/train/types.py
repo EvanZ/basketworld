@@ -166,6 +166,10 @@ class TrajectoryBatch(NamedTuple):
     defense_score_delta: Any
     terminal_learner_win_score: Any = None
     pressure_diagnostics: Any = None
+    learner_check_opportunities: Any = None
+    opponent_check_opportunities: Any = None
+    learner_check_pickups: Any = None
+    opponent_check_pickups: Any = None
 
 
 class RolloutOutput(NamedTuple):
@@ -291,6 +295,10 @@ class EvalTrace(NamedTuple):
     offense_score: Any
     defense_score: Any
     pressure_diagnostics: Any = None
+    learner_check_opportunities: Any = None
+    opponent_check_opportunities: Any = None
+    learner_check_pickups: Any = None
+    opponent_check_pickups: Any = None
 
 
 class DeployEvalTotals(NamedTuple):
@@ -382,6 +390,10 @@ class DeployEvalTotals(NamedTuple):
     overtime_team_a_points: Any = 0.0
     overtime_team_b_points: Any = 0.0
     pressure_diagnostics: Any = None
+    learner_check_opportunities: Any = 0.0
+    opponent_check_opportunities: Any = 0.0
+    learner_check_pickups: Any = 0.0
+    opponent_check_pickups: Any = 0.0
 
 
 class DeployEvalOutput(NamedTuple):

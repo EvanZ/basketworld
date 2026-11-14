@@ -80,16 +80,54 @@ from basketworld_jax.train.main import (
 )
 from basketworld_jax.train.runtime import (
     _apply_selector_update_param_scope,
+    _build_check_transition_metrics,
     _mask_selector_update_grads,
     _merge_selector_update_params,
     _renew_unselected_intent_timeout,
     _selector_segment_application_masks,
     summarize_deploy_eval_outputs,
+    summarize_check_pickup_metrics,
     summarize_learner_rebound_metrics,
     summarize_rebound_diagnostics,
     summarize_ppo_eligible_episode_metrics,
     summarize_reward_by_intent_metrics,
 )
+
+
+def test_check_pickup_metrics_split_learner_and_opponent_by_receiving_team():
+    static = SimpleNamespace(
+        training_player_mask=np.asarray([1.0, 1.0, 0.0, 0.0]),
+        offense_ids=np.asarray([0, 1]),
+    )
+    env_out = SimpleNamespace(
+        state=SimpleNamespace(offense_team=np.asarray([0, 1, 1, 0])),
+        check_opportunity=np.asarray([1, 1, 0, 1]),
+        check_pickup=np.asarray([1, 0, 0, 1]),
+    )
+    split = _build_check_transition_metrics(
+        static,
+        env_out,
+        np.asarray([1, 1, 1, 0], dtype=bool),
+        np,
+    )
+    assert split["learner_check_opportunities"].tolist() == [1, 0, 0, 0]
+    assert split["opponent_check_opportunities"].tolist() == [0, 1, 0, 0]
+    assert split["learner_check_pickups"].tolist() == [1, 0, 0, 0]
+    assert split["opponent_check_pickups"].tolist() == [0, 0, 0, 0]
+
+    summary = summarize_check_pickup_metrics(
+        env_out.check_opportunity[:2],
+        env_out.check_pickup[:2],
+        split["learner_check_opportunities"],
+        split["learner_check_pickups"],
+        split["opponent_check_opportunities"],
+        split["opponent_check_pickups"],
+    )
+    assert summary["check_pickup_rate"] == pytest.approx(0.5)
+    assert summary["learner_check_pickup_rate"] == pytest.approx(1.0)
+    assert summary["opponent_check_pickup_rate"] == pytest.approx(0.0)
+    assert summary["learner_check_opportunity_count"] == 1
+    assert summary["opponent_check_opportunity_count"] == 1
 
 
 def test_time_limit_truncation_bootstraps_from_final_observation_value():
@@ -1248,6 +1286,10 @@ def test_summarize_deploy_eval_outputs_aggregates_counts_and_rebound_rates():
         check_opportunities=4.0,
         check_setup_opportunities=4.0,
         check_pickups=3.0,
+        learner_check_opportunities=2.0,
+        learner_check_pickups=2.0,
+        opponent_check_opportunities=2.0,
+        opponent_check_pickups=1.0,
         check_violations=1.0,
         check_space_defense_violations=1.0,
         check_pickup_steps=7.0,
@@ -1300,6 +1342,8 @@ def test_summarize_deploy_eval_outputs_aggregates_counts_and_rebound_rates():
     assert summary["check_space_defense_violation_count"] == 1
     assert summary["check_space_defense_violation_rate"] == pytest.approx(0.25)
     assert summary["check_pickup_rate"] == pytest.approx(0.75)
+    assert summary["learner_check_pickup_rate"] == pytest.approx(1.0)
+    assert summary["opponent_check_pickup_rate"] == pytest.approx(0.5)
     assert summary["check_mean_pickup_steps"] == pytest.approx(7.0 / 3.0)
     assert summary["completed_possession_count"] == 3
     assert summary["mean_winner_reward_per_episode"] == pytest.approx(0.0)
@@ -2897,6 +2941,8 @@ def test_core_mlflow_train_metric_filter_drops_redundant_aliases():
         "selector_usage_by_intent/0": 0.2,
         "check_space_defense_violation_count": 4,
         "check_space_defense_violation_rate": 0.2,
+        "learner_check_pickup_rate": 0.9,
+        "opponent_check_pickup_rate": 0.4,
         "end_to_end_steps_per_sec": 30000.0,
     }
 
@@ -2929,12 +2975,18 @@ def test_core_mlflow_train_metric_filter_drops_redundant_aliases():
     assert "selector_usage_by_intent/0" not in filtered
     assert filtered["check_space_defense_violation_count"] == 4
     assert filtered["check_space_defense_violation_rate"] == pytest.approx(0.2)
+    assert filtered["learner_check_pickup_rate"] == pytest.approx(0.9)
+    assert filtered["opponent_check_pickup_rate"] == pytest.approx(0.4)
     assert filtered["end_to_end_steps_per_sec"] == 30000.0
     assert _filter_mlflow_train_metrics(metrics, profile="full") == metrics
 
 
 def test_core_mlflow_deploy_metric_filter_keeps_compact_aggregates():
     metrics = {
+        "action_argmax_offense": 0,
+        "action_argmax_defense": 0,
+        "action_sampled_offense": 1,
+        "action_sampled_defense": 1,
         "completion_rate": 1.0,
         "mean_offense_score": 17.0,
         "mean_live_boundary_player_fraction": 0.4,
@@ -2947,11 +2999,17 @@ def test_core_mlflow_deploy_metric_filter_keeps_compact_aggregates():
         "turnover_defender_pressure_share": 0.15,
         "check_space_defense_violation_count": 4,
         "check_space_defense_violation_rate": 0.2,
+        "learner_check_pickup_rate": 0.9,
+        "opponent_check_pickup_rate": 0.4,
     }
 
     filtered = _filter_mlflow_deploy_metrics(metrics)
 
     assert filtered == {
+        "action_argmax_offense": 0,
+        "action_argmax_defense": 0,
+        "action_sampled_offense": 1,
+        "action_sampled_defense": 1,
         "completion_rate": 1.0,
         "mean_offense_score": 17.0,
         "mean_live_boundary_player_fraction": 0.4,
@@ -2960,6 +3018,8 @@ def test_core_mlflow_deploy_metric_filter_keeps_compact_aggregates():
         "turnover_defender_pressure_share": 0.15,
         "check_space_defense_violation_count": 4,
         "check_space_defense_violation_rate": 0.2,
+        "learner_check_pickup_rate": 0.9,
+        "opponent_check_pickup_rate": 0.4,
     }
     assert _filter_mlflow_deploy_metrics(metrics, profile="full") == metrics
 
@@ -3388,6 +3448,11 @@ def test_train_loop_emits_history_and_eval_dumps():
         == 4
     )
     assert deploy_metrics["same_policy_both_sides"] == 1
+    assert deploy_metrics["action_mode"] == "sampled"
+    assert deploy_metrics["action_argmax_offense"] == 0
+    assert deploy_metrics["action_argmax_defense"] == 0
+    assert deploy_metrics["action_sampled_offense"] == 1
+    assert deploy_metrics["action_sampled_defense"] == 1
     assert "rebound_softmax_win_rate_offense" in deploy_metrics
     assert "defensive_rebound_rate" in deploy_metrics
     assert "mean_live_all_player_pair_distance" in deploy_metrics
