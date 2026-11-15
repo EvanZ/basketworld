@@ -49,9 +49,14 @@ def test_lineup_schedule_is_deterministic_balanced_and_has_independent_games():
         assert len(roster) == len(set(roster)) == 10
 
 
-def test_saved_schedule_replays_against_its_exact_pool_and_is_immutable(tmp_path):
+@pytest.mark.parametrize("team_size", [3, 4, 5])
+def test_saved_schedule_replays_against_its_exact_pool_and_is_immutable(
+    tmp_path, team_size
+):
     pool = generate_player_pool(player_count=14, seed=12)
-    schedule = build_balanced_lineup_schedule(pool, game_count=20, seed=444)
+    schedule = build_balanced_lineup_schedule(
+        pool, game_count=20, seed=444, team_size=team_size
+    )
 
     path = write_lineup_schedule(schedule, tmp_path / "lineups.json")
     reloaded = load_lineup_schedule(path, pool=pool)
@@ -64,7 +69,9 @@ def test_saved_schedule_replays_against_its_exact_pool_and_is_immutable(tmp_path
     with pytest.raises(TypeError):
         reloaded.diagnostics["game_appearance_spread"] = 0
 
-    other_schedule = build_balanced_lineup_schedule(pool, game_count=20, seed=445)
+    other_schedule = build_balanced_lineup_schedule(
+        pool, game_count=20, seed=445, team_size=team_size
+    )
     with pytest.raises(FileExistsError, match="immutable"):
         write_lineup_schedule(other_schedule, path)
 
@@ -73,14 +80,19 @@ def test_saved_schedule_replays_against_its_exact_pool_and_is_immutable(tmp_path
         load_lineup_schedule(path, pool=incompatible_pool)
 
 
-def test_schedule_extension_preserves_base_games_and_adds_only_new_ids():
+@pytest.mark.parametrize("team_size", [3, 4, 5])
+def test_schedule_extension_preserves_base_games_and_adds_only_new_ids(team_size):
     pool = generate_player_pool(player_count=12, seed=4)
-    base = build_balanced_lineup_schedule(pool, game_count=24, seed=11)
+    base = build_balanced_lineup_schedule(
+        pool, game_count=24, seed=11, team_size=team_size
+    )
 
     extension = build_lineup_schedule_extension(
         pool, base, additional_game_count=12, seed=13
     )
 
+    assert extension.additional_schedule.team_size == team_size
+    assert extension.combined_schedule.team_size == team_size
     assert len(extension.additional_schedule.games) == 12
     assert len(extension.combined_schedule.games) == 36
     assert extension.combined_schedule.games[:24] == base.games
@@ -169,3 +181,36 @@ def test_schedule_payload_preserves_future_fields_and_rechecks_diagnostics():
     invalid["schedule_id"] = schedule_id_for_payload(invalid)
     with pytest.raises(LineupScheduleError, match="diagnostics"):
         LineupSchedule.from_payload(invalid)
+
+
+@pytest.mark.parametrize("team_size", [3, 4, 5])
+def test_team_size_controls_minimum_pool_and_deterministic_schedule(team_size):
+    pool = generate_player_pool(player_count=team_size * 2, seed=31)
+    schedule = build_balanced_lineup_schedule(
+        pool, game_count=12, seed=912, team_size=team_size
+    )
+    replay = build_balanced_lineup_schedule(
+        pool, game_count=12, seed=912, team_size=team_size
+    )
+    assert schedule.to_payload() == replay.to_payload()
+    assert schedule.team_size == team_size
+    assert schedule.diagnostics["team_a_start_game_count"] == 6
+    assert schedule.diagnostics["team_b_start_game_count"] == 6
+    for game in schedule.games:
+        assert len(game.team_a_player_ids) == len(game.team_b_player_ids) == team_size
+        assert (
+            len(set((*game.team_a_player_ids, *game.team_b_player_ids)))
+            == team_size * 2
+        )
+    too_small = generate_player_pool(player_count=team_size * 2 - 1, seed=31)
+    with pytest.raises(LineupScheduleError, match=f"at least {team_size * 2}"):
+        build_balanced_lineup_schedule(
+            too_small, game_count=2, seed=1, team_size=team_size
+        )
+
+
+@pytest.mark.parametrize("team_size", [0, 2, 6, 3.5])
+def test_schedule_rejects_unsupported_team_size(team_size):
+    pool = generate_player_pool(player_count=12, seed=31)
+    with pytest.raises(LineupScheduleError, match="team_size"):
+        build_balanced_lineup_schedule(pool, game_count=2, seed=1, team_size=team_size)

@@ -37,13 +37,15 @@ class FixedPoolModelError(ValueError):
     """A raw study cannot support the requested offline comparison or model."""
 
 
-def fixed_pool_study_budget(skill_count: int) -> dict[str, int]:
+def fixed_pool_study_budget(skill_count: int, *, team_size: int = 5) -> dict[str, int]:
     """Return the skill-scaled initial study budget recorded by issue #57."""
     if int(skill_count) < 1:
         raise FixedPoolModelError("A fixed-pool model needs at least one active skill.")
+    if team_size not in (3, 4, 5):
+        raise FixedPoolModelError("Study team_size must be 3, 4, or 5.")
     seeded_players = max(10, 8 * int(skill_count))
     game_appearances_per_player = 100
-    games = math.ceil(seeded_players * game_appearances_per_player / 10)
+    games = math.ceil(seeded_players * game_appearances_per_player / (2 * team_size))
     return {
         "effective_skill_count": int(skill_count),
         "seeded_players": int(seeded_players),
@@ -497,7 +499,7 @@ def _matrix_diagnostics(
         condition_number = math.inf
     else:
         # Exclude only the known gauge direction.  For example, every signed
-        # five-versus-five player row sums to zero, so absolute player value is
+        # equal-size team player row sums to zero, so absolute player value is
         # intentionally unidentified while all values versus replacement are
         # estimable.
         smallest_identified = (
@@ -2078,7 +2080,8 @@ def fit_fixed_pool_study_models(
     )
     pool_manifest = normalized_study["pool_manifest"]
     skill_count = len(pool_manifest.get("skill_descriptors", []))
-    budget = fixed_pool_study_budget(skill_count)
+    team_size = len(episodes[0]["team_a_player_ids"])
+    budget = fixed_pool_study_budget(skill_count, team_size=team_size)
     pair_ids = [str(row["pair_id"]) for row in included]
     split = paired_group_split(
         pair_ids, validation_fraction=validation_fraction, seed=split_seed

@@ -17,6 +17,7 @@ from basketworld_jax.eval import (
 )
 from basketworld_jax.eval.fixed_pool import generate_player_pool
 from basketworld_jax.eval.fixed_pool_results import load_fixed_pool_study_artifacts
+from basketworld_jax.eval.fixed_pool_study import write_fixed_pool_model_reanalysis
 from basketworld_jax.eval.lineup_schedule import build_balanced_lineup_schedule
 from basketworld_jax.eval.native import (
     _apply_native_profile_rows,
@@ -714,13 +715,18 @@ def test_game_clock_native_and_historical_evaluation_emit_clock_diagnostics(
         for episode in native["results"]
         for event in episode["game"]["clock_events"]
     )
-def test_native_fixed_pool_evaluation_uses_scheduled_profiles_and_rng_streams(tmp_path):
+
+
+@pytest.mark.parametrize("team_size", [3, 4, 5])
+def test_native_fixed_pool_evaluation_uses_scheduled_profiles_and_rng_streams(
+    tmp_path, team_size
+):
     checkpoint_dir = tmp_path / "native_fixed_pool_eval_ckpts"
     args = parse_args(
         [
             "--run-train-loop",
             "--players",
-            "5",
+            str(team_size),
             "--enable-multi-possession",
             "--multi-possession-limit",
             "1",
@@ -754,14 +760,16 @@ def test_native_fixed_pool_evaluation_uses_scheduled_profiles_and_rng_streams(tm
     optional_params = _native_eval_env_params()
     optional_params.update(
         {
-            "players": 5,
+            "players": team_size,
             "enable_multi_possession": True,
             "multi_possession_limit": 1,
             "inbound_deadline_steps": 2,
         }
     )
-    pool = generate_player_pool(player_count=10, seed=808)
-    schedule = build_balanced_lineup_schedule(pool, game_count=2, seed=909)
+    pool = generate_player_pool(player_count=2 * team_size, seed=808)
+    schedule = build_balanced_lineup_schedule(
+        pool, game_count=2, seed=909, team_size=team_size
+    )
 
     result = run_native_jax_evaluation(
         num_episodes=len(schedule.games),
@@ -797,6 +805,26 @@ def test_native_fixed_pool_evaluation_uses_scheduled_profiles_and_rng_streams(tm
         for row in fixed_pool_artifact["episodes"]
     )
     assert "possession_events" in fixed_pool_artifact["manifest"]["tables"]
+    assert fixed_pool_artifact["schedule_manifest"]["team_size"] == team_size
+    assert fixed_pool_artifact["possession_events"]
+    games_by_id = {game.game_id: game for game in schedule.games}
+    for event in fixed_pool_artifact["possession_events"]:
+        game = games_by_id[event["schedule_game_id"]]
+        slots = (*game.team_a_player_ids, *game.team_b_player_ids)
+        for prefix in ("actor", "target"):
+            slot = event[f"{prefix}_player_slot"]
+            if slot is not None:
+                assert event[f"{prefix}_player_id"] == slots[slot]
+                if prefix == "actor":
+                    assert event["actor_team"] == (
+                        "team_a" if slot < team_size else "team_b"
+                    )
+    report_path = write_fixed_pool_model_reanalysis(
+        result["fixed_pool_artifacts"]["root"],
+        report_root=tmp_path / "reports",
+        bootstrap_samples=2,
+    )
+    assert report_path.is_file()
     assert len(result["results"]) == 2
     for episode, game in zip(result["results"], schedule.games, strict=True):
         trace = episode["fixed_pool_study"]

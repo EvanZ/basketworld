@@ -3377,12 +3377,10 @@ def run_native_jax_evaluation(
     n_players = int(config.players) * 2
     offense_ids = list(range(int(config.players)))
     defense_ids = list(range(int(config.players), n_players))
-    if fixed_pool_mode and (
-        n_players != 10 or len(offense_ids) != 5 or len(defense_ids) != 5
-    ):
+    if fixed_pool_mode and (int(config.players) != fixed_lineup_schedule.team_size):
         raise ValueError(
-            "Fixed-pool evaluation requires a 5v5 JAX environment with exactly "
-            "ten player slots."
+            f"Fixed-pool schedule team size {fixed_lineup_schedule.team_size} "
+            f"does not match the JAX environment team size {config.players}."
         )
     runner = _build_native_eval_runner(
         jax,

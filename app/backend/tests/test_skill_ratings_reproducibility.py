@@ -19,7 +19,7 @@ def _report_with_artifacts(tmp_path: Path, *, recorded: dict | None) -> tuple[Pa
     pool_path = raw_root / "pool_manifest.json"
     schedule_path = raw_root / "schedule_manifest.json"
     _write_json(pool_path, {"players": [{"player_id": "one"}], "pool_seed": 11})
-    _write_json(schedule_path, {"games": [{"game_id": "one"}], "schedule_seed": 12})
+    _write_json(schedule_path, {"games": [{"game_id": "one"}], "schedule_seed": 12, "team_size": 4})
     report_path = tmp_path / "artifacts" / "fixed_pool_reports" / "study-a" / "checkpoint_report.json"
     report = {
         "checkpoint": {"path": str(tmp_path / "checkpoint")},
@@ -53,6 +53,7 @@ def test_report_reproducibility_preserves_all_recorded_seeds(tmp_path, monkeypat
     reproducibility = skill_ratings_routes._report_reproducibility(report_path, report)
 
     assert reproducibility is not None
+    assert reproducibility["team_size"] == 4
     assert reproducibility["seeds"] == {
         "pool_seed": 11,
         "schedule_seed": 12,

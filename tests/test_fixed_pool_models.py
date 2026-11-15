@@ -497,3 +497,13 @@ def test_action_modes_are_reported_separately_and_cross_schema_fails():
     incompatible["manifest"]["skill_schema_hash"] = "other-schema"
     with pytest.raises(FixedPoolModelError, match="cross-schema"):
         assert_studies_schema_compatible([direct, incompatible])
+
+
+@pytest.mark.parametrize("team_size, expected_games", [(3, 1067), (4, 800), (5, 640)])
+def test_budget_preserves_player_appearances_for_smaller_teams(
+    team_size, expected_games
+):
+    budget = fixed_pool_study_budget(8, team_size=team_size)
+    assert budget["games"] == expected_games
+    assert budget["seeded_players"] == 64
+    assert budget["game_appearances_per_player"] == 100

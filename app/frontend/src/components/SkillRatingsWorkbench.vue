@@ -357,7 +357,7 @@ onBeforeUnmount(stopPolling);
               <input v-model="config.poolPath" required />
             </label>
             <label>
-              <span class="field-label">Seeded players <span class="optional">0 = skill-scaled default</span> <span class="help-tip" tabindex="0" title="How many synthetic players to rate. Zero sizes the pool from the active skill registry (currently 64 for 8 skills). More players improve skill-model coverage but require a larger schedule.">?</span></span>
+              <span class="field-label">Seeded players <span class="optional">0 = skill-scaled default</span> <span class="help-tip" tabindex="0" title="How many synthetic players to rate. Zero sizes the pool from the active skill registry (eight players per skill, at least ten players). The pool must contain at least 6 players for 3v3, 8 for 4v4, or 10 for 5v5. More players improve skill-model coverage but require a larger schedule.">?</span></span>
               <input v-model.number="config.poolSize" type="number" min="0" />
             </label>
           </div>
@@ -365,14 +365,14 @@ onBeforeUnmount(stopPolling);
             <span class="field-label">Pool seed <span class="help-tip" tabindex="0" title="Random seed used only when creating a pool. Reusing the same seed and configuration reproduces the same player profiles; change it for an independent replicate.">?</span></span>
             <input v-model.number="config.poolSeed" type="number" />
           </label>
-          <label class="toggle"><input v-model="config.createSchedule" type="checkbox" /> Create a new balanced schedule <span class="help-tip" tabindex="0" title="The schedule chooses a distinct, balanced 5v5 lineup for every game, balances which team starts, and gives each game independent RNG streams. Turn this off to reuse an existing immutable schedule.">?</span></label>
+          <label class="toggle"><input v-model="config.createSchedule" type="checkbox" /> Create a new balanced schedule <span class="help-tip" tabindex="0" title="The schedule automatically matches the checkpoint’s 3v3, 4v4, or 5v5 team size and chooses a distinct, balanced lineup for every game, balances which team starts, and gives each game independent RNG streams. Turn this off to reuse an existing immutable schedule.">?</span></label>
           <div class="two-column">
             <label>
-              <span class="field-label">Schedule path <span class="help-tip" tabindex="0" title="Where the immutable balanced-lineup schedule is written or loaded from. The schedule must match the chosen player pool.">?</span></span>
+              <span class="field-label">Schedule path <span class="help-tip" tabindex="0" title="Where the immutable balanced-lineup schedule is written or loaded from. The schedule must match the chosen player pool and checkpoint team size.">?</span></span>
               <input v-model="config.schedulePath" required />
             </label>
             <label>
-              <span class="field-label">Games <span class="optional">0 = skill-scaled default</span> <span class="help-tip" tabindex="0" title="Number of distinct balanced games. Zero chooses the skill-scaled default (currently 640 games for 64 players and 8 skills). More games narrow uncertainty intervals and take longer.">?</span></span>
+              <span class="field-label">Games <span class="optional">0 = skill-scaled default</span> <span class="help-tip" tabindex="0" title="Number of distinct balanced games. Zero targets 100 appearances per player: for 64 players, 1067 games at 3v3, 800 at 4v4, or 640 at 5v5. More games narrow uncertainty intervals and take longer.">?</span></span>
               <input v-model.number="config.gameCount" type="number" min="0" />
             </label>
           </div>
@@ -440,6 +440,7 @@ onBeforeUnmount(stopPolling);
             <span :class="['status-badge', job?.status || 'idle']">{{ job?.status || 'idle' }}</span>
           </div>
           <template v-if="job">
+            <p v-if="job.config?.team_size" class="muted">{{ job.config.team_size }}v{{ job.config.team_size }} · team size from checkpoint</p>
             <p class="phase"><strong>{{ formatPhase(latestEvent?.phase) }}</strong><span v-if="latestEvent?.elapsed_sec !== undefined">{{ formatElapsed(latestEvent.elapsed_sec) }} elapsed</span></p>
             <template v-if="batchProgress">
               <div class="progress-label"><span>Games completed</span><strong>{{ batchProgress.completed }} / {{ batchProgress.total }}</strong></div>
@@ -461,7 +462,7 @@ onBeforeUnmount(stopPolling);
               <pre>{{ job.logs?.map((entry) => entry.message).join('\n') }}</pre>
             </details>
           </template>
-          <p v-else class="muted">Launching validates the checkpoint’s 5v5 multi-possession compatibility before it starts work.</p>
+          <p v-else class="muted">Team size is taken automatically from the checkpoint. Launching validates 3v3, 4v4, or 5v5 multi-possession compatibility and checks reused schedules before it starts work.</p>
         </section>
 
         <section class="reports-card">
@@ -541,6 +542,7 @@ onBeforeUnmount(stopPolling);
           This legacy report did not record {{ report.reproducibility.missing_seed_keys.join(', ').replaceAll('_', ' ') }}. It cannot be safely extended; launch a new study instead.
         </p>
         <dl class="reproducibility-seeds">
+          <dt>Matchup</dt><dd>{{ report.reproducibility.team_size ? `${report.reproducibility.team_size}v${report.reproducibility.team_size}` : 'Unavailable' }}</dd>
           <dt>Player pool seed</dt><dd>{{ formatSeed(report.reproducibility.seeds?.pool_seed) }}</dd>
           <dt>Original schedule seed</dt><dd>{{ formatSeed(report.reproducibility.seeds?.schedule_seed) }}</dd>
           <dt>Evaluation seed</dt><dd>{{ formatSeed(report.reproducibility.seeds?.evaluation_seed) }}</dd>

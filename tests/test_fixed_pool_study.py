@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+
+import pytest
 from types import SimpleNamespace
 
 from basketworld_jax.eval.fixed_pool import generate_player_pool
@@ -9,6 +12,7 @@ from basketworld_jax.eval.fixed_pool_results import (
     persist_fixed_pool_study_artifacts,
 )
 from basketworld_jax.eval.fixed_pool_study import (
+    FixedPoolStudyRunError,
     _study_skill_sampling_overrides,
     run_fixed_pool_study,
     write_fixed_pool_model_reanalysis,
@@ -178,13 +182,16 @@ def test_study_pool_sampling_has_support_for_each_active_skill():
         assert len(values) > 1
 
 
-def test_operational_runner_creates_then_reuses_immutable_inputs(tmp_path, monkeypatch):
+@pytest.mark.parametrize("team_size", [3, 4, 5])
+def test_operational_runner_creates_then_reuses_immutable_inputs(
+    tmp_path, monkeypatch, team_size
+):
     checkpoint = tmp_path / "update_0000004"
     _mark_jax_checkpoint(checkpoint)
     monkeypatch.setattr(
         "basketworld_jax.eval.fixed_pool_study.load_checkpoint_metadata",
         lambda _path: {
-            "env_config": {"players": 5, "enable_multi_possession": True},
+            "env_config": {"players": team_size, "enable_multi_possession": True},
             "trainer_config": {"eval_horizon": 3},
         },
     )
@@ -199,6 +206,7 @@ def test_operational_runner_creates_then_reuses_immutable_inputs(tmp_path, monke
     assert created["enabled"] is True
     assert created["pool"]["created"] is True
     assert created["schedule"]["created"] is True
+    assert created["schedule"]["team_size"] == team_size
     assert len(created["checkpoint_reports"]) == 1
     report = created["checkpoint_reports"][0]
     assert report["raw_artifact_dependencies"]["root"].endswith(
@@ -251,15 +259,16 @@ def test_operational_runner_creates_then_reuses_immutable_inputs(tmp_path, monke
     assert conventional["scenario_weights"]["status"] == "excluded"
 
 
+@pytest.mark.parametrize("team_size", [3, 4, 5])
 def test_operational_runner_extends_raw_evidence_without_replaying_base_games(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, team_size
 ):
     checkpoint = tmp_path / "update_0000004"
     _mark_jax_checkpoint(checkpoint)
     monkeypatch.setattr(
         "basketworld_jax.eval.fixed_pool_study.load_checkpoint_metadata",
         lambda _path: {
-            "env_config": {"players": 5, "enable_multi_possession": True},
+            "env_config": {"players": team_size, "enable_multi_possession": True},
             "trainer_config": {"eval_horizon": 3},
         },
     )
@@ -280,7 +289,11 @@ def test_operational_runner_extends_raw_evidence_without_replaying_base_games(
     extension_args.fixed_pool_schedule_create = True
     extension_args.fixed_pool_artifact_dir = str(tmp_path / "extension_artifacts")
 
+    base_root = Path(extension_args.fixed_pool_extension_source)
+    original_files = {p: p.read_bytes() for p in base_root.iterdir() if p.is_file()}
     extended = run_fixed_pool_study(extension_args, native_runner=_fake_native_runner)
+    assert all(p.read_bytes() == content for p, content in original_files.items())
+    assert extended["schedule"]["team_size"] == team_size
 
     report = extended["checkpoint_reports"][0]
     artifact = load_fixed_pool_study_artifacts(report["raw_artifact_dependencies"]["root"])
@@ -291,3 +304,80 @@ def test_operational_runner_extends_raw_evidence_without_replaying_base_games(
     assert report["execution"]["reproducibility"]["extension_source_root"] == (
         extension_args.fixed_pool_extension_source
     )
+
+
+@pytest.mark.parametrize(
+    "failure", ["mixed", "unsupported", "single_possession", "small_pool"]
+)
+def test_preflight_failure_does_not_publish_inputs(tmp_path, monkeypatch, failure):
+    checkpoint = tmp_path / "checkpoint"
+    other = tmp_path / "other"
+    _mark_jax_checkpoint(checkpoint)
+    _mark_jax_checkpoint(other)
+    args = _args(tmp_path, checkpoint, create=True)
+    args.fixed_pool_checkpoint.append(str(other))
+    args.fixed_pool_size = 5 if failure == "small_pool" else 10
+    monkeypatch.setattr(
+        "basketworld_jax.eval.fixed_pool_study.load_checkpoint_metadata",
+        lambda path: {
+            "env_config": {
+                "players": (
+                    2
+                    if failure == "unsupported"
+                    else 4 if failure == "mixed" and path == other else 3
+                ),
+                "enable_multi_possession": failure != "single_possession",
+            }
+        },
+    )
+    with pytest.raises(FixedPoolStudyRunError):
+        run_fixed_pool_study(
+            args, native_runner=lambda **kwargs: pytest.fail("Must not evaluate")
+        )
+    assert not Path(args.fixed_pool_path).exists()
+    assert not Path(args.fixed_pool_schedule_path).exists()
+    assert not Path(args.fixed_pool_artifact_dir).exists()
+
+
+@pytest.mark.parametrize("extension", [False, True])
+def test_preflight_rejects_wrong_size_schedule_without_writes(
+    tmp_path, monkeypatch, extension
+):
+    from basketworld_jax.eval.fixed_pool import write_player_pool
+    from basketworld_jax.eval.lineup_schedule import (
+        build_balanced_lineup_schedule,
+        write_lineup_schedule,
+    )
+
+    checkpoint = tmp_path / "checkpoint"
+    _mark_jax_checkpoint(checkpoint)
+    args = _args(tmp_path, checkpoint, create=False)
+    pool = generate_player_pool(player_count=10, seed=3)
+    write_player_pool(pool, args.fixed_pool_path)
+    schedule = build_balanced_lineup_schedule(pool, game_count=2, seed=5)
+    write_lineup_schedule(schedule, args.fixed_pool_schedule_path)
+    if extension:
+        from tests.test_fixed_pool_results import _episode_result
+
+        raw = persist_fixed_pool_study_artifacts(
+            pool=pool,
+            schedule=schedule,
+            episode_results=[_episode_result(pool, schedule, i) for i in range(2)],
+            possession_events=[],
+            output_dir=tmp_path / "base",
+        )
+        args.fixed_pool_extension_source = str(raw.root)
+        args.fixed_pool_schedule_create = True
+        args.fixed_pool_schedule_path = str(tmp_path / "new_schedule.json")
+    original_files = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    monkeypatch.setattr(
+        "basketworld_jax.eval.fixed_pool_study.load_checkpoint_metadata",
+        lambda path: {"env_config": {"players": 4, "enable_multi_possession": True}},
+    )
+    with pytest.raises(FixedPoolStudyRunError, match="does not match"):
+        run_fixed_pool_study(
+            args, native_runner=lambda **kwargs: pytest.fail("Must not evaluate")
+        )
+    assert {
+        p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()
+    } == original_files

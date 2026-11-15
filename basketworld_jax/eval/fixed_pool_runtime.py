@@ -101,7 +101,7 @@ def build_fixed_pool_game_batch(
         or len(team_b_slots) != expected_team_size
     ):
         raise FixedPoolRuntimeError(
-            "Fixed-pool schedules require exactly five stable JAX slots per team."
+            f"Fixed-pool schedules require exactly {expected_team_size} stable JAX slots per team."
         )
     all_slots = (*team_a_slots, *team_b_slots)
     if (
@@ -114,7 +114,7 @@ def build_fixed_pool_game_batch(
         )
     if int(total_slots) != expected_team_size * 2:
         raise FixedPoolRuntimeError(
-            "Fixed-pool evaluation currently supports exactly ten JAX player slots."
+            f"Fixed-pool evaluation requires exactly {expected_team_size * 2} JAX player slots."
         )
 
     players = {player.player_id: player for player in pool.players}

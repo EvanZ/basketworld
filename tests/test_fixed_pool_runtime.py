@@ -10,16 +10,19 @@ from basketworld_jax.eval.lineup_schedule import build_balanced_lineup_schedule
 from basketworld_jax.eval.skills import ACTIVE_PLAYER_SKILL_REGISTRY
 
 
-def test_fixed_pool_batch_maps_global_players_to_stable_jax_slots():
+@pytest.mark.parametrize("team_size", [3, 4, 5])
+def test_fixed_pool_batch_maps_global_players_to_stable_jax_slots(team_size):
     pool = generate_player_pool(player_count=12, seed=41)
-    schedule = build_balanced_lineup_schedule(pool, game_count=2, seed=99)
+    schedule = build_balanced_lineup_schedule(
+        pool, game_count=2, seed=99, team_size=team_size
+    )
     batch = build_fixed_pool_game_batch(
         pool,
         schedule,
         schedule.games,
-        team_a_slots=range(5),
-        team_b_slots=range(5, 10),
-        total_slots=10,
+        team_a_slots=range(team_size),
+        team_b_slots=range(team_size, 2 * team_size),
+        total_slots=2 * team_size,
     )
 
     assert batch.starting_team_codes.tolist() == [0, 1]
@@ -53,11 +56,11 @@ def test_fixed_pool_batch_maps_global_players_to_stable_jax_slots():
         batch.player_skill_rows["layup"][0, 0] = 0.0
 
 
-def test_fixed_pool_batch_rejects_non_5v5_jax_slots():
+def test_fixed_pool_batch_rejects_slots_mismatched_with_schedule():
     pool = generate_player_pool(player_count=10, seed=12)
     schedule = build_balanced_lineup_schedule(pool, game_count=2, seed=18)
 
-    with pytest.raises(FixedPoolRuntimeError, match="five stable JAX slots"):
+    with pytest.raises(FixedPoolRuntimeError, match="5 stable JAX slots"):
         build_fixed_pool_game_batch(
             pool,
             schedule,

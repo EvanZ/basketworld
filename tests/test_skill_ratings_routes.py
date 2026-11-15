@@ -404,3 +404,115 @@ def test_failed_job_keeps_actionable_evaluator_output(monkeypatch, tmp_path):
     assert any(
         "ScheduleCompatibilityError" in entry["message"] for entry in snapshot["logs"]
     )
+
+
+def _roster_request(tmp_path, monkeypatch, team_size, *, pool_size=0):
+    monkeypatch.setattr(routes, "REPO_ROOT", tmp_path)
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    monkeypatch.setattr(
+        "basketworld_jax.eval.fixed_pool_study.load_checkpoint_metadata",
+        lambda path: {
+            "env_config": {"players": team_size, "enable_multi_possession": True}
+        },
+    )
+    return routes.SkillRatingsJobRequest(
+        checkpoint_paths=[str(checkpoint)],
+        pool_path="pool.json",
+        pool_size=pool_size,
+        schedule_path="schedule.json",
+        artifact_dir="output",
+    )
+
+
+@pytest.mark.parametrize("team_size", [3, 4, 5])
+@pytest.mark.parametrize("reuse", [False, True])
+def test_ui_preflight_accepts_checkpoint_team_size(
+    tmp_path, monkeypatch, team_size, reuse
+):
+    config = _roster_request(tmp_path, monkeypatch, team_size, pool_size=2 * team_size)
+    if reuse:
+        pool = generate_player_pool(player_count=2 * team_size, seed=1)
+        write_player_pool(pool, tmp_path / "pool.json")
+        write_lineup_schedule(
+            build_balanced_lineup_schedule(
+                pool, game_count=2, seed=3, team_size=team_size
+            ),
+            tmp_path / "schedule.json",
+        )
+        config.create_pool = config.create_schedule = False
+    started = []
+    monkeypatch.setattr(
+        routes.threading.Thread, "start", lambda self: started.append(self)
+    )
+    job = routes._SkillRatingsJobManager().start(config)
+    assert job["status"] == "queued"
+    assert job["config"]["team_size"] == team_size
+    assert len(started) == 1
+
+
+@pytest.mark.parametrize("team_size", [3, 4, 5])
+@pytest.mark.parametrize("reuse", [False, True])
+def test_ui_rejects_undersized_pool_before_dispatch(
+    tmp_path, monkeypatch, team_size, reuse
+):
+    config = _roster_request(
+        tmp_path, monkeypatch, team_size, pool_size=2 * team_size - 1
+    )
+    if reuse:
+        write_player_pool(
+            generate_player_pool(player_count=2 * team_size - 1, seed=1),
+            tmp_path / "pool.json",
+        )
+        config.create_pool = False
+    manager = routes._SkillRatingsJobManager()
+    with pytest.raises(HTTPException, match=f"at least {team_size * 2}"):
+        manager.start(config)
+    assert manager._jobs == {}
+    assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize("extension", [False, True])
+def test_ui_rejects_mismatched_schedule_before_dispatch(
+    tmp_path, monkeypatch, extension
+):
+    config = _roster_request(tmp_path, monkeypatch, 4)
+    pool = generate_player_pool(player_count=10, seed=1)
+    write_player_pool(pool, tmp_path / "pool.json")
+    path = tmp_path / ("base/schedule_manifest.json" if extension else "schedule.json")
+    write_lineup_schedule(
+        build_balanced_lineup_schedule(pool, game_count=2, seed=3), path
+    )
+    config.create_pool = False
+    config.create_schedule = extension
+    if extension:
+        config.extension_source = str(path.parent)
+        config.game_count = 2
+    manager = routes._SkillRatingsJobManager()
+    with pytest.raises(
+        HTTPException, match="5v5 schedule does not match the 4v4 checkpoint"
+    ):
+        manager.start(config)
+    assert manager._jobs == {}
+    assert not (tmp_path / "output").exists()
+
+
+def test_ui_rejects_mixed_checkpoint_team_sizes(tmp_path, monkeypatch):
+    config = _roster_request(tmp_path, monkeypatch, 3)
+    other = tmp_path / "other"
+    other.mkdir()
+    config.checkpoint_paths.append(str(other))
+    monkeypatch.setattr(
+        "basketworld_jax.eval.fixed_pool_study.load_checkpoint_metadata",
+        lambda path: {
+            "env_config": {
+                "players": 4 if path == other else 3,
+                "enable_multi_possession": True,
+            }
+        },
+    )
+    manager = routes._SkillRatingsJobManager()
+    with pytest.raises(HTTPException, match="same team size"):
+        manager.start(config)
+    assert manager._jobs == {}
+    assert not (tmp_path / "pool.json").exists()

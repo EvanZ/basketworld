@@ -89,10 +89,11 @@ class _SkillRatingsJobManager:
 
     def start(self, config: SkillRatingsJobRequest) -> dict[str, Any]:
         resolved = _resolve_request_paths(config)
-        _validate_request_inputs(config, resolved)
-        # Metadata validation is intentionally done before dispatch so the UI
-        # rejects a single-possession or non-5v5 checkpoint immediately.
-        _validate_checkpoint_compatibility(resolved["checkpoint_paths"])
+        # Derive roster size from metadata before validating shared inputs or
+        # allocating a worker; never convert the selected checkpoint's game.
+        team_size = _validate_checkpoint_compatibility(resolved["checkpoint_paths"])
+        _validate_request_inputs(config, resolved, team_size)
+        resolved["team_size"] = team_size
 
         with self._lock:
             if self._active_job_id is not None:
@@ -317,8 +318,14 @@ def _resolve_request_paths(config: SkillRatingsJobRequest) -> dict[str, Any]:
 
 
 def _validate_request_inputs(
-    config: SkillRatingsJobRequest, resolved: Mapping[str, Any]
+    config: SkillRatingsJobRequest, resolved: Mapping[str, Any], team_size: int = 5
 ) -> None:
+    from basketworld_jax.eval.fixed_pool_study import (
+        FixedPoolStudyRunError,
+        _validate_pool_team_size,
+        _validate_schedule_team_size,
+    )
+
     missing = [str(path) for path in resolved["checkpoint_paths"] if not path.is_dir()]
     if missing:
         raise HTTPException(
@@ -350,11 +357,11 @@ def _validate_request_inputs(
             status_code=422,
             detail="A new player pool requires a new schedule created from that pool.",
         )
-    if config.create_pool and 0 < int(config.pool_size) < 10:
-        raise HTTPException(
-            status_code=422,
-            detail="A 5v5 Skill Ratings player pool must contain at least ten players.",
-        )
+    if config.create_pool and int(config.pool_size) > 0:
+        try:
+            _validate_pool_team_size(int(config.pool_size), team_size)
+        except FixedPoolStudyRunError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # Reused artifacts are immutable inputs, so validate their content and
     # their relationship before allocating a background worker.  In
@@ -371,19 +378,27 @@ def _validate_request_inputs(
             )
 
             pool = load_player_pool(pool_path)
-            if len(pool.players) < 10:
-                raise PlayerPoolError(
-                    "A 5v5 Skill Ratings player pool must contain at least ten players."
-                )
+            _validate_pool_team_size(len(pool.players), team_size)
             if not config.create_schedule:
-                load_lineup_schedule(schedule_path, pool=pool)
-        except (OSError, PlayerPoolError, LineupScheduleError) as exc:
+                schedule = load_lineup_schedule(schedule_path, pool=pool)
+                _validate_schedule_team_size(schedule, team_size)
+        except (
+            OSError,
+            PlayerPoolError,
+            LineupScheduleError,
+            FixedPoolStudyRunError,
+        ) as exc:
             raise HTTPException(
                 status_code=422,
                 detail=f"Skill Ratings input artifacts are incompatible: {exc}",
             ) from exc
     extension_source = resolved.get("extension_source")
     if extension_source is not None:
+        if config.create_pool:
+            raise HTTPException(
+                status_code=422,
+                detail="An extension must reuse its original player pool.",
+            )
         if not extension_source.is_dir():
             raise HTTPException(
                 status_code=422, detail="Extension source study does not exist."
@@ -396,17 +411,27 @@ def _validate_request_inputs(
             raise HTTPException(
                 status_code=422, detail="Choose at least one additional game."
             )
+        try:
+            base_schedule = load_lineup_schedule(
+                extension_source / "schedule_manifest.json", pool=pool
+            )
+            _validate_schedule_team_size(base_schedule, team_size)
+        except (OSError, LineupScheduleError, FixedPoolStudyRunError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Skill Ratings extension is incompatible: {exc}",
+            ) from exc
 
 
-def _validate_checkpoint_compatibility(checkpoint_paths: list[Path]) -> None:
+def _validate_checkpoint_compatibility(checkpoint_paths: list[Path]) -> int:
     try:
         from basketworld_jax.eval.fixed_pool_study import (  # local-only metadata read
             FixedPoolStudyRunError,
-            _checkpoint_env_params,
+            _checkpoint_study_environments,
         )
 
-        for path in checkpoint_paths:
-            _checkpoint_env_params(path)
+        environments = _checkpoint_study_environments(checkpoint_paths)
+        return int(environments[checkpoint_paths[0]][0]["players"])
     except FixedPoolStudyRunError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
@@ -482,6 +507,7 @@ def _public_config(
     public.update(
         {
             "checkpoint_paths": [str(path) for path in resolved["checkpoint_paths"]],
+            "team_size": resolved.get("team_size"),
             "pool_path": str(resolved["pool_path"]),
             "schedule_path": str(resolved["schedule_path"]),
             "artifact_dir": str(resolved["artifact_dir"]),
@@ -636,6 +662,7 @@ def _report_reproducibility(
     ]
     return {
         "config": config,
+        "team_size": schedule.get("team_size"),
         "seeds": {
             "pool_seed": pool.get("pool_seed"),
             "schedule_seed": schedule.get("schedule_seed"),

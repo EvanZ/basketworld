@@ -325,3 +325,42 @@ def test_raw_artifact_remains_readable_after_additive_pool_schema_evolution(tmp_
         load_fixed_pool_study_artifacts(paths.root)["manifest"]["study_id"]
         == paths.study_id
     )
+
+
+@pytest.mark.parametrize("team_size", [3, 4, 5])
+def test_event_attribution_uses_roster_size_for_both_teams(team_size):
+    pool = generate_player_pool(player_count=2 * team_size, seed=3)
+    schedule = build_balanced_lineup_schedule(
+        pool, game_count=2, seed=5, team_size=team_size
+    )
+    game = schedule.games[0]
+    trace = _event_trace()
+    trace["shot_shooter"][1, 0] = 2 * team_size - 1
+    trace["turnover_player"][1, 0] = team_size - 1
+    trace["steal_player"][1, 0] = team_size
+    trace["rebound_winner"][1, 0] = team_size + 1
+    trace["inbound_player"][1, 0] = team_size
+    trace["defensive_lane_violation_player"][1, 0] = team_size + 2
+    events = possession_event_rows_from_trace(
+        trace,
+        env_index=0,
+        active_steps=2,
+        episode=1,
+        game_metadata={**game.to_payload(), "schedule_game_id": game.game_id},
+    )
+    slots = (*game.team_a_player_ids, *game.team_b_player_ids)
+    for event in events:
+        for prefix in ("actor", "target"):
+            slot = event[f"{prefix}_player_slot"]
+            if slot is not None:
+                assert event[f"{prefix}_player_id"] == slots[slot]
+                if prefix == "actor":
+                    assert event["actor_team"] == (
+                        "team_a" if slot < team_size else "team_b"
+                    )
+    shot = next(event for event in events if event["event_type"] == "shot")
+    assert shot["actor_team"] == "team_b"
+    assert shot["actor_player_id"] == game.team_b_player_ids[-1]
+    turnover = next(event for event in events if event["event_type"] == "turnover")
+    assert turnover["actor_player_id"] == game.team_a_player_ids[-1]
+    assert turnover["target_player_id"] == game.team_b_player_ids[0]

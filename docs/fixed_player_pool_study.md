@@ -7,13 +7,17 @@ historical-opponent evaluation, or Elo artifacts.
 
 ## Supported checkpoints
 
-Use a current JAX **5v5 multi-possession** checkpoint whose observation schema
-matches the current runtime schema. Older single-possession checkpoints are
-intentionally unsupported. The runner validates this before any game is run.
+Use a current JAX **3v3, 4v4, or 5v5 multi-possession** checkpoint whose
+observation schema matches the current runtime schema. Older single-possession
+checkpoints are intentionally unsupported. Team size is read automatically from
+checkpoint metadata in both the UI and CLI.
+All checkpoints sharing a schedule must have the same team size. Reused and
+extension schedules must match that size. Roster-size compatibility is validated
+before dispatch or writing new pool/schedule artifacts.
 
 Pool identity is an evaluation artifact, not a policy observation. The study
-pins named player skill profiles into the existing ten stable JAX slots; no
-player ID is supplied to either policy.
+pins named player skill profiles into the existing stable JAX slots (6, 8, or
+10); no player ID is supplied to either policy.
 
 New study pools use `independent_skill_coverage_v1`: percentage skills have
 0.15 standard-deviation variation and unbounded standardized skills have 1.0.
@@ -24,7 +28,11 @@ the study because fitted skill coefficients need nonzero support.
 
 Create the player pool and balanced independent-game schedule once, then keep
 their JSON files immutable. The default size and schedule length are
-skill-scaled (with the current registry: 64 players and 640 games). Every game
+skill-scaled. With 8 skills, the default pool has 64 players and the schedule
+targets 100 appearances per player: 1067 games for 3v3, 800 for 4v4, or 640
+for 5v5. Explicit game counts remain unchanged. Pools must contain at least
+6, 8, or 10 players respectively; those minima allow games but are too small
+for a well-supported skill study. Every game
 has a distinct balanced lineup, an independently seeded RNG stream, and a
 balanced starting side. The smaller values below are a smoke test and will be
 flagged as under-sized in the report.

@@ -34,6 +34,7 @@ from basketworld_jax.eval.fixed_pool_results import (
 )
 from basketworld_jax.eval.lineup_schedule import (
     LineupSchedule,
+    SUPPORTED_STUDY_TEAM_SIZES,
     build_balanced_lineup_schedule,
     build_lineup_schedule_extension,
     load_lineup_schedule,
@@ -184,11 +185,11 @@ def _load_or_create_pool(args) -> tuple[PlayerPool, Path, bool]:
             }
         },
     )
-    return pool, write_player_pool(pool, path), True
+    return pool, path, True
 
 
 def _load_or_create_schedule(
-    args, pool: PlayerPool
+    args, pool: PlayerPool, *, team_size: int
 ) -> tuple[LineupSchedule, Path, bool]:
     path_text = str(getattr(args, "fixed_pool_schedule_path", "") or "").strip()
     if not path_text:
@@ -202,22 +203,25 @@ def _load_or_create_schedule(
             raise FixedPoolStudyRunError(
                 "--fixed-pool-schedule-create requires a new path; immutable schedule already exists."
             )
-        return load_lineup_schedule(path, pool=pool), path, False
+        schedule = load_lineup_schedule(path, pool=pool)
+        _validate_schedule_team_size(schedule, team_size)
+        return schedule, path, False
     if not create:
         raise FixedPoolStudyRunError(
             "Fixed schedule does not exist. Pass --fixed-pool-schedule-create to create it."
         )
     configured_games = int(getattr(args, "fixed_pool_games", 0) or 0)
     default_games = fixed_pool_study_budget(
-        len(ACTIVE_PLAYER_SKILL_REGISTRY.descriptors)
+        len(ACTIVE_PLAYER_SKILL_REGISTRY.descriptors), team_size=team_size
     )["games"]
     game_count = configured_games if configured_games > 0 else default_games
     schedule = build_balanced_lineup_schedule(
         pool,
         game_count=game_count,
         seed=int(getattr(args, "fixed_pool_schedule_seed", 1)),
+        team_size=team_size,
     )
-    return schedule, write_lineup_schedule(schedule, path), True
+    return schedule, path, True
 
 
 def _checkpoint_env_params(
@@ -228,9 +232,9 @@ def _checkpoint_env_params(
     config = JaxEnvironmentConfig.from_checkpoint_metadata(payload)
     optional_params = config.as_metadata()
     # These are hard study constraints, not mutable evaluation settings.
-    if int(config.players) != 5:
+    if int(config.players) not in SUPPORTED_STUDY_TEAM_SIZES:
         raise FixedPoolStudyRunError(
-            "Fixed-pool studies require a 5v5 checkpoint/environment."
+            "Fixed-pool studies require a 3v3, 4v4, or 5v5 checkpoint/environment."
         )
     if not bool(config.enable_multi_possession):
         raise FixedPoolStudyRunError(
@@ -238,6 +242,37 @@ def _checkpoint_env_params(
         )
     training_params = dict(payload.get("trainer_config", {}) or {})
     return optional_params, training_params
+
+
+def _checkpoint_study_environments(
+    checkpoint_paths: Sequence[Path],
+) -> dict[Path, tuple[dict[str, Any], dict[str, Any]]]:
+    """Validate every checkpoint before preparing shared study inputs."""
+    environments = {path: _checkpoint_env_params(path) for path in checkpoint_paths}
+    team_sizes = {int(params[0]["players"]) for params in environments.values()}
+    if len(team_sizes) != 1:
+        raise FixedPoolStudyRunError(
+            "All checkpoints in a fixed-pool study must use the same team size. "
+            "Create separate studies for different team sizes."
+        )
+    return environments
+
+
+def _validate_pool_team_size(player_count: int, team_size: int) -> None:
+    if player_count < team_size * 2:
+        raise FixedPoolStudyRunError(
+            f"A {team_size}v{team_size} Skill Ratings player pool must contain "
+            f"at least {team_size * 2} players."
+        )
+
+
+def _validate_schedule_team_size(schedule: LineupSchedule, team_size: int) -> None:
+    if schedule.team_size != team_size:
+        raise FixedPoolStudyRunError(
+            f"The {schedule.team_size}v{schedule.team_size} schedule does not match "
+            f"the {team_size}v{team_size} checkpoint. Create a new schedule "
+            "for this team size."
+        )
 
 
 def _specialist_vs_balanced(
@@ -607,7 +642,10 @@ def run_fixed_pool_study(
 ) -> dict[str, Any]:
     """Create/load inputs, evaluate requested checkpoints, and write reports."""
     checkpoint_paths = _parse_checkpoint_paths(args)
+    environments = _checkpoint_study_environments(checkpoint_paths)
+    team_size = int(environments[checkpoint_paths[0]][0]["players"])
     pool, pool_path, pool_created = _load_or_create_pool(args)
+    _validate_pool_team_size(len(pool.players), team_size)
     extension_source_text = str(
         getattr(args, "fixed_pool_extension_source", "") or ""
     ).strip()
@@ -619,6 +657,7 @@ def run_fixed_pool_study(
         base_schedule = load_lineup_schedule(
             extension_source_root / "schedule_manifest.json", pool=pool
         )
+        _validate_schedule_team_size(base_schedule, team_size)
         source_pool_id = str((source.get("manifest") or {}).get("pool_id", ""))
         if source_pool_id != pool.pool_id:
             raise FixedPoolStudyRunError(
@@ -652,11 +691,12 @@ def run_fixed_pool_study(
                 "An extension must create its new schedule artifact."
             )
         schedule = extension.additional_schedule
-        schedule_path = write_lineup_schedule(schedule, schedule_path)
         schedule_created = True
         combined_schedule = extension.combined_schedule
     else:
-        schedule, schedule_path, schedule_created = _load_or_create_schedule(args, pool)
+        schedule, schedule_path, schedule_created = _load_or_create_schedule(
+            args, pool, team_size=team_size
+        )
     artifact_root_text = str(getattr(args, "fixed_pool_artifact_dir", "") or "").strip()
     if not artifact_root_text:
         raise FixedPoolStudyRunError("--fixed-pool-artifact-dir is required.")
@@ -670,6 +710,11 @@ def run_fixed_pool_study(
         raise FixedPoolStudyRunError(
             "fixed-pool action mode must be direct or sampled."
         )
+    # Validate roster compatibility before publishing either immutable input.
+    if pool_created:
+        write_player_pool(pool, pool_path)
+    if schedule_created:
+        write_lineup_schedule(schedule, schedule_path)
     mlflow, context = _start_mlflow_if_requested(args)
     written_reports: list[dict[str, Any]] = []
     with context:
@@ -688,7 +733,7 @@ def run_fixed_pool_study(
                 }
             )
             progress_callback({"phase": "checkpoint_environment_loading"})
-            optional_params, training_params = _checkpoint_env_params(checkpoint_path)
+            optional_params, training_params = environments[checkpoint_path]
             progress_callback({"phase": "checkpoint_environment_loaded"})
             # Restore policy tensors exactly once, at a phase the CLI and a
             # future background-job UI can report independently.  The native
@@ -814,6 +859,7 @@ def run_fixed_pool_study(
             "id": schedule.schedule_id,
             "created": schedule_created,
             "game_count": len(schedule.games),
+            "team_size": team_size,
         },
         "action_mode": action_mode,
         "checkpoint_reports": written_reports,

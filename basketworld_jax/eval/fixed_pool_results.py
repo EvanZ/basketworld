@@ -259,13 +259,16 @@ def _shot_type_label(code: int | None) -> str | None:
 def _slot_player_map(game_metadata: Mapping[str, Any]) -> dict[int, tuple[str, str]]:
     team_a = tuple(str(value) for value in game_metadata.get("team_a_player_ids", []))
     team_b = tuple(str(value) for value in game_metadata.get("team_b_player_ids", []))
-    if len(team_a) != 5 or len(team_b) != 5:
+    if not team_a or len(team_a) != len(team_b):
         raise FixedPoolStudyArtifactError(
-            "A fixed-pool trace needs exactly five named players on each team."
+            "A fixed-pool trace needs equal, nonempty named player rosters on each team."
         )
     return {
         **{slot: ("team_a", player_id) for slot, player_id in enumerate(team_a)},
-        **{5 + slot: ("team_b", player_id) for slot, player_id in enumerate(team_b)},
+        **{
+            len(team_a) + slot: ("team_b", player_id)
+            for slot, player_id in enumerate(team_b)
+        },
     }
 
 

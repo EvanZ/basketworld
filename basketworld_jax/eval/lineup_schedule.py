@@ -1,4 +1,4 @@
-"""Deterministic, immutable 5v5 lineup schedules for fixed-player studies."""
+"""Deterministic, immutable lineup schedules for fixed-player studies."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from basketworld_jax.eval.fixed_pool import (
 
 
 LINEUP_SCHEDULE_SCHEMA_VERSION = 3
+SUPPORTED_STUDY_TEAM_SIZES = (3, 4, 5)
 _LEGACY_LINEUP_SCHEDULE_SCHEMA_VERSION = 2
 _SUPPORTED_LINEUP_SCHEDULE_SCHEMA_VERSIONS = frozenset(
     {_LEGACY_LINEUP_SCHEDULE_SCHEMA_VERSION, LINEUP_SCHEDULE_SCHEMA_VERSION}
@@ -650,9 +651,9 @@ def validate_lineup_schedule(
         raise LineupScheduleError(
             f"Unsupported lineup-schedule schema version {schedule.schema_version}."
         )
-    if schedule.team_size != 5:
+    if schedule.team_size not in SUPPORTED_STUDY_TEAM_SIZES:
         raise LineupScheduleError(
-            "Fixed-pool evaluation schedules must use 5-player teams."
+            "Fixed-pool evaluation schedules must use 3-, 4-, or 5-player teams."
         )
     expected_optimizer = (
         _LEGACY_OPTIMIZER_VERSION
@@ -668,7 +669,9 @@ def validate_lineup_schedule(
             "Lineup-schedule candidate_count must be at least one."
         )
     if len(schedule.pool_player_ids) < schedule.team_size * 2:
-        raise LineupScheduleError("Schedule pool must contain at least ten players.")
+        raise LineupScheduleError(
+            f"Schedule pool must contain at least {schedule.team_size * 2} players."
+        )
     if len(set(schedule.pool_player_ids)) != len(schedule.pool_player_ids):
         raise LineupScheduleError("Schedule pool_player_ids must be unique.")
     pool_ids = set(schedule.pool_player_ids)
@@ -735,18 +738,22 @@ def build_balanced_lineup_schedule(
     game_count: int,
     seed: int,
     candidate_count: int = 128,
+    team_size: int = 5,
 ) -> LineupSchedule:
-    """Build a deterministic schedule of distinct, balanced 5v5 games."""
+    """Build balanced games; default to five-player teams for existing callers."""
     assert_pool_compatible(pool)
     if int(game_count) < 1:
         raise LineupScheduleError("game_count must be at least one.")
     if int(candidate_count) < 1:
         raise LineupScheduleError("candidate_count must be at least one.")
-    team_size = 5
+    if team_size not in SUPPORTED_STUDY_TEAM_SIZES:
+        raise LineupScheduleError("team_size must be 3, 4, or 5.")
+    team_size = int(team_size)
     player_ids = tuple(player.player_id for player in pool.players)
     if len(player_ids) < team_size * 2:
         raise LineupScheduleError(
-            "A 5v5 lineup schedule requires at least ten pool players."
+            f"A {team_size}v{team_size} lineup schedule requires at least "
+            f"{team_size * 2} pool players."
         )
     rng = np.random.default_rng(int(seed))
     appearances = {player_id: 0 for player_id in player_ids}
