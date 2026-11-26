@@ -9,6 +9,7 @@ import uuid
 import numpy as np
 
 from basketworld.domain import ActionType, Team
+from basketworld_jax.shot_defense import SHOT_DEFENSE_DEFAULTS, shot_defense_values, validate_trained_shot_defense
 from basketworld.utils.play_names import lookup_play_name
 from basketworld.utils.start_templates import resolve_start_template
 from basketworld_jax.config import (
@@ -72,6 +73,7 @@ from app.backend.inference_adapters import (
 )
 
 _JAX_STATIC_ONLY_ENV_KEYS = {
+    *SHOT_DEFENSE_DEFAULTS,
     "enable_rebounds",
     "rebound_table_model_dir",
     "rebound_target_temperature",
@@ -115,6 +117,7 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
     "check_setup_steps",
     "check_clearance",
     "require_all_offense_clear",
+    "prefer_higher_percentage_shot",
     "random_check_location",
     "episode_end_mode",
     "game_clock_seconds",
@@ -124,6 +127,7 @@ _JAX_STATIC_ONLY_ENV_KEYS = {
 
 
 _JAX_STATIC_ONLY_ENV_DEFAULTS = {
+    **SHOT_DEFENSE_DEFAULTS,
     "enable_rebounds": False,
     "rebound_table_model_dir": "",
     "rebound_target_temperature": 1.0,
@@ -166,6 +170,7 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
     "check_clearance": 0,
     "random_check_location": False,
     "require_all_offense_clear": False,
+    "prefer_higher_percentage_shot": False,
     "episode_end_mode": "possessions",
     "game_clock_seconds": 300,
     "overtime_seconds": 120,
@@ -173,6 +178,7 @@ _JAX_STATIC_ONLY_ENV_DEFAULTS = {
 }
 
 _JAX_STATIC_ONLY_ENV_CASTS = {
+    **{key: "bool" if isinstance(value, bool) else "float" for key, value in SHOT_DEFENSE_DEFAULTS.items()},
     "enable_rebounds": "bool",
     "rebound_table_model_dir": "str",
     "rebound_target_temperature": "float",
@@ -215,6 +221,7 @@ _JAX_STATIC_ONLY_ENV_CASTS = {
     "check_clearance": "int",
     "random_check_location": "bool",
     "require_all_offense_clear": "bool",
+    "prefer_higher_percentage_shot": "bool",
     "episode_end_mode": "str",
     "game_clock_seconds": "int",
     "overtime_seconds": "int",
@@ -587,6 +594,11 @@ class JaxDevRuntime:
             self.raw_model = raw_model
             self.jax = raw_model.jax
             self.jnp = raw_model.jnp
+        if raw_model is not None:
+            validate_trained_shot_defense(getattr(raw_model, "metadata", {}), self.environment_config)
+        opponent_raw = unwrap_inference_model(opponent_policy)
+        if opponent_raw is not None:
+            validate_trained_shot_defense(getattr(opponent_raw, "metadata", {}), self.environment_config)
         self.static = build_kernel_static_from_config(self.environment_config, self.jnp)
         self._clearance_zone_cells_cache: tuple[tuple[int, int], ...] | None = None
         self._step_batch_runner = None
@@ -1002,9 +1014,11 @@ class JaxDevRuntime:
         self.episode_check_stats = copy.deepcopy(
             snapshot.get("episode_check_stats") or self._empty_episode_check_stats()
         )
-        self._box_score_players = copy.deepcopy(
-            snapshot.get("box_score_players") or self._empty_box_score_players()
-        )
+        saved_box_score = snapshot.get("box_score_players") or {}
+        self._box_score_players = {
+            str(pid): {**self._empty_player_box_score(), **copy.deepcopy(saved_box_score.get(str(pid), {}))}
+            for pid in range(self.n_players)
+        }
         self._box_score_unattributed_turnovers = copy.deepcopy(
             snapshot.get("box_score_unattributed_turnovers")
             or {"team_a": 0, "team_b": 0}
@@ -1098,7 +1112,10 @@ class JaxDevRuntime:
                 self.env_params[field.name] = copy.deepcopy(
                     getattr(current_view, field.name)
                 )
-        self.environment_config = self._build_environment_config()
+        candidate = self._build_environment_config()
+        if self.raw_model is not None:
+            validate_trained_shot_defense(self.raw_model.metadata, candidate)
+        self.environment_config = candidate
         self.environment = self._build_environment_view()
         self.static = build_kernel_static_from_config(self.environment_config, self.jnp)
         if self.state is not None:
@@ -1124,6 +1141,14 @@ class JaxDevRuntime:
         if raw_model is None or not hasattr(raw_model, "jax"):
             raise TypeError("JAX dev runtime requires a loaded JAX inference model.")
 
+        checkpoint_static_params = _jax_static_env_params_from_policy(unified_policy)
+        candidate = normalize_runtime_environment_config(JaxEnvironmentConfig.from_dev_game_params(
+            self.required_params, {**self.env_params, **checkpoint_static_params}
+        ))
+        validate_trained_shot_defense(getattr(raw_model, "metadata", {}), candidate)
+        opponent_raw = unwrap_inference_model(opponent_policy)
+        if opponent_raw is not None:
+            validate_trained_shot_defense(getattr(opponent_raw, "metadata", {}), candidate)
         self.unified_policy = unified_policy
         self.opponent_policy = opponent_policy
         self.raw_model = raw_model
@@ -1218,6 +1243,7 @@ class JaxDevRuntime:
             "reb": 0,
             "ast": 0,
             "stl": 0,
+            "blk": 0,
             "tov": 0,
         }
 
@@ -1258,6 +1284,11 @@ class JaxDevRuntime:
                     line["dunk_m"] += int(made)
                 if made:
                     line["pts"] += int(round(_as_float(out.shot_value[0])))
+
+        if _as_bool(getattr(out, "shot_blocked", np.asarray([0]))[0]):
+            blocker = player_line(getattr(out, "shot_blocker", np.asarray([-1]))[0])
+            if blocker is not None:
+                blocker["blk"] += 1
 
         if _as_bool(getattr(out, "assist", np.asarray([0]))[0]):
             line = player_line(getattr(out, "assist_passer", np.asarray([-1]))[0])
@@ -1495,6 +1526,7 @@ class JaxDevRuntime:
             rebound_win_prob_features=bool(getattr(self.raw_model.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(self.raw_model.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(self.raw_model.spec, "multi_possession_features", False)),
+            shooting_skill_features=int(getattr(self.raw_model.spec, 'observation_schema_version', 1)) >= 7,
             team_clearance_features=(
                 int(getattr(self.raw_model.spec, "observation_schema_version", 1)) >= 6
             ),
@@ -1513,6 +1545,7 @@ class JaxDevRuntime:
             ),
             rebound_target_observation_features=bool(getattr(self.raw_model.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(self.raw_model.spec, "multi_possession_features", False)),
+            shooting_skill_features=int(getattr(self.raw_model.spec, 'observation_schema_version', 1)) >= 7,
             team_clearance_features=(
                 int(getattr(self.raw_model.spec, "observation_schema_version", 1)) >= 6
             ),
@@ -1571,6 +1604,7 @@ class JaxDevRuntime:
             rebound_win_prob_features=bool(getattr(raw.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(raw.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(raw.spec, "multi_possession_features", False)),
+            shooting_skill_features=int(getattr(raw.spec, 'observation_schema_version', 1)) >= 7,
             team_clearance_features=(
                 int(getattr(raw.spec, "observation_schema_version", 1)) >= 6
             ),
@@ -2193,8 +2227,20 @@ class JaxDevRuntime:
     def shot_clock(self) -> int:
         return _as_int(_field0(self.state, "shot_clock"))
 
+    def _episode_skill_payload(self) -> dict[str, dict[str, float]]:
+        arrays = self.jax.device_get({
+            descriptor.key: getattr(self.state, descriptor.runtime_field)[0]
+            for descriptor in ACTIVE_PLAYER_SKILL_REGISTRY.descriptors
+        })
+        return {
+            str(pid): {key: float(values[pid]) for key, values in arrays.items()}
+            for pid in range(self.n_players)
+        }
+
     def _sync_environment(self) -> None:
         env = self.environment
+        for descriptor in ACTIVE_PLAYER_SKILL_REGISTRY.descriptors:
+            setattr(env, f"{descriptor.runtime_field}_by_player", np.asarray(_field0(self.state, descriptor.runtime_field)))
         env.positions = self.positions
         env.ball_holder = self.ball_holder
         env.shot_clock = self.shot_clock
@@ -2620,9 +2666,14 @@ class JaxDevRuntime:
                 "distance": int(round(_as_float(out.shot_distance[0]))),
                 "probability": float(prob),
                 "rng": -1.0,
-                "base_probability": float(prob),
-                "pressure_multiplier": 1.0,
+                "base_probability": _as_float(getattr(out, "shot_open_probability", np.asarray([prob]))[0]),
+                "pressure_multiplier": 1.0 - _as_float(getattr(out, "shot_suppression_after_resistance", np.asarray([0.0]))[0]),
+                "blocked": _as_bool(getattr(out, "shot_blocked", np.asarray([0]))[0]),
+                "blocker_id": _as_int(getattr(out, "shot_blocker", np.asarray([-1]))[0]),
+                "conditional_probability": _as_float(getattr(out, "shot_conditional_probability", np.asarray([prob]))[0]),
+                "block_probability": _as_float(getattr(out, "shot_block_probability", np.asarray([0.0]))[0]),
                 "is_three": _as_int(out.shot_type[0]) == SHOT_TYPE_THREE,
+                "is_dunk": _as_int(out.shot_type[0]) == SHOT_TYPE_DUNK,
                 "expected_points": expected,
                 "assist_potential": assist_potential,
                 "assist_full": assist_full,
@@ -2699,14 +2750,14 @@ class JaxDevRuntime:
                     "total_steal_prob": 0.0,
                     "defenders_evaluated": [],
                 }
-            else:
+            elif _as_bool(out.turnover[0]):
                 reason = _as_int(out.turnover_reason[0])
-                stolen_by = _as_int(_field0(next_state, "ball_holder"))
+                stolen_by = _as_int(out.steal_player[0])
                 results["turnovers"].append(
                     {
                         "player_id": passer,
                         "reason": "pass_out_of_bounds" if reason == TURNOVER_REASON_PASS_OUT_OF_BOUNDS else "steal",
-                        "stolen_by": stolen_by if stolen_by >= 0 else None,
+                        "stolen_by": stolen_by if reason == TURNOVER_REASON_INTERCEPTED and stolen_by >= 0 else None,
                         "turnover_pos": tuple(int(v) for v in prev_positions[passer].tolist()),
                         "pass_target": receiver if receiver >= 0 else None,
                         "intended_target": receiver if receiver >= 0 else None,
@@ -2866,6 +2917,11 @@ class JaxDevRuntime:
                     "probability": float(shot.get("probability", 0.0)),
                     "success": bool(shot.get("success", False)),
                     "is_three": bool(shot.get("is_three", False)),
+                    "is_dunk": bool(shot.get("is_dunk", False)),
+                    "blocked": bool(shot.get("blocked", False)),
+                    "blocker_id": shot.get("blocker_id"),
+                    "conditional_probability": shot.get("conditional_probability"),
+                    "block_probability": shot.get("block_probability"),
                     "rng": float(shot.get("rng", -1.0)),
                     "base_probability": float(shot.get("base_probability", -1.0)),
                     "pressure_multiplier": float(shot.get("pressure_multiplier", -1.0)),
@@ -3129,6 +3185,7 @@ class JaxDevRuntime:
             multi_possession_features=bool(
                 getattr(selector_model.spec, "multi_possession_features", False)
             ),
+            shooting_skill_features=int(getattr(selector_model.spec, 'observation_schema_version', 1)) >= 7,
             team_clearance_features=(
                 int(getattr(selector_model.spec, "observation_schema_version", 1)) >= 6
             ),
@@ -3493,6 +3550,7 @@ class JaxDevRuntime:
             "three_pt_std": float(self.environment.three_pt_std or 0.0),
             "dunk_std": float(self.environment.dunk_std or 0.0),
             "allow_dunks": bool(self.environment.allow_dunks),
+            "prefer_higher_percentage_shot": bool(self.environment.prefer_higher_percentage_shot),
         }
         rebound_runtime = {
             "enabled": bool(getattr(self.environment, "enable_rebounds", False)),
@@ -3613,16 +3671,8 @@ class JaxDevRuntime:
                 str(pid): bool(rebound_specialist[pid] > 0.0)
                 for pid in range(self.n_players)
             },
-            "player_episode_skills": {
-                str(pid): {
-                    "pressure": float(pressure_skill[pid]),
-                    "steal": float(steal_skill[pid]),
-                    "ball_handling": float(ball_handling_skill[pid]),
-                    "passing": float(passing_skill[pid]),
-                    "shot_contest": float(shot_contest_skill[pid]),
-                }
-                for pid in range(self.n_players)
-            },
+            "player_episode_skills": self._episode_skill_payload(),
+            "shot_defense_parameters": shot_defense_values(self.environment_config),
             "shot_params": shot_params,
             "rebound_runtime": rebound_runtime,
             "training_params": training_params,
@@ -4189,16 +4239,7 @@ class JaxDevRuntime:
             str(pid): bool(rebound_skill_specialist[int(pid)] > 0.0)
             for pid in range(int(rebound_skill_specialist.shape[0]))
         }
-        player_episode_skills = {
-            str(pid): {
-                "pressure": float(pressure_skill[pid]),
-                "steal": float(steal_skill[pid]),
-                "ball_handling": float(ball_handling_skill[pid]),
-                "passing": float(passing_skill[pid]),
-                "shot_contest": float(shot_contest_skill[pid]),
-            }
-            for pid in range(self.n_players)
-        }
+        player_episode_skills = self._episode_skill_payload()
         metadata = get_policy_metadata(getattr(game_state, "unified_policy", None)) or {}
         counterfactual_snapshot = self._counterfactual_snapshot_summary(game_state)
         rebound_target_observation_features = bool(
@@ -4215,6 +4256,7 @@ class JaxDevRuntime:
             rebound_target_observation_features=rebound_target_observation_features,
             multi_possession_features=self.multi_possession_enabled,
             episode_end_mode="game_clock" if clock_mode else "possessions",
+            shooting_skill_features=int(getattr(self.raw_model.spec, 'observation_schema_version', 1)) >= 7,
             team_clearance_features=(
                 int(getattr(self.raw_model.spec, "observation_schema_version", 1)) >= 6
             ),
@@ -4497,6 +4539,7 @@ class JaxDevRuntime:
             "player_rebound_skills": player_rebound_skills,
             "player_rebound_skill_specialists": player_rebound_skill_specialists,
             "player_episode_skills": player_episode_skills,
+            "shot_defense_parameters": shot_defense_values(self.environment_config),
             # Preserve legacy field names for the board, while making them the
             # *current* offense/defense in continuous games.
             "offense_ids": active_offense_ids,
@@ -4529,6 +4572,7 @@ class JaxDevRuntime:
                 "three_pt_std": float(self.environment.three_pt_std or 0.0),
                 "dunk_std": float(self.environment.dunk_std or 0.0),
                 "allow_dunks": bool(self.environment.allow_dunks),
+                "prefer_higher_percentage_shot": bool(self.environment.prefer_higher_percentage_shot),
             },
             "rebound_runtime": {
                 "enabled": bool(getattr(self.environment, "enable_rebounds", False)),

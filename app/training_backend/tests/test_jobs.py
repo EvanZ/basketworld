@@ -422,7 +422,8 @@ def test_job_manager_recovers_inactive_run_from_validated_checkpoint(
     assert recovery["payload"]["provenance_confirmation"]["confirmed"] is True
 
 
-def test_resume_preflight_defaults_missing_team_clearance_to_false(tmp_path):
+@pytest.mark.parametrize("flag", ["require_all_offense_clear", "prefer_higher_percentage_shot"])
+def test_resume_preflight_defaults_missing_rule_to_false(tmp_path, flag):
     settings = Settings(
         repo_root=tmp_path / "repo", data_dir=tmp_path / "data",
         database_path=tmp_path / "data" / "training.duckdb",
@@ -438,14 +439,17 @@ def test_resume_preflight_defaults_missing_team_clearance_to_false(tmp_path):
     metadata_path = checkpoint / "metadata.json"
     metadata = json.loads(metadata_path.read_text())
     saved = manager._resolved_config_from_preview(preview)
-    saved.pop("require_all_offense_clear")
+    saved.pop(flag)
     metadata["resolved_training_config"] = saved
     metadata_path.write_text(json.dumps(metadata))
     manager._preflight_resume(checkpoint=str(checkpoint), preview=preview)
-    enabled_preview = manager.preview(
-        config.model_copy(update={"require_all_offense_clear": True}), run_id=run_id
-    )
-    with pytest.raises(RuntimeError, match="require_all_offense_clear"):
+    enabled_config = config.model_copy(update=(
+        {"require_all_offense_clear": True}
+        if flag == "require_all_offense_clear"
+        else {"overrides": {flag: True}}
+    ))
+    enabled_preview = manager.preview(enabled_config, run_id=run_id)
+    with pytest.raises(RuntimeError, match=flag):
         manager._preflight_resume(checkpoint=str(checkpoint), preview=enabled_preview)
 
 

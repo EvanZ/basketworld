@@ -920,7 +920,7 @@ function recordPlayableStepPlayByPlay(payload, context = {}) {
       const shooterId = Number(shooterRaw);
       if (!Number.isFinite(shooterId)) continue;
       const shot = shotRaw && typeof shotRaw === 'object' ? shotRaw : {};
-      const isDunk = Boolean(shot.is_dunk) || Number(shot.distance) === 0;
+      const isDunk = Boolean(shot.is_dunk ?? (Number(shot.distance) === 0));
       const isThree = !isDunk && Boolean(shot.is_three);
       const shotLabel = isDunk ? 'Dunk' : (isThree ? '3pt shot' : '2pt shot');
       let event = `${shotLabel} ${Boolean(shot.success) ? 'made' : 'missed'} by ${formatPlayablePlayerRef(shooterId)}.`;
@@ -1268,6 +1268,7 @@ const rulesSummary = computed(() => {
     threePtStd,
     dunkStd,
     allowDunks,
+    preferHigherPercentageShot: Boolean(shootingParams.prefer_higher_percentage_shot ?? false),
     threePointDistance,
     threePointBlendEndDistance,
     threePtExtraHexDecay,
@@ -2550,7 +2551,7 @@ onBeforeUnmount(() => {
               </li>
               <li>Those sampled skill sets stay fixed for the game and are reused whenever that side is on offense.</li>
               <li>Base shot make probability uses layup% at distance ≤ 1, then linearly blends toward 3PT% through distance {{ formatRuleNumber(rulesSummary.threePointBlendEndDistance, 1) }}.</li>
-              <li>Beyond that range, probability drops by {{ formatRulePercent(rulesSummary.threePtExtraHexDecay, 1) }} per extra hex; dunks (distance 0) use dunk% when enabled: <code>{{ rulesSummary.allowDunks ? 'true' : 'false' }}</code>.</li>
+              <li>Beyond that range, probability drops by {{ formatRulePercent(rulesSummary.threePtExtraHexDecay, 1) }} per extra hex. At distance 0, {{ rulesSummary.allowDunks ? (rulesSummary.preferHigherPercentageShot ? 'use the higher of layup% and dunk% (ties choose dunk)' : 'use dunk%') : 'use layup%' }}. Higher-percentage shot rule: <code>{{ rulesSummary.preferHigherPercentageShot ? 'true' : 'false' }}</code>. Dunks enabled: <code>{{ rulesSummary.allowDunks ? 'true' : 'false' }}</code>.</li>
               <li v-if="rulesSummary.shotPressureEnabled">
                 Final make probability = base probability × shot-pressure multiplier (max reduction {{ formatRulePercent(rulesSummary.shotPressureMax, 1) }}, lambda {{ formatRuleNumber(rulesSummary.shotPressureLambda, 2) }}, arc {{ formatRuleNumber(rulesSummary.shotPressureArcDegrees, 0) }}°).
               </li>

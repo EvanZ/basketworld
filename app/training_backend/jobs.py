@@ -594,6 +594,7 @@ class JobManager:
         if isinstance(saved_config, dict):
             saved_config = dict(saved_config)
             saved_config.setdefault("require_all_offense_clear", False)
+            saved_config.setdefault("prefer_higher_percentage_shot", False)
             # Old checkpoints used recency; introducing opt-in PFSP must not
             # make unchanged legacy resumes fail the config comparison.
             saved_config.setdefault("opponent_pool_sampling", "recency")

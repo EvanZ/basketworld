@@ -35,3 +35,15 @@ export function selectedAnalysisIdentity(report) {
     dependencies,
   };
 }
+
+export function skillEffectInterval(skill) {
+  const low = skill?.interval_p05;
+  const high = skill?.interval_p95;
+  if (low == null || high == null || low === '' || high === ''
+      || !Number.isFinite(Number(low)) || !Number.isFinite(Number(high))
+      || Number(low) > Number(high)) return null;
+  return {
+    label: `${Number(low).toFixed(2)} to ${Number(high).toFixed(2)}`,
+    includesZero: Number(low) <= 0 && Number(high) >= 0,
+  };
+}

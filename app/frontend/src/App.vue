@@ -7,6 +7,8 @@ import LiveBoxScore from './components/LiveBoxScore.vue';
 import AssistSankey from './components/AssistSankey.vue';
 import { ref as vueRef } from 'vue';
 import KeyboardLegend from './components/KeyboardLegend.vue';
+import PlayByPlayPanel from './components/PlayByPlayPanel.vue';
+import { buildPlayByPlay } from './utils/playByPlay';
 import { initGame, initTemplateSandbox, stepGame, saveEpisode, saveEpisodeFromPngs, startSelfPlay, prepareFastSelfPlay, setMultiPossessionLimit, replayLastEpisode, getPhiParams, setPhiParams, runEvaluation, getEvaluationProgress, getPassStealProbabilities, getStateValues, updatePlayerPosition, setShotClock, resetTurnState, swapPolicies, listPolicies, previewPassSteal, getReboundPreview, applyStartTemplate } from './services/api';
 import { resetStatsStorage } from './services/stats';
 import { startEpisodeExport } from './services/api';
@@ -1249,6 +1251,7 @@ const boardGameHistory = computed(() =>
     ? [selectedPlaybookPanel.value?.base_state].filter(Boolean)
     : gameHistory.value
 );
+const devPlayByPlay = computed(() => buildPlayByPlay(boardGameHistory.value, playerDisplayNames.value));
 const boardPlaybookOverlay = computed(() =>
   isPlaybookBoardPreviewActive.value
     ? {
@@ -2990,6 +2993,8 @@ function buildCustomEvalSetup() {
       'ball_handling',
       'passing',
     ];
+    const shotDefense = gameState.value.shot_defense_parameters || {};
+    const needsNewSkills = shotDefense.rim_protection_enabled || shotDefense.contested_shooting_enabled;
     const normalizedProfiles = {};
     for (let playerId = 0; playerId < totalPlayers; playerId += 1) {
       const raw = profiles[String(playerId)] ?? profiles[playerId];
@@ -2997,7 +3002,10 @@ function buildCustomEvalSetup() {
         throw new Error(`Pinned roster is missing Player ${playerId}.`);
       }
       const profile = {};
-      for (const skillName of requiredSkills) {
+      const profileSkills = [...requiredSkills, ...['rim_protection', 'contested_shooting'].filter(
+        (name) => needsNewSkills || raw[name] !== undefined,
+      )];
+      for (const skillName of profileSkills) {
         const value = Number(raw[skillName]);
         if (!Number.isFinite(value)) {
           throw new Error(`Pinned roster has an invalid ${skillName} value for Player ${playerId}.`);
@@ -4641,6 +4649,7 @@ onBeforeUnmount(() => {
         </div>
 
         <KeyboardLegend />
+        <PlayByPlayPanel :rows="devPlayByPlay" />
 
       </div>
       </div>

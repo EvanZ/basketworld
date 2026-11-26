@@ -140,7 +140,7 @@ def save_episode():
             shooter_id_str = list(ar["shots"].keys())[0]
             shot_res = ar["shots"][shooter_id_str]
             distance = int(shot_res.get("distance", 999))
-            is_dunk = distance == 0
+            is_dunk = bool(shot_res.get("is_dunk", distance == 0))
             is_three = bool(
                 shot_res.get("is_three") if "is_three" in shot_res else distance >= game_state.env.three_point_distance
             )
@@ -213,7 +213,7 @@ def _episode_png_output_path(export_format="gif"):
             shooter_id_str = list(ar["shots"].keys())[0]
             shot_res = ar["shots"][shooter_id_str]
             distance = int(shot_res.get("distance", 999))
-            is_dunk = distance == 0
+            is_dunk = bool(shot_res.get("is_dunk", distance == 0))
             is_three = bool(
                 shot_res.get("is_three") if "is_three" in shot_res else distance >= game_state.env.three_point_distance
             )

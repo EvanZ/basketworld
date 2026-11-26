@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 
+from basketworld_jax.scoring_metrics import SCORING_METRIC_SCHEMA_VERSION
+
 
 CHECKPOINT_VERSION = 2
 LEGACY_PICKLE_CHECKPOINT_VERSION = 1
@@ -93,6 +95,7 @@ def build_checkpoint_payload(
 ) -> dict[str, Any]:
     payload = {
         "checkpoint_version": CHECKPOINT_VERSION,
+        "scoring_metric_schema_version": SCORING_METRIC_SCHEMA_VERSION,
         "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "update_index": int(update_index),
         "trainer_config": dict(trainer_config),
@@ -158,6 +161,7 @@ def build_checkpoint_payload(
 def _metadata_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     metadata = {
         "checkpoint_version": int(payload["checkpoint_version"]),
+        "scoring_metric_schema_version": int(payload.get("scoring_metric_schema_version", 1)),
         "saved_at": str(payload["saved_at"]),
         "update_index": int(payload["update_index"]),
         "trainer_config": _to_jsonable(dict(payload["trainer_config"])),
@@ -220,6 +224,7 @@ def _metadata_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def _payload_from_metadata(metadata: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     payload = {
         "checkpoint_version": int(metadata["checkpoint_version"]),
+        "scoring_metric_schema_version": int(metadata.get("scoring_metric_schema_version", 1)),
         "saved_at": metadata["saved_at"],
         "update_index": int(metadata["update_index"]),
         "trainer_config": _from_jsonable(metadata["trainer_config"]),
@@ -319,6 +324,7 @@ def load_checkpoint_metadata(path: str | Path) -> dict[str, Any]:
     metadata = _read_checkpoint_metadata(checkpoint_path)
     payload: dict[str, Any] = {
         "checkpoint_version": int(metadata["checkpoint_version"]),
+        "scoring_metric_schema_version": int(metadata.get("scoring_metric_schema_version", 1)),
         "saved_at": metadata["saved_at"],
         "update_index": int(metadata["update_index"]),
         "trainer_config": _from_jsonable(metadata["trainer_config"]),
@@ -366,7 +372,7 @@ def _load_legacy_pickle_checkpoint(path: str | Path) -> dict[str, Any]:
         raise ValueError(
             f"Unsupported legacy JAX checkpoint version {version}; expected {LEGACY_PICKLE_CHECKPOINT_VERSION}."
         )
-    return payload
+    return {"scoring_metric_schema_version": 1, **payload}
 
 
 def save_checkpoint(path: str | Path, payload: dict[str, Any]) -> Path:

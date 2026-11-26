@@ -21,6 +21,7 @@ import {
 } from './configEditing'
 import { launchGitCommit, launchWorktreeState } from './runProvenance'
 import { pfspRows, metricDefinition } from './pfsp'
+import { scoringMetricGroup } from './scoringMetrics'
 import OpponentUsageChart from './OpponentUsageChart.vue'
 
 const defaultConfig = () => ({
@@ -47,7 +48,7 @@ const defaultConfig = () => ({
 
 const PIN_STORAGE_KEY = 'basketworld.training.pinned-configs.v1'
 const PIN_MIGRATION_KEY = 'basketworld.training.pinned-configs.migration.v1'
-const PIN_MIGRATION_VERSION = 'opponent-cache-v8'
+const PIN_MIGRATION_VERSION = 'shot-defense-v10'
 const MIGRATED_PINNED_FIELDS = [
   'opponent_snapshot_every_updates',
   'opponent_pool_size',
@@ -59,11 +60,14 @@ const MIGRATED_PINNED_FIELDS = [
   'team_action_mode',
   'offense_action_order',
   'defense_action_order',
+  'rim_protection_enabled',
+  'contested_shooting_enabled',
   'shot_contest_skill_mean',
   'shot_contest_skill_std',
   'shot_contest_skill_effect_weight',
   'random_check_location',
   'require_all_offense_clear',
+  'prefer_higher_percentage_shot',
 ]
 const METRIC_STORAGE_KEY = 'basketworld.training.sparkline-metrics.v1'
 const MAX_SELECTED_METRICS = 16
@@ -75,7 +79,13 @@ const DEFAULT_METRICS = [
   'jax/train/entropy_coef',
   'jax/train/intent_disc_auc_ovr_macro_holdout',
   'jax/train/mean_completed_episode_length',
-  'jax/train/game_reward_mean',
+  'jax/train/learner_points_scored_per_completed_game',
+  'jax/train/learner_points_allowed_per_completed_game',
+  'jax/train/learner_points_scored_per_completed_offensive_possession',
+  'jax/train/learner_points_allowed_per_completed_defensive_possession',
+  'jax/train/learner_completed_game_win_score',
+  'jax/train/completed_game_count',
+  'jax/train/truncated_game_count',
 ]
 const DEFAULT_PINNED_FIELDS = [
   'opponent_snapshot_every_updates',
@@ -87,6 +97,8 @@ const DEFAULT_PINNED_FIELDS = [
   'mlflow_experiment_name',
   'num_updates',
   'entropy_decay_updates',
+  'rim_protection_enabled',
+  'contested_shooting_enabled',
   'shot_contest_skill_mean',
   'shot_contest_skill_std',
   'shot_contest_skill_effect_weight',
@@ -105,6 +117,7 @@ const DEFAULT_PINNED_FIELDS = [
   'check_clearance',
   'random_check_location',
   'require_all_offense_clear',
+  'prefer_higher_percentage_shot',
   'multi_possession_use_inbounds',
 ]
 const APP_CONFIG_KEYS = {
@@ -293,7 +306,10 @@ const filteredRunConfig = computed(() => {
   ].some((value) => String(value || '').toLowerCase().includes(query)))
 })
 const availableMetricNames = computed(() => new Set(availableMetrics.value.map((metric) => metric.name)))
-const addableMetrics = computed(() => availableMetrics.value.filter((metric) => !selectedMetricNames.value.includes(metric.name)))
+const showScoringDiagnostics = ref(false)
+const addableMetrics = computed(() => availableMetrics.value.filter((metric) =>
+  !selectedMetricNames.value.includes(metric.name) && (showScoringDiagnostics.value ||
+    !['Roster and opening-possession diagnostics', 'Legacy scoring (schema 1)'].includes(scoringMetricGroup(metric.name)))))
 const metricPickerResults = computed(() => {
   const query = metricToAdd.value.trim().toLowerCase()
   return addableMetrics.value
@@ -305,6 +321,10 @@ const metricCards = computed(() => selectedMetricNames.value.map((name) => ({
   points: metricSeries.value[name] || [],
   available: availableMetricNames.value.has(name),
 })))
+const metricCardGroups = computed(() => {
+  const order = ['Learner scoring', 'Learner evaluation', 'Self-play behavior', 'Opponent comparisons', 'RL health and other diagnostics', 'Roster and opening-possession diagnostics', 'Legacy scoring (schema 1)']
+  return order.map(name => ({ name, metrics: metricCards.value.filter(metric => scoringMetricGroup(metric.name) === name) })).filter(group => group.metrics.length)
+})
 const eloPoints = computed(() => prepareEloSeries(eloSummary.value))
 const eloPlotPoints = computed(() => eloSparklineCoordinates(eloPoints.value))
 const latestElo = computed(() => eloPoints.value[eloPoints.value.length - 1] || null)
@@ -586,6 +606,14 @@ function fieldLabel(field) {
     multi_possession_limit_end: 'Final possessions',
     multi_possession_limit_ramp_updates: 'Curriculum updates',
     historical_eval_episodes: 'Historical eval episodes',
+    rim_protection_enabled: 'Rim protection',
+    contested_shooting_enabled: 'Contested shooting',
+    rim_protection_block_distribution_max: 'Sampled block probability upper bound (sampling only)',
+    rim_protection_skill_block_reference: 'Rim skill centering reference',
+    rim_protection_contest_base: 'Rim contest baseline',
+    rim_protection_block_base: 'Block baseline',
+    contested_shooting_skill_std: 'Contested shooting skill spread',
+    contested_shooting_effect_weight: 'Contested shooting effect weight',
     shot_contest_skill_mean: 'Shot contest mean',
     shot_contest_skill_std: 'Shot contest std',
     shot_contest_skill_effect_weight: 'Shot contest effect weight',
@@ -595,6 +623,7 @@ function fieldLabel(field) {
     check_clearance: 'Check-clearance rings',
     random_check_location: 'Randomize check location',
     require_all_offense_clear: 'Require all offense to clear the arc',
+    prefer_higher_percentage_shot: 'Prefer higher-percentage layup or dunk',
     multi_possession_use_inbounds: 'Use inbounds for dead-ball restarts',
     episode_end_mode: 'Episode format',
     game_clock_seconds: 'Regulation duration (seconds)',
@@ -909,9 +938,25 @@ async function continueRun() {
   }
 }
 
+async function loadConfigSchema() {
+  try {
+    configSchema.value = await api.getConfigSchema()
+  } catch (cause) {
+    error.value = cause.message
+  }
+}
+
+async function refreshApp() {
+  await Promise.all([loadRuns(), loadConfigSchema()])
+}
+
+function openNewRun() {
+  activeView.value = 'new'
+  loadConfigSchema()
+}
+
 onMounted(async () => {
-  const [, , schema] = await Promise.all([loadRuns(), loadPreview(), api.getConfigSchema()])
-  configSchema.value = schema
+  await Promise.all([loadRuns(), loadPreview(), loadConfigSchema()])
   refreshTimer = window.setInterval(() => loadRuns(), 2500)
   metricRefreshTimer = window.setInterval(() => {
     if (activeView.value === 'detail') {
@@ -937,7 +982,7 @@ onBeforeUnmount(() => {
       </div>
       <nav>
         <button :class="{ active: activeView === 'runs' }" @click="activeView = 'runs'">Runs</button>
-        <button :class="{ active: activeView === 'new' }" @click="activeView = 'new'">New run</button>
+        <button :class="{ active: activeView === 'new' }" @click="openNewRun">New run</button>
         <button :disabled="!selected" :class="{ active: activeView === 'detail' }" @click="activeView = 'detail'">Run detail</button>
       </nav>
       <div class="worker-card">
@@ -954,7 +999,7 @@ onBeforeUnmount(() => {
           <p class="eyebrow">STANDALONE CONTROL PLANE</p>
           <h1>{{ activeView === 'new' ? 'Launch training' : activeView === 'detail' ? 'Run detail' : 'Training runs' }}</h1>
         </div>
-        <button class="ghost" @click="loadRuns">Refresh</button>
+        <button class="ghost" @click="refreshApp">Refresh</button>
       </header>
 
       <div v-if="error" class="error-banner">{{ error }}</div>
@@ -962,7 +1007,7 @@ onBeforeUnmount(() => {
       <section v-if="activeView === 'runs'" class="panel">
         <div class="panel-heading">
           <div><h2>Experiments</h2><p>Durable workers and their latest persisted state.</p></div>
-          <button class="primary" :disabled="Boolean(activeRun)" @click="activeView = 'new'">New run</button>
+          <button class="primary" :disabled="Boolean(activeRun)" @click="openNewRun">New run</button>
         </div>
         <div class="run-filters">
           <label for="run-status-filter">Status
@@ -1312,6 +1357,7 @@ onBeforeUnmount(() => {
             <div class="detail-section-heading metrics-heading">
               <div><h3>MLflow metrics</h3><span>{{ selectedMetricNames.length }} pinned · {{ availableMetrics.length }} available</span></div>
               <div class="metric-picker">
+                <label><input v-model="showScoringDiagnostics" type="checkbox" /> Include scoring diagnostics and legacy metrics</label>
                 <div class="metric-picker-search">
                   <input v-model="metricToAdd" autocomplete="off" aria-label="Metric to add" placeholder="Search or paste a metric name…" @focus="metricPickerOpen = true" @input="metricPickerOpen = true" @blur="closeMetricPicker" @keyup.enter="addMetric" @keydown.esc="metricPickerOpen = false" />
                   <div v-if="metricPickerOpen" class="metric-picker-menu">
@@ -1326,8 +1372,11 @@ onBeforeUnmount(() => {
             </div>
             <p v-if="metricsError" class="metric-error">{{ metricsError }}</p>
             <div v-if="!selected.mlflow_run_id" class="empty-metrics">Waiting for the MLflow run to start…</div>
-            <div v-else-if="metricCards.length" class="sparkline-grid">
-              <article v-for="metric in metricCards" :key="metric.name" class="sparkline-card">
+            <div v-else-if="metricCards.length">
+              <section v-for="group in metricCardGroups" :key="group.name">
+                <h3>{{ group.name }}</h3>
+                <div class="sparkline-grid">
+              <article v-for="metric in group.metrics" :key="metric.name" class="sparkline-card">
                 <div class="sparkline-card-heading">
                   <div><strong>{{ metricLabel(metric.name) }}</strong><small :title="metric.name">{{ metric.name }}</small></div>
                   <button type="button" :aria-label="`Unpin ${metric.name}`" :title="`Unpin ${metric.name}`" @click="removeMetric(metric.name)">×</button>
@@ -1342,6 +1391,8 @@ onBeforeUnmount(() => {
                 </template>
                 <div v-else class="sparkline-empty">{{ metric.available ? (metricsLoading ? 'Loading…' : 'No history yet') : 'Not logged by this run yet' }}</div>
               </article>
+                </div>
+              </section>
             </div>
             <div v-else class="empty-metrics">Add a metric to begin monitoring.</div>
           </div>

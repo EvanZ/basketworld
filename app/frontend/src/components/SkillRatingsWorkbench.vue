@@ -1,5 +1,6 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import TeamStrengthPanel from './TeamStrengthPanel.vue';
 import {
   extendSkillRatingsStudy,
   getActiveSkillRatingsJob,
@@ -12,10 +13,15 @@ import {
   latestReportedProgress,
   reportedProgressPercent,
   selectedAnalysisIdentity,
+  skillEffectInterval,
   skillRatingsReportOptionLabel,
 } from '../utils/skillRatingsWorkbench';
 
 const props = defineProps({
+  gameState: { type: Object, default: null },
+  playerDisplayNames: { type: Object, default: () => ({}) },
+  playerDeterministic: { type: Boolean, default: true },
+  opponentDeterministic: { type: Boolean, default: true },
   checkpointPath: {
     type: String,
     default: '',
@@ -75,6 +81,7 @@ const copyNotice = ref('');
 const additionalGames = ref(640);
 const extensionScheduleSeed = ref(1);
 let pollTimer = null;
+let reportRequestId = 0;
 
 const selectedCheckpointPath = computed(() => String(props.checkpointPath || '').trim());
 const selectedPolicyIsJax = computed(() => String(props.modelBackend || '').toLowerCase().startsWith('jax'));
@@ -141,6 +148,7 @@ function studyPayload() {
 }
 
 function formatNumber(value, digits = 2) {
+  if (value === null || value === undefined || value === '') return '—';
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric.toFixed(digits) : '—';
 }
@@ -251,16 +259,21 @@ async function refreshReports() {
 }
 
 async function loadReport(path = selectedReportPath.value) {
-  if (!path) return;
+  const requestId = ++reportRequestId;
+  selectedReportPath.value = path;
+  report.value = null;
   error.value = '';
+  if (!path) return;
   try {
-    selectedReportPath.value = path;
-    report.value = await getSkillRatingsReport(path);
+    const loaded = await getSkillRatingsReport(path);
+    if (requestId !== reportRequestId) return;
+    report.value = loaded;
     const sourceGames = Number(report.value?.reproducibility?.config?.game_count);
     const sourceSeed = Number(report.value?.reproducibility?.config?.schedule_seed);
     if (Number.isFinite(sourceGames) && sourceGames > 0) additionalGames.value = sourceGames;
     if (Number.isFinite(sourceSeed)) extensionScheduleSeed.value = sourceSeed + 1;
   } catch (err) {
+    if (requestId !== reportRequestId) return;
     error.value = err.message || 'Could not load Skill Ratings report.';
   }
 }
@@ -319,6 +332,14 @@ onBeforeUnmount(stopPolling);
     </header>
 
     <p v-if="error" class="error-message">{{ error }}</p>
+
+    <TeamStrengthPanel
+      :report="report"
+      :game-state="gameState"
+      :player-display-names="playerDisplayNames"
+      :player-deterministic="playerDeterministic"
+      :opponent-deterministic="opponentDeterministic"
+    />
 
     <div class="workbench-grid">
       <form class="config-card" @submit.prevent="launch">
@@ -475,7 +496,8 @@ onBeforeUnmount(stopPolling);
             <span class="field-label">Results artifact location <span class="help-tip" tabindex="0" title="A report library or study folder to search. It is separate from the next launch destination, so new study paths never remove or hide prior reports.">?</span></span>
             <input v-model="config.resultsArtifactDir" @change="refreshReports" />
           </label>
-          <select v-model="selectedReportPath" @change="loadReport()">
+          <label for="skill-ratings-report">Study to inspect and apply to current teams</label>
+          <select id="skill-ratings-report" v-model="selectedReportPath" @change="loadReport()">
             <option value="">Choose a report…</option>
             <option v-for="item in reports" :key="item.path" :value="item.path">{{ skillRatingsReportOptionLabel(item) }}</option>
           </select>
@@ -511,7 +533,7 @@ onBeforeUnmount(stopPolling);
         </details>
       </section>
 
-      <div class="results-grid">
+      <div class="results-overview">
         <section class="result-card factors-card">
           <h3>Three factors</h3>
           <p class="muted">Conventional OLS scenario weights. Free-throw rate is unavailable because the environment has no fouls or free throws.</p>
@@ -520,6 +542,30 @@ onBeforeUnmount(stopPolling);
             <strong>{{ formatPercent(details.percent_of_total_margin_delta) }}</strong>
           </div>
           <p v-for="(details, factor) in report.three_factors.unavailable_factors || {}" :key="factor" class="muted">{{ factor }}: {{ details.reason }}</p>
+        </section>
+        <section class="result-card table-card skill-effects-card">
+          <h3>Direct skill effects</h3>
+          <p class="muted">Effects and 90% bootstrap intervals are net-rating points per one pool standard deviation. An interval spanning zero leaves the direction uncertain.</p>
+          <p v-if="report.skill_coefficient_bootstrap" class="muted">
+            {{ report.skill_coefficient_bootstrap.successful_samples }} of {{ report.skill_coefficient_bootstrap.samples }} resamples fitted.
+            Whole game groups are resampled with the player pool held fixed. Intervals condition on the selected ridge penalty.
+          </p>
+          <p v-else class="muted">This saved analysis predates coefficient intervals. Reanalyse its saved games to calculate them; no new simulation is needed.</p>
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th>Skill</th><th>Group</th><th>Status</th><th>Net rating / pool SD</th><th>90% bootstrap interval</th><th>Includes zero?</th><th>Pool mean</th><th>Pool SD</th></tr></thead>
+              <tbody>
+                <tr v-for="skill in report.skill_coefficients" :key="skill.key">
+                  <td>{{ skill.label }}</td><td>{{ skill.group }}</td>
+                  <td>{{ skill.reason?.replaceAll('_', ' ') || 'Estimated' }}</td>
+                  <td>{{ formatNumber(skill.net_rating_per_standard_deviation) }}</td>
+                  <td :title="skill.bootstrap_successful_samples == null ? '' : `${skill.bootstrap_successful_samples} identifiable bootstrap fits`">{{ skillEffectInterval(skill)?.label || 'Unavailable' }}</td>
+                  <td>{{ skillEffectInterval(skill) ? (skillEffectInterval(skill).includesZero ? 'Yes' : 'No') : '—' }}</td>
+                  <td>{{ formatNumber(skill.pool_mean) }}</td><td>{{ formatNumber(skill.pool_standard_deviation) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </section>
         <section class="result-card">
           <h3>Model diagnostics</h3>
@@ -571,15 +617,7 @@ onBeforeUnmount(stopPolling);
         </div>
       </section>
 
-      <section class="result-card table-card">
-        <h3>Direct skill effects</h3>
-        <div class="table-scroll">
-          <table>
-            <thead><tr><th>Skill</th><th>Group</th><th>Net rating / pool SD</th><th>Pool mean</th><th>Pool SD</th></tr></thead>
-            <tbody><tr v-for="skill in report.skill_coefficients" :key="skill.key"><td>{{ skill.label }}</td><td>{{ skill.group }}</td><td>{{ formatNumber(skill.net_rating_per_standard_deviation) }}</td><td>{{ formatNumber(skill.pool_mean) }}</td><td>{{ formatNumber(skill.pool_standard_deviation) }}</td></tr></tbody>
-          </table>
-        </div>
-      </section>
+
     </section>
   </section>
 </template>
@@ -607,7 +645,7 @@ button { border-radius: 7px; padding: .6rem .85rem; border: 1px solid #5678a9; c
 .progress-track { overflow: hidden; height: .55rem; border-radius: 999px; background: #21324a; }.progress-fill { height: 100%; background: #48bb88; transition: width .25s ease; }.progress-label { margin: .75rem 0 .35rem; font-size: .85rem; }.timing-estimate { margin: .65rem 0 .25rem; color: #cde3ff; font-size: .84rem; line-height: 1.4; }
 details { margin-top: .85rem; } summary { cursor: pointer; color: #bcd2f8; } pre { max-height: 250px; overflow: auto; white-space: pre-wrap; color: #bfcde3; font-size: .73rem; }
 .error-message { border: 1px solid #8a3945; border-radius: 7px; padding: .65rem; background: #3d1d25; color: #ffdbe0; }
-.results-section { margin-top: 1rem; }.study-size { display: flex; flex-wrap: wrap; gap: .45rem; }.study-size span { border-radius: 999px; padding: .35rem .6rem; background: #203653; color: #cde3ff; font-size: .8rem; }.selected-analysis-card { margin-top: 1rem; }.analysis-identity, .analysis-dependencies { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: .45rem .9rem; margin: 0; }.analysis-identity dt, .analysis-dependencies dt { color: #aebfd9; }.analysis-identity dd, .analysis-dependencies dd { min-width: 0; margin: 0; }.analysis-identity code, .analysis-dependencies code { overflow-wrap: anywhere; white-space: normal; }.results-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(260px, .85fr); gap: 1rem; margin: 1rem 0; }.factor-row { display: flex; justify-content: space-between; gap: 1rem; border-top: 1px solid #283d59; padding: .6rem 0; font-size: .9rem; }.factor-row span { color: #c6d4e9; }.diagnostics, .reproducibility-seeds { display: grid; grid-template-columns: 1fr auto; gap: .45rem .9rem; margin: 0; }.diagnostics dt, .reproducibility-seeds dt { color: #aebfd9; }.diagnostics dd, .reproducibility-seeds dd { margin: 0; font-weight: 700; }.reproducibility-card { margin-top: 1rem; }.reproducibility-card h3 { margin-bottom: .25rem; }.copy-notice { margin: .75rem 0 0; color: #9be7bd; font-size: .84rem; }.extension-controls { display: grid; grid-template-columns: minmax(150px, .55fr) minmax(150px, .55fr) auto; align-items: end; gap: .7rem; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #283d59; }.extension-controls label { margin: 0; }.extension-controls .primary { width: auto; white-space: nowrap; }.table-card { margin-top: 1rem; }.table-scroll { overflow: auto; } table { width: 100%; border-collapse: collapse; font-size: .83rem; } th, td { padding: .55rem .65rem; border-bottom: 1px solid #283d59; text-align: left; vertical-align: top; white-space: nowrap; } th { position: sticky; top: 0; background: #14223a; color: #c8dcfc; }
+.results-overview { display: grid; gap: 1rem; margin-top: 1rem; } .results-overview .table-card { margin-top: 0; } .results-section { margin-top: 1rem; }.study-size { display: flex; flex-wrap: wrap; gap: .45rem; }.study-size span { border-radius: 999px; padding: .35rem .6rem; background: #203653; color: #cde3ff; font-size: .8rem; }.selected-analysis-card { margin-top: 1rem; }.analysis-identity, .analysis-dependencies { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: .45rem .9rem; margin: 0; }.analysis-identity dt, .analysis-dependencies dt { color: #aebfd9; }.analysis-identity dd, .analysis-dependencies dd { min-width: 0; margin: 0; }.analysis-identity code, .analysis-dependencies code { overflow-wrap: anywhere; white-space: normal; }.results-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(260px, .85fr); gap: 1rem; margin: 1rem 0; }.factor-row { display: flex; justify-content: space-between; gap: 1rem; border-top: 1px solid #283d59; padding: .6rem 0; font-size: .9rem; }.factor-row span { color: #c6d4e9; }.diagnostics, .reproducibility-seeds { display: grid; grid-template-columns: 1fr auto; gap: .45rem .9rem; margin: 0; }.diagnostics dt, .reproducibility-seeds dt { color: #aebfd9; }.diagnostics dd, .reproducibility-seeds dd { margin: 0; font-weight: 700; }.reproducibility-card { margin-top: 1rem; }.reproducibility-card h3 { margin-bottom: .25rem; }.copy-notice { margin: .75rem 0 0; color: #9be7bd; font-size: .84rem; }.extension-controls { display: grid; grid-template-columns: minmax(150px, .55fr) minmax(150px, .55fr) auto; align-items: end; gap: .7rem; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #283d59; }.extension-controls label { margin: 0; }.extension-controls .primary { width: auto; white-space: nowrap; }.table-card { margin-top: 1rem; }.table-scroll { overflow: auto; } table { width: 100%; color: inherit; border-collapse: collapse; font-size: .83rem; } th, td { padding: .55rem .65rem; border-bottom: 1px solid #283d59; text-align: left; vertical-align: top; white-space: nowrap; } th { position: sticky; top: 0; background: #14223a; color: #c8dcfc; }
 @media (max-width: 900px) { .workbench-grid, .results-grid, .extension-controls { grid-template-columns: 1fr; }.three-column { grid-template-columns: 1fr; } }
 @media (max-width: 600px) { .workbench-header, .results-heading { align-items: flex-start; flex-direction: column; }.two-column { grid-template-columns: 1fr; } }
 </style>

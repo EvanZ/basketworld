@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+from basketworld_jax.shot_defense_metrics import build_shot_defense_diagnostics, summarize_shot_defense_diagnostics
+
+from basketworld_jax.shot_defense import SHOT_DEFENSE_DEFAULTS, shot_defense_enabled, shot_defense_contract, validate_trained_shot_defense
+
 from pathlib import Path
 from threading import Event, Thread
 from time import perf_counter
 from typing import Any, Mapping
 
 import numpy as np
+
+from basketworld_jax.scoring_metrics import (
+    SCORING_METRIC_SCHEMA_VERSION,
+    ratio as scoring_ratio,
+)
 
 from basketworld.domain import ActionType, Team
 from basketworld_jax.config import (
@@ -245,6 +254,7 @@ _JAX_EVALUATION_CONTRACT_FIELDS = (
     "made_basket_restart_mode",
     "check_clearance",
     "require_all_offense_clear",
+    "prefer_higher_percentage_shot",
     "episode_end_mode",
     "game_clock_seconds",
     "overtime_seconds",
@@ -316,6 +326,7 @@ def _resolve_native_environment_config(
             checkpoint_metadata=unified_payload,
         )
     )
+    validate_trained_shot_defense(unified_payload, resolved)
     if opponent_payload is None or opponent_payload is unified_payload:
         return resolved
     opponent = normalize_runtime_environment_config(
@@ -325,9 +336,10 @@ def _resolve_native_environment_config(
             checkpoint_metadata=opponent_payload,
         )
     )
+    validate_trained_shot_defense(opponent_payload, opponent)
     mismatches = {
         field: (getattr(resolved, field), getattr(opponent, field))
-        for field in _JAX_EVALUATION_CONTRACT_FIELDS
+        for field in (*_JAX_EVALUATION_CONTRACT_FIELDS, *SHOT_DEFENSE_DEFAULTS)
         if getattr(resolved, field) != getattr(opponent, field)
     }
     if mismatches:
@@ -590,6 +602,11 @@ def _apply_native_custom_setup(
     if has_complete_player_profiles:
         n_players = int(static.role_encoding.shape[0])
         for descriptor in ACTIVE_PLAYER_SKILL_REGISTRY.descriptors:
+            missing = [pid for pid in range(n_players) if descriptor.key not in player_profiles.get(str(pid), {})]
+            if missing:
+                if len(missing) == n_players and descriptor.key in {"rim_protection", "contested_shooting"} and not (bool(np.asarray(static.rim_protection_enabled)) or bool(np.asarray(static.contested_shooting_enabled))):
+                    continue
+                raise ValueError(f"Custom player profiles are missing {descriptor.key} for slots {missing}.")
             values = np.asarray(
                 [player_profiles[str(pid)][descriptor.key] for pid in range(n_players)],
                 dtype=np.float32,
@@ -693,6 +710,10 @@ def _apply_native_profile_rows(
     for descriptor in ACTIVE_PLAYER_SKILL_REGISTRY.descriptors:
         values = player_skill_rows.get(descriptor.key)
         if values is None:
+            if descriptor.key in {"rim_protection", "contested_shooting"} and not (
+                bool(np.asarray(static.rim_protection_enabled)) or bool(np.asarray(static.contested_shooting_enabled))
+            ):
+                continue
             raise ValueError(
                 f"Fixed-pool profile rows are missing active skill {descriptor.key!r}."
             )
@@ -1399,6 +1420,7 @@ def _build_native_eval_runner(
                 multi_possession_features=bool(
                     getattr(team_a_spec, "multi_possession_features", False)
                 ),
+                shooting_skill_features=int(getattr(team_a_spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(
                     int(getattr(team_a_spec, "observation_schema_version", 1)) >= 6
                 ),
@@ -1436,6 +1458,7 @@ def _build_native_eval_runner(
                 multi_possession_features=bool(
                     getattr(team_a_spec, "multi_possession_features", False)
                 ),
+                shooting_skill_features=int(getattr(team_a_spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(
                     int(getattr(team_a_spec, "observation_schema_version", 1)) >= 6
                 ),
@@ -1463,6 +1486,7 @@ def _build_native_eval_runner(
                 multi_possession_features=bool(
                     getattr(team_b_spec, "multi_possession_features", False)
                 ),
+                shooting_skill_features=int(getattr(team_b_spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(
                     int(getattr(team_b_spec, "observation_schema_version", 1)) >= 6
                 ),
@@ -1573,6 +1597,8 @@ def _build_native_eval_runner(
                 ~env_out.truncated.astype(jnp.bool_)
             )
             trace = {
+                "shot_defense_diagnostics": build_shot_defense_diagnostics(static, env_out, ~policy_state.episode_ended.astype(jnp.bool_), jnp),
+                **{field: getattr(env_out, field) for field in ("shot_blocked", "shot_blocker", "shot_is_finish", "shot_contested", "shot_open_probability", "shot_conditional_probability", "shot_block_probability", "shot_suppression_before_resistance", "shot_suppression_after_resistance")},
                 "full_actions": full_actions.astype(jnp.int32),
                 "ball_holder": policy_state.ball_holder.astype(jnp.int32),
                 "next_ball_holder": env_out.state.ball_holder.astype(jnp.int32),
@@ -2466,6 +2492,7 @@ def _init_player_stats(n_players: int) -> dict[int, dict[str, Any]]:
             "potential_assists": 0,
             "turnovers": 0,
             "steals": 0,
+            "blocks": 0,
             "points": 0.0,
             "offensive_rebounds": 0,
             "defensive_rebounds": 0,
@@ -2500,6 +2527,7 @@ def _init_aggregate_stats() -> dict[str, Any]:
         "potential_assists": 0,
         "turnovers": 0,
         "steals": 0,
+            "blocks": 0,
         "points": 0.0,
         "offensive_rebounds": 0,
         "defensive_rebounds": 0,
@@ -2631,6 +2659,7 @@ def _merge_aggregate_stats(
         "potential_assists",
         "turnovers",
         "steals",
+        "blocks",
         "episodes",
         "steps",
         "offensive_rebounds",
@@ -3314,6 +3343,9 @@ def run_native_jax_evaluation(
             else legacy_checkpoint_schemas
         )
     )
+    if bool(np.asarray(static.rim_protection_enabled)) or bool(np.asarray(static.contested_shooting_enabled)):
+        expected_environment_schema = 7
+        compatible_checkpoint_schemas = {7}
     if static_multi and (
         not checkpoint_schema_versions.issubset(compatible_checkpoint_schemas)
         or environment_schema_version != expected_environment_schema
@@ -3520,6 +3552,7 @@ def run_native_jax_evaluation(
     value_diagnostics_accum = _empty_value_diagnostics()
 
     start = perf_counter()
+    all_shot_defense_diagnostics = []
     completed_episodes = 0
     if eval_seed is None:
         eval_seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
@@ -3715,6 +3748,7 @@ def run_native_jax_evaluation(
                 int(selector_settings["mode_code"]),
             )
             trace = dict(jax.device_get(trace_device))
+            all_shot_defense_diagnostics.append(np.asarray(trace["shot_defense_diagnostics"])[:, :take].sum(axis=(0, 1)))
         finally:
             if heartbeat_stop is not None:
                 heartbeat_stop.set()
@@ -4151,6 +4185,12 @@ def run_native_jax_evaluation(
                 if int(trace["shot_attempt"][t, idx]):
                     shooter_id = int(trace["shot_shooter"][t, idx])
                     shot_success = bool(int(trace["shot_success"][t, idx]))
+                    blocked = bool(int(trace["shot_blocked"][t, idx]))
+                    blocker = int(trace["shot_blocker"][t, idx])
+                    if blocked:
+                        for stats_map in (per_player_stats, episode_player_stats):
+                            if blocker in stats_map:
+                                stats_map[blocker]["blocks"] += 1
                     shot_value = float(trace["shot_value"][t, idx])
                     shot_type = _shot_type_label(int(trace["shot_type"][t, idx]))
                     q = int(trace["shot_q"][t, idx])
@@ -4222,8 +4262,14 @@ def run_native_jax_evaluation(
                     )
                     shots_payload[str(shooter_id)] = {
                         "success": shot_success,
+                        "blocked": blocked,
+                        "blocker_id": blocker if blocked else None,
+                        "conditional_probability": float(trace["shot_conditional_probability"][t, idx]),
+                        "block_probability": float(trace["shot_block_probability"][t, idx]),
+                        "base_probability": float(trace["shot_open_probability"][t, idx]),
                         "distance": float(trace["shot_distance"][t, idx]),
                         "is_three": shot_type == "three",
+                        "is_dunk": shot_type == "dunk",
                         "expected_points": float(trace["shot_expected_points"][t, idx]),
                         "shot_value": shot_value,
                         "assist_full": assist_full,
@@ -5703,6 +5749,7 @@ def run_native_jax_evaluation(
                 bool(all_completed[pair_start]) and bool(all_completed[pair_end])
             )
     summary = {
+        "scoring_metric_schema_version": SCORING_METRIC_SCHEMA_VERSION,
         "backend": "jax",
         "mode": "native_compiled",
         "num_episodes": int(num_episodes),
@@ -5730,15 +5777,15 @@ def run_native_jax_evaluation(
         "horizon_truncated_games": horizon_truncated_game_count,
         "clock_metrics_completed_games": completed_clock_metrics,
         "clock_metrics_truncated_games": truncated_clock_metrics,
+        "completed_win_rate": scoring_ratio(win_count, len(completed_game_indices)),
+        "completed_win_score": scoring_ratio(win_count + 0.5 * tie_count, len(completed_game_indices)),
         "win_count": win_count,
         "loss_count": loss_count,
         "tie_count": tie_count,
         "completed_user_score_mean": _mean(completed_user_scores),
         "completed_opponent_score_mean": _mean(completed_opponent_scores),
         # These stable-team totals are the authoritative PPP numerators for a
-        # multi-possession evaluation.  The role-oriented offense/defense
-        # aggregates below intentionally remain separate diagnostics because
-        # those roles alternate during a game.
+        # multi-possession evaluation; roles can alternate during a game.
         "completed_user_score_total": float(sum(completed_user_scores)),
         "completed_opponent_score_total": float(sum(completed_opponent_scores)),
         "completed_margin_mean": _mean(completed_margins),
@@ -5806,18 +5853,11 @@ def run_native_jax_evaluation(
                 default=0,
             )
         ),
-        "user_points_per_possession": (
-            float(sum(completed_user_scores) / completed_user_offensive_possessions)
-            if completed_user_offensive_possessions > 0
-            else 0.0
+        "user_points_per_completed_offensive_possession": scoring_ratio(
+            sum(completed_user_scores), completed_user_offensive_possessions
         ),
-        "opponent_points_per_possession": (
-            float(
-                sum(completed_opponent_scores)
-                / completed_opponent_offensive_possessions
-            )
-            if completed_opponent_offensive_possessions > 0
-            else 0.0
+        "opponent_points_per_completed_offensive_possession": scoring_ratio(
+            sum(completed_opponent_scores), completed_opponent_offensive_possessions
         ),
         "paired_starting_team_evaluation": {
             "enabled": bool(static_multi),
@@ -5839,13 +5879,6 @@ def run_native_jax_evaluation(
         "winner_reward_per_episode": _mean(all_winner_rewards),
         "auxiliary_reward_per_episode": _mean(all_auxiliary_rewards),
         "phi_shaping_per_episode": _mean(all_phi_shaping),
-        "team_a_score_delta_per_episode": _mean(all_team_a_score_delta),
-        "team_b_score_delta_per_episode": _mean(all_team_b_score_delta),
-        "offense_points_per_episode": _mean(all_offense_points),
-        "defense_points_per_episode": _mean(all_defense_points),
-        "score_margin_per_episode": _mean(
-            np.asarray(all_offense_points) - np.asarray(all_defense_points)
-        ),
         "pass_attempts_per_episode": _mean(all_pass_attempts),
         "completed_passes_per_episode": _mean(all_completed_passes),
         "assists_per_episode": _mean(all_assists),
@@ -5939,8 +5972,6 @@ def run_native_jax_evaluation(
         "rebound_attempts_per_episode": _mean(all_rebound_attempts),
         "offensive_rebounds_per_episode": _mean(all_offensive_rebounds),
         "defensive_rebounds_per_episode": _mean(all_defensive_rebounds),
-        "total_offense_points": _sum(all_offense_points),
-        "total_defense_points": _sum(all_defense_points),
         "total_rebound_attempts": int(total_rebound_attempts),
         "total_offensive_rebounds": int(_sum(all_offensive_rebounds)),
         "total_defensive_rebounds": int(_sum(all_defensive_rebounds)),
@@ -6109,6 +6140,7 @@ def run_native_jax_evaluation(
             "rng_streams": ["reset", "environment", "policy"],
             **(fixed_checkpoint_metadata or {}),
         }
+    summary.update(summarize_shot_defense_diagnostics(np.asarray(all_shot_defense_diagnostics)))
     fixed_pool_artifacts = None
     if fixed_pool_artifact_dir is not None:
         assert fixed_player_pool is not None
@@ -6120,6 +6152,7 @@ def run_native_jax_evaluation(
             possession_events=fixed_pool_possession_events,
             output_dir=fixed_pool_artifact_dir,
             mlflow_client=fixed_pool_mlflow_client,
+            environment_contract={"shot_defense": shot_defense_contract(config), "environment": config.as_metadata()},
         )
         fixed_pool_artifacts = artifact_paths.to_payload()
         summary.setdefault("fixed_pool_study", {})[

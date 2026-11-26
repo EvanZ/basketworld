@@ -8,8 +8,9 @@ import {
   interactionHandDuration,
   interactionHandOpacity,
   interactionHandPairPose,
+  shotReleaseGesture,
 } from '@/utils/interactionHands';
-import { defensiveLaneViolationBannerPayload } from '@/utils/outcomeBanners';
+import { nonShotOutcomeBannerPayload } from '@/utils/outcomeBanners';
 import { resolveRenderableState } from '@/utils/renderableState';
 import { stableBoardViewBox } from '@/utils/boardViewBox';
 import { resolveEpisodeSkillMetadata } from '@/utils/episodeSkillMetadata';
@@ -597,43 +598,11 @@ function shotAttemptBannerPayload(
   const isThree = Boolean(shotResult.is_three ?? shotResult.isThree);
   return {
     key: eventKey,
-    text: `${made ? 'Made' : 'Missed'} ${isThree ? '3PT' : '2PT'}`,
+    text: shotResult.blocked ? `Blocked by #${shotResult.blocker_id}` : `${made ? 'Made' : 'Missed'} ${isThree ? '3PT' : '2PT'}`,
     made,
-    kind: made ? 'made' : 'missed',
+    kind: shotResult.blocked ? 'blocked' : made ? 'made' : 'missed',
     scoringTeam: made ? scoringTeam : null,
     reboundText: made ? null : reboundBannerText(actionResults),
-  };
-}
-
-function turnoverBannerPayload(actionResults) {
-  const turnovers = Array.isArray(actionResults?.turnovers)
-    ? actionResults.turnovers
-    : [];
-  const turnover = turnovers.find((entry) => entry && typeof entry === 'object');
-  if (!turnover) return null;
-  const reason = String(turnover.reason || '').toLowerCase();
-  const isSteal = reason === 'steal';
-  // The runtime records an offensive three-seconds violation as the turnover
-  // reason and also supplies the lane-violation detail for the court overlay.
-  const isLaneViolation = reason === 'offensive_three_seconds'
-    || reason === 'offensive_lane_violation'
-    || Boolean(actionResults?.offensive_lane_violations?.length);
-  return {
-    text: isSteal ? 'Steal' : (isLaneViolation ? 'Turnover - Lane Violation' : 'Turnover'),
-    made: false,
-    kind: isSteal ? 'steal' : 'turnover',
-    reboundText: null,
-  };
-}
-
-function checkViolationBannerPayload(actionResults) {
-  const checks = Array.isArray(actionResults?.checks) ? actionResults.checks : [];
-  if (!checks.some((entry) => entry?.violation)) return null;
-  return {
-    text: 'Check Violation',
-    made: false,
-    kind: 'violation',
-    reboundText: null,
   };
 }
 
@@ -656,9 +625,7 @@ function shotAttemptBannerPayloadForState(state) {
     scoringTeam,
     eventKey,
   )
-    ?? checkViolationBannerPayload(actionResults)
-    ?? turnoverBannerPayload(actionResults)
-    ?? defensiveLaneViolationBannerPayload(actionResults);
+    ?? nonShotOutcomeBannerPayload(actionResults);
 }
 
 function clearShotAttemptBanner() {
@@ -3344,9 +3311,9 @@ const episodeOutcome = computed(() => {
         const [q, r] = pos;
         const bq = currentGameState.value.basket_position[0];
         const br = currentGameState.value.basket_position[1];
-        // Simple distance for dunk check
+        // Older replays lack the selected shot type; retain their legacy label.
         const dist = (Math.abs(q - bq) + Math.abs((q + r) - (bq + br)) + Math.abs(r - br)) / 2;
-        const isDunk = dist === 0;
+        const isDunk = Boolean(shotResult.is_dunk ?? (dist === 0));
         return {
             type: shotResult.success ? 'MADE_SHOT' : 'MISSED_SHOT',
             isThree,
@@ -4023,7 +3990,9 @@ function captureShotFlashFromState(state) {
   );
   return {
     flashKey: `capture-shot-${shooterId}-${Number(shot.success)}`,
+    isDunk: Boolean(shot.is_dunk ?? (Number(shot.distance ?? hexDistance(shooterPos, basketPos)) === 0)),
     shooterId,
+    blockerId: shot.blocked ? Number(shot.blocker_id) : null,
     x1: start.x,
     y1: start.y,
     x2: end.x,
@@ -4280,11 +4249,17 @@ const activeInteractionHands = computed(() => {
   const shot = activeShotFlash.value;
   if (shot) {
     const progress = shotFlashProgress.value;
+    if (shot.blockerId !== null && shot.blockerId >= 0) {
+      addInteraction({
+        key: `block-${shot.flashKey}`, playerId: shot.blockerId,
+        kind: 'block-swat', label: 'Blocking shot', progress,
+        opacity: interactionHandOpacity('release', progress),
+      });
+    }
     addInteraction({
       key: `shot-release-${shot.flashKey}`,
       playerId: Number(shot.shooterId),
-      kind: 'shot-release',
-      label: 'Releasing shot',
+      ...shotReleaseGesture(shot.isDunk, shot.distance),
       progress,
       opacity: interactionHandOpacity('release', progress),
     });
@@ -4315,6 +4290,7 @@ function interactionHandsForPlayer(player) {
       ...interaction,
       pose: interactionHandPairPose({
         center,
+        basket: basketPosition.value,
         kind: interaction.kind,
         playerRadius: HEX_RADIUS,
         progress: interaction.progress,
@@ -4379,7 +4355,7 @@ function triggerShotJump(shooterId, isDunk = false) {
   }, SHOOT_JUMP_PERIOD_SECONDS * 1000);
 }
 
-function triggerShotFlash(shooterId, start, end, success, isDunk = false, distance = 0) {
+function triggerShotFlash(shooterId, start, end, success, isDunk = false, distance = 0, blockerId = null) {
   if (shotFlashTimeout.value) {
     clearTimeout(shotFlashTimeout.value);
     shotFlashTimeout.value = null;
@@ -4394,6 +4370,8 @@ function triggerShotFlash(shooterId, start, end, success, isDunk = false, distan
     flashKey: ++shotFlashSerial,
     startedAtMs,
     shooterId,
+    blockerId,
+    isDunk,
     x1: start.x,
     y1: start.y,
     x2: end.x,
@@ -4407,10 +4385,11 @@ function triggerShotFlash(shooterId, start, end, success, isDunk = false, distan
   };
   triggerLiveInteractionHands('shot', [{
     playerId: Number(shooterId),
-    kind: 'shot-release',
-    label: 'Releasing shot',
+    ...shotReleaseGesture(isDunk, distance),
     phase: 'release',
-  }], timing.durationMs);
+  }, ...(blockerId !== null && blockerId >= 0 ? [{
+    playerId: blockerId, kind: 'block-swat', label: 'Blocking shot', phase: 'release',
+  }] : [])], timing.durationMs);
   if (!props.disableTransitions) {
     startShotFlashClock();
   }
@@ -4549,9 +4528,7 @@ watch(
 
     // Turnovers do not produce a shot animation, so announce them explicitly.
     // The banner stays visible briefly after the next possession begins.
-    const turnoverOrViolationBanner = checkViolationBannerPayload(state.last_action_results)
-      ?? turnoverBannerPayload(state.last_action_results)
-      ?? defensiveLaneViolationBannerPayload(state.last_action_results);
+    const turnoverOrViolationBanner = nonShotOutcomeBannerPayload(state.last_action_results);
     if (turnoverOrViolationBanner) {
       triggerOutcomeBanner(turnoverOrViolationBanner);
     }
@@ -4594,9 +4571,9 @@ watch(
     const end = axialToCartesian(basketPos[0], basketPos[1]);
     const success = !!shotData.result.success;
     const isThree = Boolean(shotData.result.is_three ?? shotData.result.isThree);
-    const isDunk =
-      (shotData.result && typeof shotData.result.is_dunk === 'boolean' && shotData.result.is_dunk) ||
-      hexDistance(shooterPos, basketPos) === 0;
+    const isDunk = Boolean(
+      shotData.result.is_dunk ?? (hexDistance(shooterPos, basketPos) === 0),
+    );
 
     const shotAnimationKey = [
       Number(state.shot_clock ?? -1),
@@ -4628,6 +4605,7 @@ watch(
       success,
       isDunk,
       hexDistance(shooterPos, basketPos),
+      shotData.result?.blocked ? Number(shotData.result.blocker_id) : null,
     );
     if (actionResultsHaveRebound(state.last_action_results)) {
       triggerReboundFlash(state, shotDurationMs * REBOUND_OVERLAY_REVEAL_PROGRESS);
@@ -5228,6 +5206,7 @@ onBeforeUnmount(() => {
           :key="player.id"
           :class="[
             'player-group',
+            { 'block-jump': !disableTransitions && activeInteractionHands.some((hand) => hand.playerId === player.id && hand.kind === 'block-swat') },
             { 'shoot-jump': shotJumpPlayerId === player.id && draggedPlayerId !== player.id },
             { 'shoot-jump-dunk': shotJumpPlayerId === player.id && shotJumpIsDunk && draggedPlayerId !== player.id },
             {
@@ -5347,7 +5326,7 @@ onBeforeUnmount(() => {
               />
               <path d="M 0 0.25 L 0 0.56" class="player-uniform-detail" />
             </g>
-            <!-- Side-mounted jazz hands appear only while this player is
+            <!-- Contextual hands appear only while this player is
                  releasing or catching the animated basketball. Keeping the
                  paths in the player group makes shot-jump transforms carry
                  the hands with the shooter and keeps SVG/GIF capture alike. -->
@@ -5361,6 +5340,7 @@ onBeforeUnmount(() => {
               aria-hidden="true"
             >
               <g
+                v-if="handPair.pose.showLeft"
                 class="interaction-hand interaction-hand-left"
                 :transform="`translate(${-handPair.pose.sideOffset} ${handPair.pose.verticalOffset}) rotate(${handPair.pose.leftBaseAngleDeg - handPair.pose.jazzAngleDeg}) scale(${-handPair.pose.handScale} ${handPair.pose.handScale})`"
               >
@@ -5378,6 +5358,7 @@ onBeforeUnmount(() => {
                 />
               </g>
               <g
+                v-if="handPair.pose.showRight"
                 class="interaction-hand interaction-hand-right"
                 :transform="`translate(${handPair.pose.sideOffset} ${handPair.pose.verticalOffset}) rotate(${handPair.pose.rightBaseAngleDeg + handPair.pose.jazzAngleDeg}) scale(${handPair.pose.handScale})`"
               >
@@ -8241,4 +8222,13 @@ onBeforeUnmount(() => {
   stroke-width: 3;
 }
 
+.block-jump {
+  animation: block-swat-jump 850ms ease-out;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+@keyframes block-swat-jump {
+  0%, 100% { transform: translateY(0); }
+  35% { transform: translateY(-12px); }
+}
 </style>

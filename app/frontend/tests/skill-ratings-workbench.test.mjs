@@ -10,6 +10,7 @@ const {
   latestReportedProgress,
   reportedProgressPercent,
   selectedAnalysisIdentity,
+  skillEffectInterval,
   skillRatingsReportOptionLabel,
 } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 
@@ -59,4 +60,14 @@ test('selected analysis retains every raw-study dependency for inspection', () =
     { key: 'pool_manifest', value: '/raw/pool_manifest.json' },
     { key: 'schedule_manifest', value: '/raw/schedule_manifest.json' },
   ]);
+});
+
+
+test('skill intervals distinguish uncertain signs, zero bounds and unavailable estimates', () => {
+  assert.deepEqual(skillEffectInterval({ interval_p05: -2, interval_p95: 1 }), { label: '-2.00 to 1.00', includesZero: true });
+  assert.equal(skillEffectInterval({ interval_p05: -2, interval_p95: -0.1 }).includesZero, false);
+  assert.equal(skillEffectInterval({ interval_p05: 0, interval_p95: 2 }).includesZero, true);
+  for (const bounds of [{}, { interval_p05: null, interval_p95: null }, { interval_p05: 1, interval_p95: -1 }]) {
+    assert.equal(skillEffectInterval(bounds), null);
+  }
 });

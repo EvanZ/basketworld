@@ -28,6 +28,7 @@ const STAT_COLUMNS = [
   ['reb', 'REB'],
   ['ast', 'AST'],
   ['stl', 'STL'],
+  ['blk', 'BLK'],
   ['tov', 'TOV'],
 ];
 

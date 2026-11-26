@@ -1,7 +1,7 @@
 # JAX scoring metrics audit
 
 Date: 2026-11-03  
-Status: Proposal for review; no metric behavior has been changed  
+Status: Implemented in the working tree on 2026-11-15; verification recorded below
 Scope: JAX training, role-specific evaluation, deploy evaluation, historical evaluation, PFSP, native evaluation artifacts, and the trainer views derived from them
 
 ## Executive summary
@@ -558,3 +558,47 @@ truncated_game_count
 - `basketworld_jax/eval/native.py`: native evaluation scoring, completed-game identity mapping, PPP, and post-rebound continuation points.
 - `app/training_backend/historical_elo.py`: trainer Elo and empirical historical win scores.
 - `app/training_frontend/src/pfsp.js` and `OpponentUsageChart.vue`: PFSP and PPP presentation semantics.
+
+
+## Implementation notes (2026-11-15)
+
+The recommendations above are implemented as scoring metric schema 2. Training
+PPP is explicitly observed-rollout; completed-game score metrics instead read
+new terminal learner/opponent scoreboard diagnostics captured before reset.
+Zero-denominator ratios are unavailable, not zero. Combined role evaluation is
+published under `jax/eval`, and deploy scoring is explicitly same-policy
+self-play. Fairness diagnostics use the actual roster and starting-team fields.
+
+Raw roster, period, and PPO-selected scoring counters are preserved under
+`scoring_diagnostics` in detailed results, excluded from both MLflow profiles.
+Retired per-game aliases are no longer written. Historical and native PPP names
+now explicitly identify completed offensive possessions; compatibility readers
+retain support for pre-v2 artifacts. PFSP, ESV, Elo, and reward formulas remain
+unchanged. No existing run history or evaluation artifact is rewritten.
+
+See `docs/site/jax/training.md` for the reporting contract. The implementation
+uses an additive schema field, a per-update schema metric, and the versioned
+MLflow parameter `jax/scoring_metric_schema/v2` so old runs can resume without
+changing an existing MLflow parameter.
+
+### Verification
+
+- Focused Python checks passed for terminal-score accounting, unequal possession
+  denominators, roster/starter mapping, high-scoring truncations, real clearance
+  violation awards, core/full MLflow filtering, historical summaries, and artifact
+  compatibility. The main focused selection passed 34 tests; final filter and
+  legacy-pickle checks also passed.
+- Training with role/deploy evaluation, grouped opponents, and checkpoint resume
+  passed. A separate resume check removed the scoring schema from a temporary
+  checkpoint and confirmed that the next update emits schema 2. Legacy MLflow
+  history preservation is covered with an existing-run logging fixture.
+- Native evaluation passed its paired-starter and completion/cutoff accounting
+  scenario. The final migration/native rerun passed both tests, including the
+  renamed PPP fields and unavailable zero-denominator rates.
+- All 17 dev-app and 7 trainer-app frontend test files passed, and both production
+  builds passed. A live trainer run-detail check verified the learner-scoring
+  section and opt-in legacy metric discovery.
+- This is focused regression coverage, not a fresh full repository suite or a
+  long-run statistical study of self-play assignment bias. Symmetry accounting
+  is checked with balanced paired scores; native starter coverage is exercised
+  with an actual identical-policy evaluation.

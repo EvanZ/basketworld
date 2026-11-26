@@ -17,6 +17,7 @@ from basketworld_jax.eval.skills import (
     PlayerSkillDescriptor,
     PlayerSkillRegistry,
     PlayerSkillValidationError,
+    registry_for_schema,
 )
 
 
@@ -135,7 +136,7 @@ class PlayerPool:
         cls,
         payload: Mapping[str, Any],
         *,
-        registry: PlayerSkillRegistry = ACTIVE_PLAYER_SKILL_REGISTRY,
+        registry: PlayerSkillRegistry | None = None,
         validate_active_skills: bool = True,
     ) -> "PlayerPool":
         if not isinstance(payload, Mapping):
@@ -256,6 +257,16 @@ def _sample_skill(
 ) -> float:
     defaults = dict(descriptor.sampling_defaults)
     override = dict(overrides or {})
+    if descriptor.sampling_distribution == "scaled_beta_logit_centered":
+        from basketworld_jax.shot_defense import rim_skill_from_block_sample, validate_rim_protection
+        settings = {**defaults, **override}
+        validate_rim_protection({
+            "rim_protection_beta_alpha": settings["alpha"], "rim_protection_beta_beta": settings["beta"],
+            "rim_protection_block_distribution_max": settings["maximum"],
+            "rim_protection_skill_block_reference": settings["reference"],
+        })
+        sample = float(settings["maximum"]) * rng.beta(float(settings["alpha"]), float(settings["beta"]))
+        return float(rim_skill_from_block_sample(sample, float(settings["reference"]), np))
     mean = float(override.get("mean", defaults.get("default_mean", 0.0)))
     std = float(override.get("std", defaults.get("default_std", 0.0)))
     if std < 0.0:
@@ -351,9 +362,10 @@ def generate_player_pool(
 def assert_pool_compatible(
     pool: PlayerPool,
     *,
-    registry: PlayerSkillRegistry = ACTIVE_PLAYER_SKILL_REGISTRY,
+    registry: PlayerSkillRegistry | None = None,
 ) -> None:
     """Ensure each active descriptor and skill value can run in this study."""
+    registry = registry or registry_for_schema(pool.skill_schema_version, pool.skill_schema_hash)
     artifact_descriptors = {
         str(descriptor.get("key")): descriptor
         for descriptor in pool.skill_descriptors
@@ -455,7 +467,7 @@ def write_player_pool(pool: PlayerPool, path: str | Path) -> Path:
 def load_player_pool(
     path: str | Path,
     *,
-    registry: PlayerSkillRegistry = ACTIVE_PLAYER_SKILL_REGISTRY,
+    registry: PlayerSkillRegistry | None = None,
     validate_active_skills: bool = True,
 ) -> PlayerPool:
     """Load a pool while preserving future fields and checking its identity."""

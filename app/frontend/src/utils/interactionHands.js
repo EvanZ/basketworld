@@ -45,9 +45,16 @@ export function interactionHandDuration(actionDurationMs, minimumDurationMs = 85
   return Math.max(actionDuration, minimumDuration);
 }
 
-/** Position a pair of cartoony jazz hands outside the player side edges. */
+export function shotReleaseGesture(isDunk, distance) {
+  if (isDunk) return { kind: 'dunk-release', label: 'Two-handed slam' };
+  if (Number(distance) <= 1) return { kind: 'layup-release', label: 'Basket-side layup' };
+  return { kind: 'shot-release', label: 'Releasing shot' };
+}
+
+/** Position contextual hands, including shot-specific release gestures. */
 export function interactionHandPairPose({
   center,
+  basket,
   kind,
   playerRadius,
   progress,
@@ -62,8 +69,43 @@ export function interactionHandPairPose({
   let verticalOffset = 0;
   let leftBaseAngleDeg = 0;
   let rightBaseAngleDeg = 0;
+  let showLeft = true;
+  let showRight = true;
+  let jazzAngleDeg = Math.sin(t * Math.PI * 4) * 7;
 
-  if (normalizedKind === 'shot-release') {
+  if (normalizedKind === 'block-swat') {
+    const reach = Math.sin(Math.PI * ramp(t, 0, 0.85));
+    showLeft = finiteOr(basket?.x, cx) <= cx;
+    showRight = !showLeft;
+    sideOffset = radius * (0.45 + 0.55 * reach);
+    verticalOffset = -radius * (0.35 + 1.15 * reach);
+    leftBaseAngleDeg = 90 + 70 * ramp(t, 0.30, 0.65);
+    rightBaseAngleDeg = -leftBaseAngleDeg;
+    jazzAngleDeg = 0;
+  } else if (normalizedKind === 'dunk-release') {
+    const lift = ramp(t, 0, 0.22);
+    const slam = ramp(t, 0.26, 0.55);
+    sideOffset = radius * (0.42 - 0.16 * lift + 0.12 * slam);
+    verticalOffset = radius * (-0.45 - 0.80 * lift + 0.95 * slam);
+    leftBaseAngleDeg = 90 + 35 * slam;
+    rightBaseAngleDeg = -leftBaseAngleDeg;
+    jazzAngleDeg = 0;
+  } else if (normalizedKind === 'layup-release') {
+    // Select the hand nearest the hoop, not a fixed anatomical hand. If the
+    // player occupies the basket cell, use the left hand as the tie-breaker.
+    const dx = finiteOr(basket?.x, cx) - cx;
+    const dy = finiteOr(basket?.y, cy) - cy;
+    showLeft = dx <= 0;
+    showRight = !showLeft;
+    const reach = ramp(t, 0.02, 0.50);
+    sideOffset = radius * (0.68 + 0.45 * reach);
+    verticalOffset = -radius * (0.15 + 0.65 * reach);
+    const aim = Math.atan2(dy || -radius * 0.5, dx || -radius) * 180 / Math.PI;
+    const fingerRoll = 18 * ramp(t, 0.40, 0.65);
+    leftBaseAngleDeg = aim + 180 + fingerRoll;
+    rightBaseAngleDeg = aim - fingerRoll;
+    jazzAngleDeg = 0;
+  } else if (normalizedKind === 'shot-release') {
     sideOffset = radius * 0.32;
     verticalOffset = -radius * 0.72;
     leftBaseAngleDeg = 90;
@@ -83,6 +125,8 @@ export function interactionHandPairPose({
     handScale: radius * 0.40,
     leftBaseAngleDeg,
     rightBaseAngleDeg,
-    jazzAngleDeg: Math.sin(t * Math.PI * 4) * 7,
+    jazzAngleDeg,
+    showLeft,
+    showRight,
   };
 }

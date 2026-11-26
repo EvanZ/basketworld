@@ -1044,6 +1044,7 @@ def _run_jax_playbook_batch(
                             rebound_win_prob_features=bool(getattr(spec, "rebound_win_prob_features", False)),
                             rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                             multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                            shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                             team_clearance_features=(
                                 int(getattr(spec, "observation_schema_version", 1)) >= 6
                             ),
@@ -1117,6 +1118,7 @@ def _run_jax_playbook_batch(
                         rebound_win_prob_features=bool(getattr(spec, "rebound_win_prob_features", False)),
                         rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                         multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                        shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                         team_clearance_features=(
                             int(getattr(spec, "observation_schema_version", 1)) >= 6
                         ),
@@ -1133,6 +1135,7 @@ def _run_jax_playbook_batch(
                         rebound_win_prob_features=bool(getattr(spec, "rebound_win_prob_features", False)),
                         rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                         multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                        shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                         team_clearance_features=(
                             int(getattr(spec, "observation_schema_version", 1)) >= 6
                         ),

@@ -146,7 +146,11 @@ def _str_to_bool(value) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "t"}
 
 
+from basketworld_jax.shot_defense import SHOT_DEFENSE_DEFAULTS
+
+
 _JAX_MLFLOW_ENV_PARAM_CASTS = {
+    **{key: _str_to_bool if isinstance(value, bool) else float for key, value in SHOT_DEFENSE_DEFAULTS.items()},
     "training_team": str,
     "players": int,
     "court_rows": int,
@@ -154,6 +158,7 @@ _JAX_MLFLOW_ENV_PARAM_CASTS = {
     "shot_clock": int,
     "min_shot_clock": int,
     "allow_dunks": _str_to_bool,
+    "prefer_higher_percentage_shot": _str_to_bool,
     "layup_pct": float,
     "three_pt_pct": float,
     "dunk_pct": float,

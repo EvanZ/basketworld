@@ -164,7 +164,11 @@ class TrajectoryBatch(NamedTuple):
     terminal_episode_steps: Any
     offense_score_delta: Any
     defense_score_delta: Any
+    terminal_learner_score: Any = None
+    terminal_opponent_score: Any = None
+    learner_started_with_possession: Any = None
     terminal_learner_win_score: Any = None
+    shot_defense_diagnostics: Any = None
     pressure_diagnostics: Any = None
     learner_check_opportunities: Any = None
     opponent_check_opportunities: Any = None
@@ -294,6 +298,7 @@ class EvalTrace(NamedTuple):
     terminal_episode_steps: Any
     offense_score: Any
     defense_score: Any
+    shot_defense_diagnostics: Any = None
     pressure_diagnostics: Any = None
     learner_check_opportunities: Any = None
     opponent_check_opportunities: Any = None
@@ -389,6 +394,7 @@ class DeployEvalTotals(NamedTuple):
     regulation_segment_4_team_b_points: Any = 0.0
     overtime_team_a_points: Any = 0.0
     overtime_team_b_points: Any = 0.0
+    shot_defense_diagnostics: Any = None
     pressure_diagnostics: Any = None
     learner_check_opportunities: Any = 0.0
     opponent_check_opportunities: Any = 0.0

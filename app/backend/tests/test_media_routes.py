@@ -424,3 +424,22 @@ def test_all_gif_paths_use_dithered_color_conversion(export_client, endpoint):
         assert result.size == (160, 96)
         assert result.info["duration"] == 1000
         assert result.convert("RGB").tobytes() == expected
+
+@pytest.mark.parametrize("is_dunk,category", [(True, "dunk"), (False, "2pt"), (None, "dunk")])
+@pytest.mark.parametrize("export_path", ["frames", "pngs"])
+def test_basket_cell_export_respects_selected_shot_type(tmp_path, monkeypatch, is_dunk, category, export_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("BW_PUBLIC_MODE", raising=False)
+    shot = {"distance": 0, "is_three": False, "success": True}
+    if is_dunk is not None:
+        shot["is_dunk"] = is_dunk
+    monkeypatch.setattr(media_routes, "game_state", SimpleNamespace(
+        run_id=None, frames=[Image.new("RGB", (8, 8), "red")],
+        env=SimpleNamespace(last_action_results={"shots": {"0": shot}}),
+    ))
+    if export_path == "pngs":
+        path = media_routes._episode_png_output_path()
+    else:
+        monkeypatch.setattr(media_routes.imageio, "mimsave", lambda *args, **kwargs: None)
+        path = media_routes.save_episode()["file_path"]
+    assert path.endswith(f"made_unassisted_{category}.gif")

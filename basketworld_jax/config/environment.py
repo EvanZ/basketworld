@@ -62,6 +62,19 @@ class JaxEnvironmentConfig:
     ball_handling_skill_std: float = 0.0
     pressure_skill_effect_weight: float = 0.0
     shot_contest_skill_effect_weight: float = 0.0
+    rim_protection_enabled: bool = False
+    rim_protection_beta_alpha: float = 1.0
+    rim_protection_beta_beta: float = 3.0
+    rim_protection_block_distribution_max: float = 0.10
+    rim_protection_skill_block_reference: float = 0.02
+    rim_protection_block_base: float = 0.02
+    rim_protection_block_effect_weight: float = 1.0
+    rim_protection_contest_base: float = 0.25
+    rim_protection_contest_effect_weight: float = 0.5
+    contested_shooting_enabled: bool = False
+    contested_shooting_skill_mean: float = 0.0
+    contested_shooting_skill_std: float = 1.0
+    contested_shooting_effect_weight: float = 0.5
     base_steal_rate: float = 0.35
     steal_perp_decay: float = 1.5
     steal_distance_factor: float = 0.08
@@ -97,6 +110,7 @@ class JaxEnvironmentConfig:
     layup_std: float = 0.0
     three_pt_std: float = 0.0
     allow_dunks: bool = False
+    prefer_higher_percentage_shot: bool = False
     dunk_pct: float = 0.9
     dunk_std: float = 0.0
     three_second_lane_width: int = 1
@@ -201,6 +215,13 @@ class JaxEnvironmentConfig:
     random_check_location: bool = False
 
     def __post_init__(self) -> None:
+        from basketworld_jax.shot_defense import validate_shot_defense, shot_defense_enabled, SHOT_DEFENSE_OBSERVATION_SCHEMA_VERSION
+
+        validate_shot_defense(self)
+        if shot_defense_enabled(self):
+            if self.multi_possession_schema_version not in (None, SHOT_DEFENSE_OBSERVATION_SCHEMA_VERSION):
+                raise ValueError("Shot-defense skills require observation schema 7.")
+            object.__setattr__(self, "multi_possession_schema_version", SHOT_DEFENSE_OBSERVATION_SCHEMA_VERSION)
         positive = {
             "grid_size": self.grid_size,
             "court_rows": self.court_rows if self.court_rows is not None else self.grid_size,
@@ -425,6 +446,8 @@ def normalize_runtime_environment_config(
     config: JaxEnvironmentConfig,
 ) -> JaxEnvironmentConfig:
     """Map supported additive checkpoint schemas to the current JAX runtime."""
+    if config.rim_protection_enabled or config.contested_shooting_enabled:
+        return config
     if not bool(config.enable_multi_possession):
         return config
     runtime_schema = (

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from basketworld_jax.shot_defense import shot_defense_enabled, validate_trained_shot_defense
+
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
@@ -134,6 +136,7 @@ class JAXInferenceModel:
                 checkpoint_metadata=payload,
             )
         )
+        validate_trained_shot_defense(payload, self.environment_config)
         config_multi = bool(self.environment_config.enable_multi_possession)
         spec_multi = bool(getattr(self.spec, "multi_possession_features", False))
         if config_multi != spec_multi:
@@ -141,7 +144,7 @@ class JAXInferenceModel:
                 "JAX checkpoint policy_spec and environment metadata disagree on "
                 f"multi-possession observations (policy={spec_multi}, environment={config_multi})."
             )
-        if config_multi:
+        if config_multi and not shot_defense_enabled(self.environment_config):
             runtime_schema = int(
                 self.environment_config.multi_possession_schema_version
                 or (
@@ -291,6 +294,10 @@ class JAXInferenceModel:
         return static
 
     def _state_from_snapshot(self, snapshot):
+        if shot_defense_enabled(self.environment_config):
+            for field in ("rim_protection_skill", "contested_shooting_skill"):
+                if field not in snapshot:
+                    raise ValueError(f"Snapshot is missing persistent {field} for this policy.")
         return stack_state_snapshots([snapshot], self.jnp)
 
     def _snapshot_cache_key(self, source, observer_is_offense: bool, snapshot: dict[str, Any]):
@@ -308,6 +315,8 @@ class JAXInferenceModel:
             "ball_handling_skill",
             "passing_skill",
             "shot_contest_skill",
+            "rim_protection_skill",
+            "contested_shooting_skill",
         )
         scalar_keys = (
             "ball_holder",
@@ -332,7 +341,7 @@ class JAXInferenceModel:
             "defense_intent_age",
             "defense_intent_commitment_remaining",
         )
-        arrays = tuple(np.asarray(snapshot[key]).tobytes() for key in array_keys)
+        arrays = tuple(np.asarray(snapshot.get(key, [])).tobytes() for key in array_keys)
         scalars = tuple(snapshot[key] for key in scalar_keys)
         clearance = np.asarray(
             snapshot.get("offense_clearance", []), dtype=np.int8
@@ -386,6 +395,7 @@ class JAXInferenceModel:
             rebound_win_prob_features=bool(getattr(self.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(self.spec, "multi_possession_features", False)),
+            shooting_skill_features=int(getattr(self.spec, 'observation_schema_version', 1)) >= 7,
             team_clearance_features=(
                 int(getattr(self.spec, "observation_schema_version", 1)) >= 6
             ),
@@ -438,6 +448,7 @@ class JAXInferenceModel:
             rebound_win_prob_features=bool(getattr(self.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(self.spec, "multi_possession_features", False)),
+            shooting_skill_features=int(getattr(self.spec, 'observation_schema_version', 1)) >= 7,
             team_clearance_features=(
                 int(getattr(self.spec, "observation_schema_version", 1)) >= 6
             ),
@@ -468,6 +479,7 @@ class JAXInferenceModel:
             ),
             rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(self.spec, "multi_possession_features", False)),
+            shooting_skill_features=int(getattr(self.spec, 'observation_schema_version', 1)) >= 7,
             team_clearance_features=(
                 int(getattr(self.spec, "observation_schema_version", 1)) >= 6
             ),
@@ -501,6 +513,8 @@ class JAXInferenceModel:
                     "ball_handling_skill",
                     "passing_skill",
                     "shot_contest_skill",
+            "rim_protection_skill",
+            "contested_shooting_skill",
                 ]
             )
         global_labels = ["shot_clock_norm", "pressure_exposure", "hoop_q_norm", "hoop_r_norm"]
@@ -599,6 +613,7 @@ class JAXInferenceModel:
             rebound_win_prob_features=bool(getattr(self.spec, "rebound_win_prob_features", False)),
             rebound_target_observation_features=bool(getattr(self.spec, "rebound_target_observation_features", True)),
             multi_possession_features=bool(getattr(self.spec, "multi_possession_features", False)),
+            shooting_skill_features=int(getattr(self.spec, 'observation_schema_version', 1)) >= 7,
             team_clearance_features=(
                 int(getattr(self.spec, "observation_schema_version", 1)) >= 6
             ),

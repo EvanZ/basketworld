@@ -10,6 +10,7 @@ const {
   interactionHandDuration,
   interactionHandOpacity,
   interactionHandPairPose,
+  shotReleaseGesture,
 } = await import(
   `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
 );
@@ -84,4 +85,64 @@ test('jazz hand wiggle is deterministic from animation progress', () => {
 
   assert.equal(first.jazzAngleDeg, 7);
   assert.deepEqual(replay, first);
+});
+
+test('dunks lift both hands then slam down', () => {
+  const pose = (progress) => interactionHandPairPose({
+    center: { x: 50, y: 50 }, kind: 'dunk-release', playerRadius: 30, progress,
+  });
+  const start = pose(0);
+  const lifted = pose(0.25);
+  const slam = pose(0.55);
+  for (const frame of [start, lifted, slam]) {
+    assert.equal(frame.showLeft, true);
+    assert.equal(frame.showRight, true);
+    assert.equal(frame.leftBaseAngleDeg, -frame.rightBaseAngleDeg);
+    assert.equal(frame.jazzAngleDeg, 0);
+  }
+  assert.ok(lifted.verticalOffset < start.verticalOffset);
+  assert.ok(slam.verticalOffset > lifted.verticalOffset);
+});
+
+test('layups use only the hand nearest the basket on either side', () => {
+  for (const basketX of [0, 100]) {
+    const options = {
+      center: { x: 50, y: 50 }, basket: { x: basketX, y: 30 },
+      kind: 'layup-release', playerRadius: 30,
+    };
+    const start = interactionHandPairPose({ ...options, progress: 0 });
+    const release = interactionHandPairPose({ ...options, progress: 0.5 });
+    assert.equal(release.showLeft, basketX < 50);
+    assert.equal(release.showRight, basketX > 50);
+    assert.ok(release.sideOffset > start.sideOffset);
+    assert.ok(release.verticalOffset < start.verticalOffset);
+    assert.equal(release.jazzAngleDeg, 0);
+    assert.deepEqual(release, interactionHandPairPose({ ...options, progress: 0.5 }));
+  }
+});
+
+test('basket-cell layups have a stable single-hand tie-breaker', () => {
+  const pose = interactionHandPairPose({
+    center: { x: 50, y: 50 }, basket: { x: 50, y: 50 },
+    kind: 'layup-release', playerRadius: 30, progress: 0.4,
+  });
+  assert.equal(pose.showLeft, true);
+  assert.equal(pose.showRight, false);
+  assert.ok(Number.isFinite(pose.leftBaseAngleDeg));
+});
+
+test('selected shot determines the gesture for both live and captured frames', () => {
+  assert.equal(shotReleaseGesture(true, 0).kind, 'dunk-release');
+  assert.equal(shotReleaseGesture(false, 0).kind, 'layup-release');
+  assert.equal(shotReleaseGesture(false, 1).kind, 'layup-release');
+  assert.equal(shotReleaseGesture(false, 2).kind, 'shot-release');
+});
+
+test('a block swat raises only the basket-side hand', () => {
+  const base = { center: { x: 0, y: 0 }, basket: { x: -30, y: 0 }, playerRadius: 20, kind: 'block-swat' };
+  const early = interactionHandPairPose({ ...base, progress: 0 });
+  const reach = interactionHandPairPose({ ...base, progress: 0.4 });
+  assert.equal(reach.showLeft, true);
+  assert.equal(reach.showRight, false);
+  assert.ok(reach.verticalOffset < early.verticalOffset);
 });

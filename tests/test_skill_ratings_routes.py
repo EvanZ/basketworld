@@ -81,6 +81,10 @@ def test_report_payload_exposes_profiles_and_dynamic_skill_labels(
                 "coefficients": {
                     "new_skill": {
                         "net_rating_points_per_pool_standard_deviation": 2.5,
+                        "bootstrap_interval": {
+                            "per_pool_standard_deviation": {"p05": -0.5, "p95": 4.0},
+                            "successful_samples": 200,
+                        },
                         "pool_mean": 0.0,
                         "pool_standard_deviation": 1.0,
                     }
@@ -134,6 +138,14 @@ def test_report_payload_exposes_profiles_and_dynamic_skill_labels(
         "value": -0.25,
     }
     assert payload["skill_coefficients"][0]["net_rating_per_standard_deviation"] == 2.5
+    assert payload["skill_coefficients"][0]["interval_p05"] == -0.5
+    assert payload["skill_coefficients"][0]["interval_p95"] == 4.0
+    assert payload["skill_coefficients"][0]["bootstrap_successful_samples"] == 200
+    # Older immutable reports have no coefficient intervals; never invent zero bounds.
+    old_report = json.loads(report_path.read_text())
+    del old_report["direct_skill_ratings"]["coefficients"]["new_skill"]["bootstrap_interval"]
+    _write_json(report_path, old_report)
+    assert routes._ui_report(report_path)["skill_coefficients"][0]["interval_p05"] is None
     assert (
         payload["three_factors"]["unavailable_factors"]["free_throw_rate"]["status"]
         == "unavailable"

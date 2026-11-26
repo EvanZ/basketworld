@@ -34,6 +34,32 @@ The historical direction names remain in the enum. In the primary
 geometric directions. For each passer, teammates are sorted by player ID and
 assigned to available slots; unused slots are masked.
 
+## Under-basket shots
+
+Enable **Prefer higher-percentage layup or dunk** in the trainer UI (CLI:
+`--prefer-higher-percentage-shot`) to opt in. The default is disabled.
+With the flag enabled, at the basket cell, `SHOOT` chooses a dunk when dunks
+are enabled and the player's `dunk_pct` is at least their `layup_pct`.
+Otherwise it chooses a layup. Ties preserve the dunk path. The selected skill
+supplies the make probability, followed by the existing contest adjustment and probability
+clamping; both shots are worth two points. The shooter stays in the basket
+cell and no extra action is needed.
+
+Layups count as two-point attempts in training, evaluation, and replay
+diagnostics. The board animates a dunk with a two-handed slam and a layup
+with the hand closest to the basket (left when both hands are equally close).
+Other two-point shots keep their normal shooting motion.
+
+The flag `prefer_higher_percentage_shot` is saved in checkpoint environment
+metadata and MLflow parameters. The UI and evaluations use that saved value;
+the UI displays it in the environment information and shooting rules. Disabled
+or missing (older checkpoints) preserves automatic dunks at distance zero
+when dunks are allowed. Training resume rejects a changed flag. Policy tensors,
+action IDs, and observation shapes/schemas are unchanged. The visual hand
+motion follows the resulting shot type for both old and new checkpoints.
+New Skill Ratings event ledgers also correct the shot-type code mapping;
+historical immutable ledgers retain their originally recorded labels.
+
 ## Action masks
 
 Every player always has `NOOP`. Movement is legal when the neighboring axial
@@ -328,3 +354,14 @@ schema and ball-clearance violation consequences. Enabled runs train from scratc
 checkpoint resume restores the setting and latched flags. The trainer and native,
 historical, and interactive evaluation use the same rule. Existing pace metrics
 measure its effect without introducing a time-to-clearance metric.
+
+### Shot-defense skill schema 7
+
+A policy trained with rim protection or contested shooting uses observation
+schema 7. It retains the preceding clearance fields and adds the persistent
+`rim_protection_skill` and `contested_shooting_skill` player features in both
+flat and attention observations. An independently disabled skill is masked to
+zero. Checkpoints record the full rule/distribution contract in
+`observation_metadata.shot_defense_contract`; equal tensor dimensions do not
+permit different enabled flags or parameter meanings. Legacy policies keep
+their previous schema and mechanics.

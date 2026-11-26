@@ -24,6 +24,7 @@ import numpy as np
 
 from basketworld_jax.eval.fixed_pool import PlayerPool
 from basketworld_jax.eval.lineup_schedule import LineupSchedule
+from basketworld_jax.env.minimal import SHOT_TYPE_DUNK, SHOT_TYPE_THREE, SHOT_TYPE_TWO
 
 
 FIXED_POOL_STUDY_SCHEMA_VERSION = 1
@@ -160,6 +161,7 @@ def _study_id_payload(
     pool: PlayerPool,
     schedule: LineupSchedule,
     episode_rows: Sequence[Mapping[str, Any]],
+    environment_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not episode_rows:
         raise FixedPoolStudyArtifactError(
@@ -184,6 +186,8 @@ def _study_id_payload(
                 raise FixedPoolStudyArtifactError(
                     f"Fixed-pool episode rows disagree on study field {field!r}."
                 )
+    if environment_contract is not None:
+        metadata["environment_contract"] = _json_value(environment_contract)
     return {
         "study_schema_version": FIXED_POOL_STUDY_SCHEMA_VERSION,
         "pool_id": pool.pool_id,
@@ -196,10 +200,11 @@ def fixed_pool_study_id(
     pool: PlayerPool,
     schedule: LineupSchedule,
     episode_rows: Sequence[Mapping[str, Any]],
+    environment_contract: Mapping[str, Any] | None = None,
 ) -> str:
     """Return the deterministic identity for one raw fixed-pool study."""
     digest = hashlib.sha256(
-        _canonical_json(_study_id_payload(pool, schedule, episode_rows)).encode("utf-8")
+        _canonical_json(_study_id_payload(pool, schedule, episode_rows, environment_contract)).encode("utf-8")
     ).hexdigest()
     return f"fixed-pool-study-v{FIXED_POOL_STUDY_SCHEMA_VERSION}-{digest[:20]}"
 
@@ -250,8 +255,7 @@ def _turnover_reason_label(code: int | None) -> str | None:
 
 
 def _shot_type_label(code: int | None) -> str | None:
-    # The kernel uses zero for a two, one for a three, and two for a dunk.
-    return {0: "two", 1: "three", 2: "dunk"}.get(
+    return {SHOT_TYPE_DUNK: "dunk", SHOT_TYPE_TWO: "two", SHOT_TYPE_THREE: "three"}.get(
         code, "unknown" if code is not None else None
     )
 
@@ -496,7 +500,14 @@ def possession_event_rows_from_trace(
                     event_subtype=shot_data["shot_type"],
                     base={**base, **shot_data},
                     actor=actor,
-                    payload={"shot_type_code": shot_type_code},
+                    target=_player_fields(slot_player_map, _trace_value(trace, "shot_blocker", step_index, env_index, -1)),
+                    payload={
+                        "shot_type_code": shot_type_code,
+                        "blocked": bool(_trace_value(trace, "shot_blocked", step_index, env_index, 0)),
+                        "blocker_slot": int(_trace_value(trace, "shot_blocker", step_index, env_index, -1)),
+                        "block_probability": float(_trace_value(trace, "shot_block_probability", step_index, env_index, 0.0)),
+                        "conditional_probability": _trace_value(trace, "shot_conditional_probability", step_index, env_index, None),
+                    },
                 )
             )
 
@@ -981,6 +992,7 @@ def persist_fixed_pool_study_artifacts(
     possession_events: Sequence[Mapping[str, Any]],
     output_dir: str | Path,
     mlflow_client: Any | None = None,
+    environment_contract: Mapping[str, Any] | None = None,
 ) -> FixedPoolStudyArtifactPaths:
     """Write immutable raw artifacts and, optionally, mirror them to MLflow.
 
@@ -991,7 +1003,7 @@ def persist_fixed_pool_study_artifacts(
     """
     episode_rows = episode_rows_from_results(pool, schedule, episode_results)
     _validate_rows(episode_rows, fields=EPISODE_TABLE_FIELDS, table_name="episode")
-    study_id = fixed_pool_study_id(pool, schedule, episode_rows)
+    study_id = fixed_pool_study_id(pool, schedule, episode_rows, environment_contract)
     normalized_events: list[dict[str, Any]] = []
     expected_game_ids = {game.game_id for game in schedule.games}
     for raw_event in possession_events:
@@ -1007,7 +1019,7 @@ def persist_fixed_pool_study_artifacts(
     )
     for row in episode_rows:
         row["study_id"] = study_id
-    study_payload = _study_id_payload(pool, schedule, episode_rows)
+    study_payload = _study_id_payload(pool, schedule, episode_rows, environment_contract)
     manifest = {
         "schema_version": FIXED_POOL_STUDY_SCHEMA_VERSION,
         "study_id": study_id,
@@ -1019,6 +1031,7 @@ def persist_fixed_pool_study_artifacts(
         "schedule_id": schedule.schedule_id,
         "schedule_schema_version": int(schedule.schema_version),
         "study_identity": study_payload,
+        "environment_contract": _json_value(environment_contract),
         "tables": {
             "episodes": {
                 "path": "episodes.csv",
@@ -1113,6 +1126,7 @@ def _persist_fixed_pool_study_rows(
     possession_events: Sequence[Mapping[str, Any]],
     output_dir: str | Path,
     source_studies: Sequence[Mapping[str, Any]] | None = None,
+    environment_contract: Mapping[str, Any] | None = None,
 ) -> FixedPoolStudyArtifactPaths:
     """Persist already-materialized rows for a derived immutable study."""
     schedule_games = {game.game_id: game for game in schedule.games}
@@ -1172,12 +1186,12 @@ def _persist_fixed_pool_study_rows(
         table_name="derived possession ledger",
     )
 
-    study_id = fixed_pool_study_id(pool, schedule, normalized_rows)
+    study_id = fixed_pool_study_id(pool, schedule, normalized_rows, environment_contract)
     for row in normalized_rows:
         row["study_id"] = study_id
     for event in normalized_events:
         event["study_id"] = study_id
-    study_payload = _study_id_payload(pool, schedule, normalized_rows)
+    study_payload = _study_id_payload(pool, schedule, normalized_rows, environment_contract)
     manifest: dict[str, Any] = {
         "schema_version": FIXED_POOL_STUDY_SCHEMA_VERSION,
         "study_id": study_id,
@@ -1189,6 +1203,7 @@ def _persist_fixed_pool_study_rows(
         "schedule_id": schedule.schedule_id,
         "schedule_schema_version": int(schedule.schema_version),
         "study_identity": study_payload,
+        "environment_contract": _json_value(environment_contract),
         "tables": {
             "episodes": {
                 "path": "episodes.csv",
@@ -1297,6 +1312,16 @@ def combine_fixed_pool_study_artifacts(
     additional_metadata = (
         (additional["manifest"].get("study_identity") or {}).get("metadata") or {}
     )
+    base_contract = base["manifest"].get("environment_contract")
+    added_contract = additional["manifest"].get("environment_contract")
+    if base_contract != added_contract:
+        added_parameters = ((added_contract or {}).get("shot_defense") or {}).get("parameters") or {}
+        legacy_extension = base_contract is None and added_contract is not None and not (
+            added_parameters.get("rim_protection_enabled", False)
+            or added_parameters.get("contested_shooting_enabled", False)
+        )
+        if not legacy_extension:
+            raise FixedPoolStudyArtifactError("Extension evidence must use the same environment and shot-defense contract.")
     if any(
         _json_value(base_metadata.get(key)) != _json_value(additional_metadata.get(key))
         for key in metadata_keys
@@ -1316,6 +1341,7 @@ def combine_fixed_pool_study_artifacts(
         episode_rows=source_rows,
         possession_events=source_events,
         output_dir=output_dir,
+        environment_contract=base["manifest"].get("environment_contract"),
         source_studies=(
             {"role": "base", "study_id": base["manifest"].get("study_id"), "root": str(base_study_root)},
             {"role": "additional", "study_id": additional["manifest"].get("study_id"), "root": str(additional_study_root)},

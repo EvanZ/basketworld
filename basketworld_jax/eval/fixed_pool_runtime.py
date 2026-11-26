@@ -15,7 +15,7 @@ from basketworld_jax.eval.lineup_schedule import (
     ScheduledGame,
     validate_lineup_schedule,
 )
-from basketworld_jax.eval.skills import ACTIVE_PLAYER_SKILL_REGISTRY
+from basketworld_jax.eval.skills import registry_for_schema
 
 
 class FixedPoolRuntimeError(ValueError):
@@ -117,12 +117,13 @@ def build_fixed_pool_game_batch(
             f"Fixed-pool evaluation requires exactly {expected_team_size * 2} JAX player slots."
         )
 
+    registry = registry_for_schema(pool.skill_schema_version, pool.skill_schema_hash)
     players = {player.player_id: player for player in pool.players}
     skill_rows = {
         descriptor.key: np.empty(
             (len(selected_games), int(total_slots)), dtype=np.float32
         )
-        for descriptor in ACTIVE_PLAYER_SKILL_REGISTRY.descriptors
+        for descriptor in registry.descriptors
     }
     starting_team_codes = np.empty((len(selected_games),), dtype=np.int8)
     reset_rng_roots = np.empty((len(selected_games),), dtype=np.uint32)
@@ -145,7 +146,7 @@ def build_fixed_pool_game_batch(
                         f"Scheduled game {game.game_id!r} references unknown player "
                         f"{player_id!r}."
                     )
-                for descriptor in ACTIVE_PLAYER_SKILL_REGISTRY.descriptors:
+                for descriptor in registry.descriptors:
                     skill_rows[descriptor.key][row, slot] = np.float32(
                         player.skills[descriptor.key]
                     )

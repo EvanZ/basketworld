@@ -339,6 +339,10 @@ const usesLobAwarePassModel = computed(() => passInterceptionModel.value === 'lo
 
       <article class="env-card">
         <h4>Shot Parameters</h4>
+        <div class="param-row"><span>Trained rim protection</span><strong>{{ gameState.shot_defense_parameters?.rim_protection_enabled ? 'Enabled' : 'Disabled (legacy rules)' }}</strong></div>
+        <div class="param-row"><span>Trained contested shooting</span><strong>{{ gameState.shot_defense_parameters?.contested_shooting_enabled ? 'Enabled' : 'Disabled (legacy rules)' }}</strong></div>
+        <div class="param-row"><span>Neutral adjacent block chance</span><strong>{{ formatPercent(gameState.shot_defense_parameters?.rim_protection_block_base) }}</strong></div>
+        <div class="param-row"><span>Neutral rim suppression</span><strong>{{ formatPercent(gameState.shot_defense_parameters?.rim_protection_contest_base) }}</strong></div>
         <div class="param-row"><span>Layup μ</span><strong>{{ formatPercent(gameState.shot_params?.layup_pct) }}</strong></div>
         <div class="param-row"><span>Layup σ</span><strong>{{ formatPercent(gameState.shot_params?.layup_std) }}</strong></div>
         <div class="param-row"><span>Three-point μ</span><strong>{{ formatPercent(gameState.shot_params?.three_pt_pct) }}</strong></div>
@@ -346,6 +350,7 @@ const usesLobAwarePassModel = computed(() => passInterceptionModel.value === 'lo
         <div class="param-row"><span>Dunk μ</span><strong>{{ formatPercent(gameState.shot_params?.dunk_pct) }}</strong></div>
         <div class="param-row"><span>Dunk σ</span><strong>{{ formatPercent(gameState.shot_params?.dunk_std) }}</strong></div>
         <div class="param-row"><span>Dunks allowed</span><strong>{{ gameState.shot_params?.allow_dunks ? 'Yes' : 'No' }}</strong></div>
+        <div class="param-row"><span>Prefer higher-percentage shot</span><strong>{{ gameState.shot_params?.prefer_higher_percentage_shot ? 'Yes' : 'No' }}</strong></div>
       </article>
     </div>
   </section>

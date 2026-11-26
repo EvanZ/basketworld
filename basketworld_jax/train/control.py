@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from basketworld_jax.scoring_metrics import SCORING_METRIC_SCHEMA_VERSION
+
 
 CONTROL_ACTIONS = frozenset({"checkpoint", "pause"})
 
@@ -94,9 +96,13 @@ def write_training_status(
         value = (metrics or {}).get(key)
         if isinstance(value, (int, float)):
             summary[key] = float(value)
+    for key, value in (metrics or {}).items():
+        if key.startswith(("learner_points_", "learner_score_", "learner_completed_game_")) or key in {"completed_game_count", "truncated_game_count"}:
+            summary[key] = value
     atomic_write_json(
         path,
         {
+            "scoring_metric_schema_version": SCORING_METRIC_SCHEMA_VERSION,
             "state": str(state),
             "completed_updates": int(completed_updates),
             "target_updates": int(target_updates),

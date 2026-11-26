@@ -21,13 +21,15 @@ def _valid_profile() -> dict[str, float]:
         "steal": 0.15,
         "ball_handling": 0.25,
         "passing": -0.05,
+        "rim_protection": 0.2,
+        "contested_shooting": -0.3,
     }
 
 
 def test_active_registry_has_a_stable_hashed_schema():
     payload = ACTIVE_PLAYER_SKILL_REGISTRY.schema_payload()
 
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert [item["key"] for item in payload["skills"]] == sorted(_valid_profile())
     assert len(ACTIVE_PLAYER_SKILL_REGISTRY.schema_hash) == 64
     assert (
@@ -83,3 +85,13 @@ def test_registry_drives_a_synthetic_extra_numeric_skill():
 
     assert normalized["contest"] == 0.75
     assert extended.schema_hash != ACTIVE_PLAYER_SKILL_REGISTRY.schema_hash
+
+
+def test_legacy_pool_load_does_not_invent_new_skills():
+    from basketworld_jax.eval.skills import LEGACY_PLAYER_SKILL_REGISTRY
+    from basketworld_jax.eval.fixed_pool import PlayerPool, generate_player_pool, assert_pool_compatible
+    pool=generate_player_pool(player_count=10,seed=84,registry=LEGACY_PLAYER_SKILL_REGISTRY)
+    loaded=PlayerPool.from_payload(pool.to_payload())
+    assert_pool_compatible(loaded)
+    assert loaded.to_payload() == pool.to_payload()
+    assert all('rim_protection' not in player.skills for player in loaded.players)

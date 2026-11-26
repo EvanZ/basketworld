@@ -20,6 +20,16 @@ target_probs[shot_type, shot_cell, target_cell]
 Shot types are dunk, two-point shot, and three-point shot. Symmetry and
 canonical-cell lookup are resolved before JIT compilation.
 
+The basket cell has separate dunk and two-point rows. The dunk row retains
+its fitted distribution. With `prefer_higher_percentage_shot` enabled,
+for an under-basket layup, the two-point row is the
+normalized equal mixture of all legal distance-one shot-cell distributions.
+Those cells use `layup_pct`; each retains its fitted layup or finger-roll
+geometry and reflected target locations. They are virtual shot origins only:
+the shooter remains at the basket. The mixture is precomputed once and used
+by both pre-shot observation features and target sampling after a miss.
+Uniform mixing and temperature are applied afterward as usual.
+
 `--enable-rebounds` requires `--rebound-table-model-dir`; the trainer rejects a
 missing artifact instead of silently inventing a distribution.
 

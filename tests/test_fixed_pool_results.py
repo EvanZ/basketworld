@@ -17,6 +17,7 @@ from basketworld_jax.eval.fixed_pool_results import (
     possession_event_rows_from_trace,
 )
 from basketworld_jax.eval.lineup_schedule import build_balanced_lineup_schedule
+from basketworld_jax.env.minimal import SHOT_TYPE_DUNK, SHOT_TYPE_THREE, SHOT_TYPE_TWO
 from basketworld_jax.eval.skills import (
     ACTIVE_PLAYER_SKILL_REGISTRY,
     PlayerSkillDescriptor,
@@ -96,7 +97,7 @@ def _event_trace():
         "shot_value": values(0.0, 2.0),
         "shot_expected_points": values(0.0, 1.4),
         "shot_distance": values(0.0, 3.0),
-        "shot_type": values(-1, 0),
+        "shot_type": values(-1, SHOT_TYPE_TWO),
         "pass_attempts": values(1, 0),
         "pass_passer": values(0, -1),
         "pass_receiver": values(1, -1),
@@ -205,11 +206,18 @@ def test_fixed_pool_artifact_round_trip_normalizes_scores_and_isolates_namespace
     assert repeated.root == paths.root
 
 
-def test_possession_ledger_captures_required_events_and_named_players():
+@pytest.mark.parametrize(
+    "shot_type,label",
+    [(SHOT_TYPE_DUNK, "dunk"), (SHOT_TYPE_TWO, "two"), (SHOT_TYPE_THREE, "three")],
+)
+def test_possession_ledger_captures_required_events_and_named_players(shot_type, label):
     pool, schedule = _study_inputs()
     game = schedule.games[0]
+    trace = _event_trace()
+    trace["shot_type"][1, 0] = shot_type
+    trace["shot_distance"][1, 0] = 5 if shot_type == SHOT_TYPE_THREE else 0
     events = possession_event_rows_from_trace(
-        _event_trace(),
+        trace,
         env_index=0,
         active_steps=2,
         episode=1,
@@ -234,6 +242,7 @@ def test_possession_ledger_captures_required_events_and_named_players():
     }
     assert all(set(event) == set(EVENT_LEDGER_FIELDS) for event in events)
     shot = next(event for event in events if event["event_type"] == "shot")
+    assert shot["shot_type"] == label
     assert shot["actor_player_id"] == game.team_a_player_ids[2]
     assert shot["shot_expected_points"] == pytest.approx(1.4)
     turnover = next(event for event in events if event["event_type"] == "turnover")
@@ -364,3 +373,12 @@ def test_event_attribution_uses_roster_size_for_both_teams(team_size):
     turnover = next(event for event in events if event["event_type"] == "turnover")
     assert turnover["actor_player_id"] == game.team_a_player_ids[-1]
     assert turnover["target_player_id"] == game.team_b_player_ids[0]
+
+
+def test_shot_defense_contract_changes_immutable_study_identity(tmp_path):
+    pool,schedule=_study_inputs()
+    episodes=[_episode_result(pool,schedule,i) for i in range(2)]
+    first=persist_fixed_pool_study_artifacts(pool=pool,schedule=schedule,episode_results=episodes,possession_events=[],output_dir=tmp_path,environment_contract={'shot_defense':{'parameters':{'rim_protection_enabled':False}}})
+    second=persist_fixed_pool_study_artifacts(pool=pool,schedule=schedule,episode_results=episodes,possession_events=[],output_dir=tmp_path,environment_contract={'shot_defense':{'parameters':{'rim_protection_enabled':True}}})
+    assert first.study_id != second.study_id
+    assert load_fixed_pool_study_artifacts(first.root)['manifest']['environment_contract']['shot_defense']['parameters']['rim_protection_enabled'] is False

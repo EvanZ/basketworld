@@ -51,8 +51,18 @@ The first component applies on the attempt; the second applies only on a make.
 
 ### Defensive lane violation
 
-A defensive lane violation adds `violation_reward` to the offense perspective,
-increments the offense score by one, and terminates the episode.
+A defensive lane violation awards the offense one point and restarts the same
+possession. With inbounds enabled, play resumes from the sideline; otherwise
+the offense receives a direct handoff. The shot clock retains its pre-whistle
+value or resets to 14, whichever is greater (capped by the configured maximum).
+Legacy reward mode adds `violation_reward` to the offense perspective; scoring
+and win/loss modes use their configured game objectives.
+
+The defensive technical takes priority over a turnover on the same step.
+An interrupted pass is canceled: it earns no pass bonus and records no pass
+attempt, completion, turnover, or steal. The possession remains open, including
+any outstanding rebound reward advance. These rules are shared by JAX training,
+evaluation, and the dev UI.
 
 ### Check-clearance violation
 

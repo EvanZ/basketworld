@@ -1,4 +1,5 @@
 const EPISODE_SKILL_FIELDS = [
+  'shot_defense_parameters',
   'player_episode_skills',
   'player_rebound_skills',
   'player_shooting_skills',

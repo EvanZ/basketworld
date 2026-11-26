@@ -79,7 +79,9 @@ cell, movement mask, lane mask, and shot classification is compiled into
 lookup arrays in the same cell order.
 
 When dunks are disabled, the basket cell cannot be entered. When dunks are
-enabled, occupying the basket cell creates the distance-zero dunk opportunity.
+enabled, occupying the basket cell creates a distance-zero dunk or layup
+opportunity. With `prefer_higher_percentage_shot` enabled, choose the higher
+skill, with ties going to a dunk. Disabled or missing preserves automatic dunks.
 
 ## Three-point geometry
 

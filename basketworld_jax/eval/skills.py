@@ -17,7 +17,7 @@ import math
 from typing import Any, Mapping
 
 
-PLAYER_SKILL_SCHEMA_VERSION = 1
+PLAYER_SKILL_SCHEMA_VERSION = 2
 
 
 class PlayerSkillValidationError(ValueError):
@@ -188,8 +188,8 @@ def _sampling_defaults(**values: Any) -> tuple[tuple[str, Any], ...]:
     return tuple(sorted(values.items()))
 
 
-ACTIVE_PLAYER_SKILL_REGISTRY = PlayerSkillRegistry(
-    schema_version=PLAYER_SKILL_SCHEMA_VERSION,
+LEGACY_PLAYER_SKILL_REGISTRY = PlayerSkillRegistry(
+    schema_version=1,
     descriptors=(
         PlayerSkillDescriptor(
             key="layup",
@@ -336,3 +336,41 @@ ACTIVE_PLAYER_SKILL_REGISTRY = PlayerSkillRegistry(
         ),
     ),
 )
+
+
+ACTIVE_PLAYER_SKILL_REGISTRY = PlayerSkillRegistry(
+    schema_version=PLAYER_SKILL_SCHEMA_VERSION,
+    descriptors=(*LEGACY_PLAYER_SKILL_REGISTRY.descriptors,
+        PlayerSkillDescriptor(
+            key="rim_protection", display_label="Rim Protection", numeric_type="float",
+            minimum=None, maximum=None, sampling_distribution="scaled_beta_logit_centered",
+            sampling_defaults=_sampling_defaults(alpha=1.0, beta=3.0, maximum=0.10, reference=0.02),
+            semantic_group="defense", runtime_field="rim_protection_skill",
+        ),
+        PlayerSkillDescriptor(
+            key="contested_shooting", display_label="Contested Shooting", numeric_type="float",
+            minimum=None, maximum=None, sampling_distribution="normal",
+            sampling_defaults=_sampling_defaults(default_mean=0.0, default_std=1.0,
+                mean_field="contested_shooting_skill_mean", std_field="contested_shooting_skill_std"),
+            semantic_group="offense", runtime_field="contested_shooting_skill",
+        ),
+    ),
+)
+
+
+def registry_for_schema(version, schema_hash):
+    for registry in (LEGACY_PLAYER_SKILL_REGISTRY, ACTIVE_PLAYER_SKILL_REGISTRY):
+        if int(version) == registry.schema_version and schema_hash == registry.schema_hash:
+            return registry
+    raise PlayerSkillValidationError("Unknown player skill schema; an explicit compatible registry is required.")
+
+
+def registry_for_environment(environment):
+    """Select a new pool's skills from the checkpoint's trained rules."""
+    from basketworld_jax.shot_defense import shot_defense_enabled
+
+    return (
+        ACTIVE_PLAYER_SKILL_REGISTRY
+        if shot_defense_enabled(environment or {})
+        else LEGACY_PLAYER_SKILL_REGISTRY
+    )

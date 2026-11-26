@@ -19,6 +19,16 @@ if __package__ in (None, ""):
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
+from basketworld_jax.scoring_metrics import (
+    SCORING_METRIC_SCHEMA_VERSION,
+    summarize_training_scoring,
+    summarize_learner_games,
+    separate_scoring_diagnostics,
+    retired_scoring_metric,
+    artifact_scoring_metric,
+    ratio as scoring_ratio,
+)
+
 from basketworld_jax.train.pfsp import (
     PFSPState,
     opponent_id,
@@ -29,6 +39,7 @@ from basketworld_jax.train.opponent_cache import (
     validate_cache_config,
 )
 from basketworld_jax.train.pressure_metrics import summarize_pressure_diagnostics
+from basketworld_jax.shot_defense_metrics import summarize_shot_defense_diagnostics
 
 from basketworld.utils.mlflow_config import setup_mlflow
 from basketworld.utils.play_names import (
@@ -50,6 +61,7 @@ from basketworld_jax.eval.artifacts import (
     write_historical_artifact,
 )
 from basketworld_jax.config import TRAIN_FROZEN_VALUES, JaxEnvironmentConfig
+from basketworld_jax.shot_defense import (SHOT_DEFENSE_DEFAULTS, SHOT_DEFENSE_OBSERVATION_SCHEMA_VERSION, shot_defense_enabled, shot_defense_values, shot_defense_contract, validate_shot_defense, validate_trained_shot_defense)
 from basketworld_jax.provenance import (
     capture_source_provenance,
     resume_config_snapshot,
@@ -177,6 +189,7 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
         "defender_pressure_decay_lambda",
         "pressure_skill_mean",
         "pressure_skill_std",
+        *SHOT_DEFENSE_DEFAULTS,
         "shot_contest_skill_mean",
         "shot_contest_skill_std",
         "ball_handling_skill_mean",
@@ -309,6 +322,7 @@ JAX_ALLOWED_ENV_OVERRIDE_KEYS = frozenset(
     }
 )
 JAX_ENV_MLFLOW_PARAM_KEYS = (
+    *SHOT_DEFENSE_DEFAULTS,
     "training_team",
     "players",
     "court_rows",
@@ -316,6 +330,7 @@ JAX_ENV_MLFLOW_PARAM_KEYS = (
     "shot_clock",
     "min_shot_clock",
     "allow_dunks",
+    "prefer_higher_percentage_shot",
     "layup_pct",
     "three_pt_pct",
     "dunk_pct",
@@ -1360,6 +1375,16 @@ def build_train_parser():
         ),
     )
     parser.add_argument(
+        "--prefer-higher-percentage-shot",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "At the basket, choose a layup when layup skill exceeds dunk skill; "
+            "ties choose dunk. Saved with the checkpoint for evaluation and UI. "
+            "Disabled preserves automatic dunks when dunks are allowed."
+        ),
+    )
+    parser.add_argument(
         "--require-all-offense-clear",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1765,6 +1790,10 @@ def _values_match(actual: Any, expected: Any) -> bool:
 
 
 def validate_train_args(args) -> None:
+    try:
+        validate_shot_defense(shot_defense_values(args))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     try:
         validate_cache_config(
             getattr(args, "opponent_snapshot_every_updates", 0),
@@ -2385,6 +2414,8 @@ def _jax_env_config_from_args(args) -> dict[str, Any]:
         )
         if bool(getattr(args, "enable_multi_possession", False)) else 1
     )
+    if shot_defense_enabled(args):
+        config["multi_possession_schema_version"] = SHOT_DEFENSE_OBSERVATION_SCHEMA_VERSION
     return config
 
 
@@ -2401,6 +2432,7 @@ def _effective_env_config_from_args(args) -> dict[str, Any]:
 
 
 _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
+    **SHOT_DEFENSE_DEFAULTS,
     "rebound_skill_sampling_mode": "gaussian",
     "rebound_skill_high": 1.0,
     "rebound_skill_low": -0.25,
@@ -2430,6 +2462,7 @@ _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS = {
     "check_setup_steps": 0,
     "check_clearance": 0,
     "require_all_offense_clear": False,
+    "prefer_higher_percentage_shot": False,
     "random_check_location": False,
     "pressure_skill_mean": 0.0,
     "pressure_skill_std": 0.0,
@@ -2453,7 +2486,7 @@ def _compatible_env_config_for_resume(
     out = dict(actual or {})
     for key in _RESUME_ENV_CONFIG_ADDITIVE_DEFAULTS:
         if key not in out and key in expected:
-            if key == "require_all_offense_clear":
+            if key in {"require_all_offense_clear", "prefer_higher_percentage_shot"}:
                 out[key] = False
             elif key == "made_basket_restart_mode":
                 out[key] = (
@@ -2469,9 +2502,24 @@ def _compatible_env_config_for_resume(
 def _validate_checkpoint_episode_semantics(
     payload: dict[str, Any], *, args, context: str
 ) -> None:
-    """Reject silent reuse across same-width possession/clock observations."""
+    """Reject silent reuse across differing shot rules or episode semantics."""
+    try:
+        validate_trained_shot_defense(payload, args)
+    except ValueError as exc:
+        raise SystemExit(f"{context}: {exc}") from exc
     effective = dict(payload.get("effective_env_config", {}) or {})
     recorded = dict(payload.get("env_config", {}) or {})
+    actual_shot_rule = False
+    for source in ("frozen_config", "trainer_config", "env_config", "effective_env_config"):
+        values = payload.get(source) or {}
+        if "prefer_higher_percentage_shot" in values:
+            actual_shot_rule = bool(values["prefer_higher_percentage_shot"])
+    expected_shot_rule = bool(getattr(args, "prefer_higher_percentage_shot", False))
+    if actual_shot_rule != expected_shot_rule:
+        raise SystemExit(
+            f"{context} uses prefer_higher_percentage_shot={actual_shot_rule}, "
+            f"but the current run uses {expected_shot_rule}; refusing to change trained shot semantics."
+        )
     actual_mode = str(
         effective.get(
             "episode_end_mode",
@@ -2861,6 +2909,7 @@ def _checkpoint_trainer_config_from_args(
         "rebound_skill_std": float(getattr(args, "rebound_skill_std", 0.0)),
         "pressure_skill_mean": float(getattr(args, "pressure_skill_mean", 0.0)),
         "pressure_skill_std": float(getattr(args, "pressure_skill_std", 0.0)),
+        **shot_defense_values(args),
         "shot_contest_skill_mean": float(
             getattr(args, "shot_contest_skill_mean", 0.0)
         ),
@@ -2942,15 +2991,18 @@ def _build_policy_spec(
         int(getattr(args, "check_clearance", 0)) > 0
         or bool(getattr(args, "require_all_offense_clear", False))
     )
-    team_clearance_features = multi_possession_features and bool(
+    shooting_skill_features = shot_defense_enabled(args)
+    check_clearance_features = check_clearance_features or (multi_possession_features and shooting_skill_features)
+    team_clearance_features = shooting_skill_features or (multi_possession_features and bool(
         getattr(args, "require_all_offense_clear", False)
-    )
+    ))
     token_dim, global_dim = token_observation_dims(
         rebound_win_prob_features,
         rebound_target_observation_features,
         multi_possession_features,
         check_clearance_features,
         team_clearance_features,
+        shooting_skill_features,
     )
     return build_actor_critic_spec(
         flat_obs_np,
@@ -2995,16 +3047,10 @@ def _build_policy_spec(
         rebound_critic_enabled=bool(getattr(args, "rebound_critic_enabled", False)),
         multi_possession_features=multi_possession_features,
         observation_schema_version=(
-            (
-                TEAM_CLEARANCE_OBSERVATION_SCHEMA_VERSION
-                if team_clearance_features
-                else (
-                    CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION
-                    if check_clearance_features
-                    else MULTI_POSSESSION_SCHEMA_VERSION
-                )
-            )
-            if multi_possession_features else 1
+            SHOT_DEFENSE_OBSERVATION_SCHEMA_VERSION if shooting_skill_features else
+            ((TEAM_CLEARANCE_OBSERVATION_SCHEMA_VERSION if team_clearance_features else
+              CHECK_CLEARANCE_OBSERVATION_SCHEMA_VERSION if check_clearance_features else
+              MULTI_POSSESSION_SCHEMA_VERSION) if multi_possession_features else 1)
         ),
     )
 
@@ -3093,6 +3139,7 @@ def _checkpoint_observation_metadata(
         ),
         multi_possession_features=bool(spec.multi_possession_features),
         episode_end_mode=mode,
+        shooting_skill_features=int(spec.observation_schema_version) >= 7,
         team_clearance_features=(
             int(spec.observation_schema_version)
             >= TEAM_CLEARANCE_OBSERVATION_SCHEMA_VERSION
@@ -3103,6 +3150,7 @@ def _checkpoint_observation_metadata(
         ),
     )
     metadata = {
+        "shot_defense_contract": shot_defense_contract(args),
         "schema_version": int(spec.observation_schema_version),
         "player_labels": list(player_labels),
         "global_labels": list(global_labels),
@@ -3254,6 +3302,15 @@ def _validate_resume_checkpoint_payload(
                     raise SystemExit(
                         f"Resume checkpoint {name} is missing per-player offense clearance state."
                     )
+    if shot_defense_enabled(args):
+        for name in ("current_state", "eval_initial_state"):
+            states = payload.get(name, {})
+            entries = states.values() if isinstance(states, dict) and "positions" not in states else (states,)
+            for state in entries:
+                get = state.get if isinstance(state, dict) else lambda key: getattr(state, key, None)
+                for field in ("rim_protection_skill", "contested_shooting_skill"):
+                    if get(field) is None or np.shape(get(field)) != np.shape(get("positions"))[:-1]:
+                        raise SystemExit(f"Resume checkpoint {name} is missing valid {field}; persistent player skills cannot be resampled.")
     expected_trainer_config = asdict(trainer_config)
     actual_trainer_config = dict(payload.get("trainer_config", {}))
     compatible_keys = [
@@ -4215,6 +4272,7 @@ def _log_mlflow_params(
         "jax/rebound_skill_std": float(getattr(args, "rebound_skill_std", 0.0)),
         "jax/pressure_skill_mean": float(getattr(args, "pressure_skill_mean", 0.0)),
         "jax/pressure_skill_std": float(getattr(args, "pressure_skill_std", 0.0)),
+        **{f"jax/{key}": value for key, value in shot_defense_values(args).items()},
         "jax/shot_contest_skill_mean": float(
             getattr(args, "shot_contest_skill_mean", 0.0)
         ),
@@ -4482,6 +4540,7 @@ def _log_mlflow_params(
         params["jax/observation/score_difference_normalization"] = float(
             GAME_CLOCK_SCORE_DIFFERENCE_NORMALIZATION
         )
+    params[f"jax/scoring_metric_schema/v{SCORING_METRIC_SCHEMA_VERSION}"] = True
     mlflow.log_params(params)
 
 
@@ -4566,16 +4625,10 @@ _CORE_TRAIN_METRICS = frozenset(
         "check_space_defense_violation_count",
         "check_space_defense_violation_rate",
         "clearance_elapsed_steps_mean",
-        "offense_learner_points_per_completed_episode",
-        "offense_opponent_points_per_completed_episode",
-        "defense_learner_points_per_completed_episode",
-        "defense_opponent_points_per_completed_episode",
+        "learner_points_scored_per_completed_game",
+        "learner_points_allowed_per_completed_game",
         "offense_truncated_episode_count",
         "defense_truncated_episode_count",
-        "offense_learner_offensive_efficiency",
-        "offense_opponent_offensive_efficiency",
-        "defense_learner_offensive_efficiency",
-        "defense_opponent_offensive_efficiency",
         "offense_learner_pace_possessions_per_game_minute",
         "offense_opponent_pace_possessions_per_game_minute",
         "defense_learner_pace_possessions_per_game_minute",
@@ -4594,22 +4647,6 @@ _CORE_TRAIN_METRICS = frozenset(
         "defense_mean_overtime_periods",
         "offense_mean_terminal_game_clock_seconds_remaining",
         "defense_mean_terminal_game_clock_seconds_remaining",
-        "offense_overtime_team_a_points",
-        "offense_overtime_team_b_points",
-        "offense_overtime_point_differential",
-        "defense_overtime_team_a_points",
-        "defense_overtime_team_b_points",
-        "defense_overtime_point_differential",
-        *(
-            f"{role}_regulation_segment_{segment}_{metric}"
-            for role in ("offense", "defense")
-            for segment in range(1, 5)
-            for metric in (
-                "team_a_points",
-                "team_b_points",
-                "point_differential",
-            )
-        ),
         "offense_learner_mean_reward",
         "offense_opponent_mean_reward",
         "defense_learner_mean_reward",
@@ -4752,9 +4789,6 @@ _CORE_DEPLOY_METRICS = frozenset(
         "mean_completed_episode_length",
         "completed_possession_count",
         "mean_live_steps_per_completed_possession",
-        "mean_offense_score",
-        "mean_defense_score",
-        "mean_score_margin",
         "mean_game_reward_per_episode",
         "mean_offense_reward_per_episode",
         "mean_defense_reward_per_episode",
@@ -4802,6 +4836,13 @@ def _filter_mlflow_train_metrics(
     *,
     profile: str = "core",
 ) -> dict[str, Any]:
+    metrics = {
+        key: value
+        for key, value in metrics.items()
+        if not retired_scoring_metric(key)
+        and not artifact_scoring_metric(key)
+        and key != "scoring_diagnostics"
+    }
     if profile == "full":
         return dict(metrics)
     if profile != "core":
@@ -4809,7 +4850,27 @@ def _filter_mlflow_train_metrics(
     return {
         key: value
         for key, value in metrics.items()
-        if key in _CORE_TRAIN_METRICS
+        if key in {"blocks", "learner_blocks", "opponent_blocks", "blocks_per_completed_possession"}
+        or "shot_defense_" in key
+        or key in _CORE_TRAIN_METRICS
+        or key.startswith(
+            (
+                "learner_points_",
+                "learner_completed_",
+                "learner_score_",
+                "learner_roster_assignment_",
+                "learner_started_with_possession_",
+                "opponent_started_with_possession_",
+                "roster_assignment_",
+                "opening_possession_",
+            )
+        )
+        or key
+        in {
+            "completed_game_count",
+            "truncated_game_count",
+            "scoring_metric_schema_version",
+        }
         or key.startswith(("pfsp/", "pressure/", "opponent_cache/"))
     }
 
@@ -4819,6 +4880,13 @@ def _filter_mlflow_deploy_metrics(
     *,
     profile: str = "core",
 ) -> dict[str, Any]:
+    metrics = {
+        key: value
+        for key, value in metrics.items()
+        if not retired_scoring_metric(key)
+        and not artifact_scoring_metric(key)
+        and key != "scoring_diagnostics"
+    }
     if profile == "full":
         return dict(metrics)
     if profile != "core":
@@ -4828,7 +4896,16 @@ def _filter_mlflow_deploy_metrics(
     return {
         key: value
         for key, value in metrics.items()
-        if key in _CORE_DEPLOY_METRICS or key.startswith(("clock_", "pressure/"))
+        if key in {"blocks", "learner_blocks", "opponent_blocks", "blocks_per_completed_possession"}
+        or "shot_defense_" in key
+        or key in _CORE_DEPLOY_METRICS
+        or key.startswith(("clock_", "pressure/", "self_play_", "roster_assignment_"))
+        or key
+        in {
+            "completed_game_count",
+            "truncated_game_count",
+            "scoring_metric_schema_version",
+        }
     }
 
 
@@ -5160,11 +5237,11 @@ def _summarize_historical_match(
             completed_possessions,
         ),
         "completed_possession_count": completed_possessions,
-        "candidate_points_per_completed_possession": _rate(
+        "candidate_points_per_completed_offensive_possession": _rate(
             candidate_score_total,
             candidate_completed_possessions,
         ),
-        "opponent_points_per_completed_possession": _rate(
+        "opponent_points_per_completed_offensive_possession": _rate(
             opponent_score_total,
             opponent_completed_possessions,
         ),
@@ -5471,6 +5548,7 @@ def _summarize_historical_match(
     ]
 
     return {
+        "scoring_metric_schema_version": SCORING_METRIC_SCHEMA_VERSION,
         "candidate_update": int(candidate_update),
         "opponent_update": int(opponent_update),
         "self_match": bool(candidate_update == opponent_update),
@@ -5502,6 +5580,64 @@ def _summarize_historical_match(
         "horizon": int(horizon),
         "action_mode": "deterministic",
     }
+
+
+def _historical_scoring_mlflow_metrics(match, opponent_key):
+    """Only completed-game scores, denominators, and small fairness splits."""
+    values = {
+        "candidate_points_per_completed_game": match["mean_candidate_score"],
+        "opponent_points_per_completed_game": match["mean_opponent_score"],
+        "candidate_score_margin_per_completed_game": match[
+            "mean_candidate_point_differential"
+        ],
+        "candidate_win_rate": match["candidate_win_rate"],
+        "candidate_points_per_completed_offensive_possession": match[
+            "candidate_points_per_completed_offensive_possession"
+        ],
+        "opponent_points_per_completed_offensive_possession": match[
+            "opponent_points_per_completed_offensive_possession"
+        ],
+        "candidate_completed_offensive_possession_count": match[
+            "candidate_completed_possession_count"
+        ],
+        "opponent_completed_offensive_possession_count": match[
+            "opponent_completed_possession_count"
+        ],
+    }
+    for source, names in (
+        (
+            "team_assignment_summaries",
+            {
+                "candidate_team_a": "candidate_roster_slot_a",
+                "candidate_team_b": "candidate_roster_slot_b",
+            },
+        ),
+        (
+            "starting_possession_summaries",
+            {
+                "candidate_started_with_possession": "candidate_started_with_possession",
+                "opponent_started_with_possession": "opponent_started_with_possession",
+            },
+        ),
+    ):
+        margins = []
+        for old, new in names.items():
+            split = match[source][old]
+            values[f"{new}_completed_game_count"] = split["completed_episode_count"]
+            values[f"{new}_score_margin_per_completed_game"] = split[
+                "mean_candidate_point_differential"
+            ]
+            values[f"{new}_win_score"] = split["w_eval"]
+            margins.append(split["mean_candidate_point_differential"])
+        name = (
+            "roster_assignment"
+            if source == "team_assignment_summaries"
+            else "opening_possession"
+        )
+        values[f"{name}_score_margin_delta"] = (
+            margins[0] - margins[1] if all(v is not None for v in margins) else None
+        )
+    return {f"{key}/{opponent_key}": value for key, value in values.items()}
 
 
 def _run_historical_match_evaluation(
@@ -5598,6 +5734,7 @@ def _historical_eval_artifact_payload(
 ) -> dict[str, Any]:
     return {
         "schema_version": 3,
+        "scoring_metric_schema_version": SCORING_METRIC_SCHEMA_VERSION,
         "milestone_updates": [int(update) for update in milestone_updates],
         "milestone_checkpoints": {
             str(int(update)): dict(record)
@@ -5662,6 +5799,7 @@ def _historical_eval_update_artifact_payload(
     opponent_updates = sorted({int(record["opponent_update"]) for record in matches})
     return {
         "schema_version": 2,
+        "scoring_metric_schema_version": SCORING_METRIC_SCHEMA_VERSION,
         "candidate_update": candidate_update,
         "candidate_checkpoint": dict(milestone_records[candidate_update]),
         "evaluated_opponent_updates": opponent_updates,
@@ -6993,24 +7131,10 @@ def _summarize_role_rollout_metrics(
         f"{role}_completed_active_step_count": int(completed_episode_steps),
         f"{role}_offense_points_total": offense_points_total,
         f"{role}_defense_points_total": defense_points_total,
-        f"{role}_offense_points_per_completed_episode": _safe_metric_ratio(
-            offense_points_total,
-            completed_episodes,
-        ),
-        f"{role}_defense_points_per_completed_episode": _safe_metric_ratio(
-            defense_points_total,
-            completed_episodes,
-        ),
         f"{role}_learner_points_total": learner_points_total,
         f"{role}_opponent_points_total": opponent_points_total,
         f"{role}_learner_completed_possessions": learner_completed_possessions,
         f"{role}_opponent_completed_possessions": opponent_completed_possessions,
-        f"{role}_learner_offensive_efficiency": shared_clock_metrics["side_a"][
-            "offensive_efficiency_points_per_possession"
-        ],
-        f"{role}_opponent_offensive_efficiency": shared_clock_metrics["side_b"][
-            "offensive_efficiency_points_per_possession"
-        ],
         f"{role}_elapsed_game_clock_seconds": elapsed_game_clock_seconds,
         f"{role}_learner_pace_possessions_per_game_minute": shared_clock_metrics[
             "side_a"
@@ -7039,14 +7163,6 @@ def _summarize_role_rollout_metrics(
         f"{role}_rebound_reward_settlement_total": rebound_reward_settlement_total,
         f"{role}_rebound_reward_net_total": (
             rebound_reward_advance_total + rebound_reward_settlement_total
-        ),
-        f"{role}_learner_points_per_completed_episode": _safe_metric_ratio(
-            learner_points_total,
-            completed_episodes,
-        ),
-        f"{role}_opponent_points_per_completed_episode": _safe_metric_ratio(
-            opponent_points_total,
-            completed_episodes,
         ),
         f"{role}_phi_r_shape_mean": _active_mean(rollout.trajectory.phi_r_shape),
         f"{role}_phi_r_shape_abs_mean": _active_mean(
@@ -7184,6 +7300,7 @@ def _summarize_role_rollout_metrics(
                 training_mask=training_mask,
             )
         )
+    metrics = {key: value for key, value in metrics.items() if not retired_scoring_metric(key)}
     return metrics
 
 
@@ -7442,12 +7559,12 @@ def _print_checkpoint_summary(
         ("offense_opponent_mean_reward", metrics.get("offense_opponent_mean_reward")),
         ("defense_opponent_mean_reward", metrics.get("defense_opponent_mean_reward")),
         (
-            "offense_learner_points_per_completed_episode",
-            metrics.get("offense_learner_points_per_completed_episode"),
+            "learner_points_scored_per_completed_game",
+            metrics.get("learner_points_scored_per_completed_game"),
         ),
         (
-            "defense_opponent_points_per_completed_episode",
-            metrics.get("defense_opponent_points_per_completed_episode"),
+            "learner_points_allowed_per_completed_game",
+            metrics.get("learner_points_allowed_per_completed_game"),
         ),
         ("mean_return", metrics.get("mean_return")),
         ("done_rate", metrics.get("done_rate")),
@@ -7590,13 +7707,14 @@ def run_training_loop(args) -> dict[str, Any]:
             getattr(args, "rebound_target_observation_features", True)
         ),
         multi_possession_features=bool(getattr(args, "enable_multi_possession", False)),
+        shooting_skill_features=shot_defense_enabled(args),
         team_clearance_features=(
-            bool(getattr(args, "require_all_offense_clear", False))
+            shot_defense_enabled(args) or bool(getattr(args, "require_all_offense_clear", False))
         ),
         check_clearance_features=(
             bool(getattr(args, "enable_multi_possession", False))
             and (
-                int(getattr(args, "check_clearance", 0)) > 0
+                shot_defense_enabled(args) or int(getattr(args, "check_clearance", 0)) > 0
                 or bool(getattr(args, "require_all_offense_clear", False))
             )
         ),
@@ -8935,6 +9053,8 @@ def run_training_loop(args) -> dict[str, Any]:
                         completion_mask=role_training_mask,
                     )
                 )
+            last_metrics = separate_scoring_diagnostics(last_metrics)
+            last_metrics.update(summarize_training_scoring(role_rollouts))
             last_metrics.update(_summarize_combined_value_diagnostics(last_metrics))
             last_metrics.update(
                 _summarize_active_player_skill_rosters(
@@ -9236,6 +9356,30 @@ def run_training_loop(args) -> dict[str, Any]:
                             selector_min_play_steps,
                         )
                 block_until_ready_tree(eval_outputs)
+                eval_scoring_rows = []
+                for role, (final_state, _) in eval_outputs.items():
+                    for row in _historical_episode_rows(
+                        final_state=final_state, diagnostics=None,
+                        candidate_fixed_team="team_a" if role == "offense" else "team_b",
+                    ):
+                        eval_scoring_rows.append({
+                            "learner_score": row["candidate_score"],
+                            "opponent_score": row["opponent_score"],
+                            "learner_roster_slot": "a" if role == "offense" else "b",
+                            "learner_started_with_possession": row["candidate_started_with_possession"],
+                            "completed": row["completed"], "truncated": not row["completed"],
+                            "offensive_possessions": row["candidate_completed_possessions"],
+                            "defensive_possessions": row["opponent_completed_possessions"],
+                        })
+                eval_scoring = summarize_learner_games(eval_scoring_rows)
+                completed_rows = [row for row in eval_scoring_rows if row["completed"]]
+                for side, name in (("offensive", "scored"), ("defensive", "allowed")):
+                    possessions = sum(row[f"{side}_possessions"] for row in completed_rows)
+                    eval_scoring[f"learner_completed_{side}_possessions"] = possessions
+                    eval_scoring[f"learner_points_{name}_per_completed_{side}_possession"] = scoring_ratio(
+                        eval_scoring[f"learner_completed_game_points_{name}"], possessions)
+                if mlflow is not None:
+                    _log_mlflow_metrics(mlflow, eval_scoring, step=update_idx, prefix="jax/eval")
                 if len(eval_trajectories) < int(args.max_eval_dumps):
                     env_index = min(
                         max(0, int(args.eval_trajectory_env_index)),
@@ -9251,6 +9395,8 @@ def run_training_loop(args) -> dict[str, Any]:
                             env_index=env_index,
                             update_index=update_idx,
                         )
+                        serialized["scoring_metric_schema_version"] = SCORING_METRIC_SCHEMA_VERSION
+                        serialized["scoring_summary"] = eval_scoring
                         serialized["training_role"] = role
                         eval_trajectories.append(serialized)
                 if mlflow is not None:
@@ -9291,18 +9437,6 @@ def run_training_loop(args) -> dict[str, Any]:
                                 opponent_selector_active
                             ),
                             "selector_alpha": float(selector_alpha),
-                            "mean_final_offense_score": float(
-                                np.asarray(final_eval_state.offense_score).mean()
-                            ),
-                            "mean_final_defense_score": float(
-                                np.asarray(final_eval_state.defense_score).mean()
-                            ),
-                            "mean_final_score_margin": float(
-                                np.asarray(
-                                    final_eval_state.offense_score
-                                    - final_eval_state.defense_score
-                                ).mean()
-                            ),
                             "mean_done_rate": float(
                                 eval_completed_dones.mean()
                             ),
@@ -9311,6 +9445,7 @@ def run_training_loop(args) -> dict[str, Any]:
                             "mean_reward": float(np.asarray(eval_trace.rewards).mean()),
                         }
                         eval_metrics.update(eval_episode_metrics)
+                        eval_metrics.update(summarize_shot_defense_diagnostics(eval_trace.shot_defense_diagnostics))
                         eval_metrics.update(summarize_pressure_diagnostics(eval_trace.pressure_diagnostics))
                         eval_metrics.update(
                             summarize_lane_violation_metrics(
@@ -9485,7 +9620,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         )
                         _log_mlflow_metrics(
                             mlflow,
-                            eval_metrics,
+                            {key: value for key, value in eval_metrics.items() if not retired_scoring_metric(key)},
                             step=update_idx,
                             prefix=f"jax/eval_{role}",
                         )
@@ -9944,6 +10079,7 @@ def run_training_loop(args) -> dict[str, Any]:
                                 f"wins/{opponent_key}": match["candidate_wins"],
                                 f"ties/{opponent_key}": match["candidate_ties"],
                                 f"losses/{opponent_key}": match["candidate_losses"],
+                                **_historical_scoring_mlflow_metrics(match, opponent_key),
                             }, step=update_idx, prefix="jax/eval_historical")
                         progress.update(1)
                         progress.set_postfix_str(
@@ -10125,13 +10261,14 @@ def run_train_scaffold(args) -> dict[str, Any]:
             getattr(args, "rebound_target_observation_features", True)
         ),
         multi_possession_features=bool(getattr(args, "enable_multi_possession", False)),
+        shooting_skill_features=shot_defense_enabled(args),
         team_clearance_features=(
-            bool(getattr(args, "require_all_offense_clear", False))
+            shot_defense_enabled(args) or bool(getattr(args, "require_all_offense_clear", False))
         ),
         check_clearance_features=(
             bool(getattr(args, "enable_multi_possession", False))
             and (
-                int(getattr(args, "check_clearance", 0)) > 0
+                shot_defense_enabled(args) or int(getattr(args, "check_clearance", 0)) > 0
                 or bool(getattr(args, "require_all_offense_clear", False))
             )
         ),

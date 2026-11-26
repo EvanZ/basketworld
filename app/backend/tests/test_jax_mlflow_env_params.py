@@ -318,3 +318,14 @@ def test_jax_local_env_config_prefers_checkpoint_env_config():
         "phi_use_ball_handler_only": False,
         "phi_blend_weight": 0.5,
     }
+
+
+def test_mlflow_shot_rule_boolean_is_not_inferred_from_truthy_strings():
+    for raw, enabled in (("true", True), ("false", False)):
+        optional = _overlay_jax_mlflow_env_params(
+            {}, {"jax/env/prefer_higher_percentage_shot": raw},
+        )
+        assert optional["prefer_higher_percentage_shot"] is enabled
+        env, wrapper = _split_jax_env_and_wrapper_params(optional)
+        assert env["prefer_higher_percentage_shot"] is enabled
+        assert "prefer_higher_percentage_shot" not in wrapper

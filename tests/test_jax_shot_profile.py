@@ -29,6 +29,7 @@ def _static_for_shot_profile(cell_coords, three_point_by_cell, basket_position):
         basket_position=jnp.asarray(basket_position, dtype=jnp.int32),
         opponent_mask=jnp.asarray([[0, 1], [1, 0]], dtype=jnp.int8),
         allow_dunks=jnp.asarray(0, dtype=jnp.int8),
+        prefer_higher_percentage_shot=jnp.asarray(0, dtype=jnp.int8),
         shot_pressure_enabled=jnp.asarray(0, dtype=jnp.int8),
         shot_pressure_max=jnp.asarray(0.0, dtype=jnp.float32),
         shot_pressure_lambda=jnp.asarray(0.0, dtype=jnp.float32),
@@ -48,6 +49,9 @@ def _state_for_shot_profile(positions):
         layup_pct=jnp.full((batch_size, n_players), 0.60, dtype=jnp.float32),
         three_pt_pct=jnp.full((batch_size, n_players), 0.37, dtype=jnp.float32),
         dunk_pct=jnp.full((batch_size, n_players), 0.85, dtype=jnp.float32),
+        shot_contest_skill=jnp.zeros((batch_size, n_players), dtype=jnp.float32),
+        rim_protection_skill=jnp.zeros((batch_size, n_players), dtype=jnp.float32),
+        contested_shooting_skill=jnp.zeros((batch_size, n_players), dtype=jnp.float32),
     )
     return KernelState(**values)
 

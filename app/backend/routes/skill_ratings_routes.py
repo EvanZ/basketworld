@@ -769,9 +769,16 @@ def _ui_report(path: Path) -> dict[str, Any]:
     for key, value in coefficients.items():
         details = value if isinstance(value, dict) else {}
         descriptor = descriptor_by_key.get(str(key), {})
+        bootstrap = details.get("bootstrap_interval") or {}
+        interval = bootstrap.get("per_pool_standard_deviation") or {}
         coefficient_rows.append(
             {
                 "key": key,
+                "status": details.get("status", "estimated"),
+                "reason": details.get("reason"),
+                "interval_p05": _number(interval.get("p05")),
+                "interval_p95": _number(interval.get("p95")),
+                "bootstrap_successful_samples": bootstrap.get("successful_samples"),
                 "label": descriptor.get("display_label", key),
                 "group": descriptor.get("semantic_group"),
                 "net_rating_per_standard_deviation": _number(
@@ -798,6 +805,8 @@ def _ui_report(path: Path) -> dict[str, Any]:
         "player_rows": rows,
         "skill_descriptors": descriptors,
         "skill_coefficients": coefficient_rows,
+        "skill_coefficient_bootstrap": direct_skill_ratings.get("coefficient_bootstrap"),
+        "environment_contract": direct_skill_ratings.get("environment_contract"),
         "skill_fit": (report.get("skill_coefficients") or {}).get("fit"),
         "player_rating_fit": direct_skill_ratings.get("fit")
         or (report.get("player_rapm") or {}).get("fit"),

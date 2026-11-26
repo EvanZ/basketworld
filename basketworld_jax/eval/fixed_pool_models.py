@@ -206,6 +206,7 @@ def assert_studies_schema_compatible(studies: Sequence[Mapping[str, Any]]) -> No
                 .get("schema_version", -1)
             ),
             "skill_schema_hash": manifest.get("skill_schema_hash"),
+            "shot_defense_contract": (manifest.get("environment_contract") or {}).get("shot_defense"),
             "checkpoint_observation_schema_versions": next(iter(checkpoint_schemas)),
             "environment_observation_schema_version": next(iter(environment_schemas)),
         }
@@ -798,7 +799,37 @@ def _pool_skill_matrix(
                 raise FixedPoolModelError(
                     f"Pool player {player_id!r} lacks declared skill {skill_key!r}."
                 ) from exc
-    return {"keys": descriptor_keys, "values": values}
+    raw_values = values.copy()
+    contract = (study.get("manifest") or {}).get("environment_contract") or {}
+    environment = contract.get("environment") or {}
+    parameters = (contract.get("shot_defense") or {}).get("parameters") or {}
+    statuses = {}
+    for column, key in enumerate(descriptor_keys):
+        reason = None
+        if key in {"rim_protection", "contested_shooting"}:
+            if not parameters.get(f"{key}_enabled", False):
+                reason = "disabled_in_checkpoint"
+            elif key == "contested_shooting" and parameters.get("contested_shooting_effect_weight") == 0:
+                reason = "zero_effect_weight"
+            elif key == "rim_protection" and all(parameters.get(f"rim_protection_{kind}_effect_weight") == 0 for kind in ("block", "contest")):
+                reason = "zero_effect_weight"
+        if reason is None and environment:
+            weight_fields = {"pressure": "pressure_skill_effect_weight", "shot_contest": "shot_contest_skill_effect_weight", "steal": "steal_skill_effect_weight", "rebound": "rebound_skill_weight"}
+            field = weight_fields.get(key)
+            if field is not None and environment.get(field) == 0:
+                reason = "zero_effect_weight"
+            if key == "rebound" and not environment.get("enable_rebounds", False):
+                reason = "disabled_in_checkpoint"
+            if key == "dunk" and not environment.get("allow_dunks", False):
+                reason = "disabled_in_checkpoint"
+            if key in {"shot_contest", "contested_shooting"} and not environment.get("shot_pressure_enabled", False):
+                reason = "disabled_in_checkpoint"
+        if reason is None and np.std(values[:, column]) <= 1.0e-12:
+            reason = "zero_pool_variance"
+        statuses[key] = {"status": "not_estimable" if reason else "estimated", "reason": reason}
+        if reason:
+            values[:, column] = 0.0
+    return {"keys": descriptor_keys, "values": values, "raw_values": raw_values, "statuses": statuses}
 
 
 def _fit_skill_ridge(
@@ -865,7 +896,7 @@ def fit_skill_regression(
     overall = _fit_skill_ridge(values, y, alpha=0.0)
     included_indices = [int(index) for index in overall["included"]]
     excluded = [
-        {"skill": keys[index], "reason": "zero_variance"}
+        {"skill": keys[index], "reason": skill_matrix["statuses"][keys[index]]["reason"] or "zero_variance"}
         for index in range(len(keys))
         if index not in included_indices
     ]
@@ -1134,9 +1165,9 @@ def _paired_bootstrap_direct_skill_intervals(
     bootstrap_samples: int,
     seed: int,
 ) -> dict[str, Any]:
-    """Sampling-group bootstrap intervals for directly estimated profile values."""
+    """Resample whole game groups for profile and skill-coefficient intervals."""
     if int(bootstrap_samples) < 1:
-        return {"samples": 0, "intervals": {}, "successful_samples": 0}
+        return {"samples": 0, "intervals": {}, "coefficient_intervals": {}, "successful_samples": 0}
     grouped_indices: dict[str, list[int]] = defaultdict(list)
     for index, episode in enumerate(episodes):
         grouped_indices[str(episode["pair_id"])].append(index)
@@ -1144,6 +1175,7 @@ def _paired_bootstrap_direct_skill_intervals(
     rng = np.random.default_rng(int(seed))
     target_array = np.asarray(target, dtype=np.float64)
     samples: list[np.ndarray] = []
+    coefficient_samples: list[np.ndarray] = []
     for _ in range(int(bootstrap_samples)):
         chosen = rng.choice(pair_ids, size=pair_ids.size, replace=True)
         indices = [index for pair_id in chosen for index in grouped_indices[str(pair_id)]]
@@ -1159,12 +1191,38 @@ def _paired_bootstrap_direct_skill_intervals(
         except (FixedPoolModelError, np.linalg.LinAlgError):
             continue
         samples.append(np.asarray(fitted["player_values"], dtype=np.float64))
+        # A constant feature in a resample is unidentified, not a zero effect.
+        coefficient_sample = np.full(len(skill_keys), np.nan, dtype=np.float64)
+        included = fitted["included"]
+        coefficient_sample[included] = fitted["coefficients"][included]
+        coefficient_samples.append(coefficient_sample)
     if not samples:
-        return {"samples": int(bootstrap_samples), "intervals": {}, "successful_samples": 0}
+        return {"samples": int(bootstrap_samples), "intervals": {}, "coefficient_intervals": {}, "successful_samples": 0}
     sample_array = np.stack(samples, axis=0)
+    coefficient_array = np.stack(coefficient_samples, axis=0)
+    pool_stds = np.std(skill_values, axis=0, ddof=0)
+    coefficient_intervals = {}
+    for index, key in enumerate(skill_keys):
+        values = coefficient_array[:, index]
+        values = values[np.isfinite(values)]
+        # One group or one successful draw cannot establish sampling uncertainty.
+        available = pair_ids.size >= 2 and values.size >= 2
+        raw_interval = (
+            {"p05": float(np.quantile(values, 0.05)), "p95": float(np.quantile(values, 0.95))}
+            if available else None
+        )
+        coefficient_intervals[key] = {
+            "successful_samples": int(values.size),
+            "per_skill_unit": raw_interval,
+            "per_pool_standard_deviation": (
+                {bound: value * float(pool_stds[index]) for bound, value in raw_interval.items()}
+                if raw_interval is not None else None
+            ),
+        }
     return {
         "samples": int(bootstrap_samples),
         "successful_samples": int(sample_array.shape[0]),
+        "coefficient_intervals": coefficient_intervals,
         "intervals": {
             player_id: {
                 "p05": float(np.quantile(sample_array[:, index], 0.05)),
@@ -2184,6 +2242,13 @@ def fit_fixed_pool_study_models(
         "selection_repeated_within_resample": False,
         "note": "Intervals condition on the outer-training five-fold CV selection.",
     }
+    # Coefficients shown in the report are fit on all included games. Bootstrap
+    # that same population; keep the existing train-only player intervals intact.
+    coefficient_bootstrap = _paired_bootstrap_direct_skill_intervals(
+        included, target, player_ids=player_ids, skill_keys=skill_keys,
+        skill_values=skill_values, ridge_alpha=direct_ridge_alpha,
+        bootstrap_samples=bootstrap_samples, seed=bootstrap_seed,
+    )
     apm_ridge_selection = _select_adjusted_plus_minus_ridge_alpha(
         train_episodes,
         train_target,
@@ -2304,8 +2369,8 @@ def fit_fixed_pool_study_models(
             "residual_skill_value": skill_model["residual_player_value"].get(player_id),
         }
     direct_player_report = {}
-    profile_means = np.mean(skill_values, axis=0)
-    profile_stds = np.std(skill_values, axis=0, ddof=0)
+    profile_means = np.mean(skill_matrix["raw_values"], axis=0)
+    profile_stds = np.std(skill_matrix["raw_values"], axis=0, ddof=0)
     for index, player_id in enumerate(player_ids):
         direct_value = float(direct_full_fit["player_values"][index])
         apm_value = float(full_fit["player_values"][index])
@@ -2315,7 +2380,11 @@ def fit_fixed_pool_study_models(
             "apm_diagnostic_value": apm_value,
             "apm_minus_skill_rating": apm_value - direct_value,
         }
+    for index, key in enumerate(skill_keys):
+        if not skill_matrix["statuses"][key]["reason"] and index not in direct_full_fit["included"]:
+            skill_matrix["statuses"][key] = {"status": "not_estimable", "reason": "no_lineup_variation"}
     direct_skill_report = {
+        "environment_contract": normalized_study["manifest"].get("environment_contract"),
         "model": "direct_skill_to_game_outcome_ridge",
         "rating_interpretation": (
             "Profile value relative to the average seeded player, predicted directly "
@@ -2328,12 +2397,27 @@ def fit_fixed_pool_study_models(
         "validation": direct_validation_report,
         "train_pair_ids": list(split["train_pair_ids"]),
         "bootstrap": direct_bootstrap,
+        "coefficient_bootstrap": {
+            "method": "paired_group_percentile",
+            "confidence_level": 0.90,
+            "population": "all_included_games",
+            "sampling_group_count": len(set(pair_ids)),
+            "seed": int(bootstrap_seed),
+            "samples": coefficient_bootstrap["samples"],
+            "successful_samples": coefficient_bootstrap["successful_samples"],
+            "ridge_alpha_conditioning": direct_bootstrap["ridge_alpha_conditioning"],
+        },
         "coefficients": {
             skill_key: {
-                "net_rating_points_per_skill_unit": float(
+                **skill_matrix["statuses"][skill_key],
+                "bootstrap_interval": (
+                    None if skill_matrix["statuses"][skill_key]["reason"] else
+                    coefficient_bootstrap["coefficient_intervals"].get(skill_key)
+                ),
+                "net_rating_points_per_skill_unit": None if skill_matrix["statuses"][skill_key]["reason"] else float(
                     direct_full_fit["coefficients"][skill_index]
                 ),
-                "net_rating_points_per_pool_standard_deviation": float(
+                "net_rating_points_per_pool_standard_deviation": None if skill_matrix["statuses"][skill_key]["reason"] else float(
                     direct_full_fit["coefficients"][skill_index]
                     * profile_stds[skill_index]
                 ),
@@ -2383,6 +2467,7 @@ def fit_fixed_pool_study_models(
             "compatible": True,
             "warnings": [],
             "skill_schema_hash": normalized_study["manifest"].get("skill_schema_hash"),
+            "shot_defense_contract": (normalized_study["manifest"].get("environment_contract") or {}).get("shot_defense"),
             "checkpoint_observation_schema_versions": included[0].get(
                 "checkpoint_observation_schema_versions"
             ),

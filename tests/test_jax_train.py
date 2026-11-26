@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -205,8 +206,8 @@ def test_clock_training_diagnostics_use_completed_possessions_and_elapsed_clock(
         num_intents=1,
     )
 
-    assert metrics["offense_learner_offensive_efficiency"] == pytest.approx(2.5)
-    assert metrics["offense_opponent_offensive_efficiency"] == pytest.approx(2.5)
+    assert "offense_learner_offensive_efficiency" not in metrics
+    assert "offense_opponent_offensive_efficiency" not in metrics
     assert metrics["offense_learner_pace_possessions_per_game_minute"] == pytest.approx(30.0)
     assert metrics["offense_completed_possessions_per_completed_game"] == pytest.approx(4.0)
     assert metrics["offense_regulation_completion_count"] == 1
@@ -537,6 +538,14 @@ def test_historical_match_summary_balances_team_assignments_and_scores():
     assert summary["candidate_losses"] == 1
     assert summary["candidate_win_rate"] == pytest.approx(0.5)
     assert summary["mean_candidate_point_differential"] == pytest.approx(1.0)
+    from basketworld_jax.train.main import _historical_scoring_mlflow_metrics
+
+    logged = _historical_scoring_mlflow_metrics(summary, "u100/deterministic")
+    assert logged["candidate_points_per_completed_game/u100/deterministic"] == 3.25
+    assert logged["candidate_roster_slot_a_completed_game_count/u100/deterministic"] == 2
+    assert logged["candidate_roster_slot_b_completed_game_count/u100/deterministic"] == 2
+    assert logged["roster_assignment_score_margin_delta/u100/deterministic"] == 2
+    assert logged["candidate_points_per_completed_offensive_possession/u100/deterministic"] is None
 
 
 def test_historical_match_summary_includes_compact_gameplay_diagnostics():
@@ -1626,7 +1635,11 @@ def test_mlflow_core_profile_keeps_learner_rebound_metrics_only():
         "rebound_learner_defensive_rebound_rate",
         "rebound_learner_softmax_win_rate_defense",
     }
-    assert _filter_mlflow_train_metrics(metrics, profile="full") == metrics
+    from basketworld_jax.scoring_metrics import retired_scoring_metric, artifact_scoring_metric
+    assert _filter_mlflow_train_metrics(metrics, profile="full") == {
+        key: value for key, value in metrics.items()
+        if not retired_scoring_metric(key) and not artifact_scoring_metric(key)
+    }
 
 
 def test_intent_discriminator_uses_training_mask_for_active_samples():
@@ -2978,7 +2991,11 @@ def test_core_mlflow_train_metric_filter_drops_redundant_aliases():
     assert filtered["learner_check_pickup_rate"] == pytest.approx(0.9)
     assert filtered["opponent_check_pickup_rate"] == pytest.approx(0.4)
     assert filtered["end_to_end_steps_per_sec"] == 30000.0
-    assert _filter_mlflow_train_metrics(metrics, profile="full") == metrics
+    from basketworld_jax.scoring_metrics import retired_scoring_metric, artifact_scoring_metric
+    assert _filter_mlflow_train_metrics(metrics, profile="full") == {
+        key: value for key, value in metrics.items()
+        if not retired_scoring_metric(key) and not artifact_scoring_metric(key)
+    }
 
 
 def test_core_mlflow_deploy_metric_filter_keeps_compact_aggregates():
@@ -2988,7 +3005,7 @@ def test_core_mlflow_deploy_metric_filter_keeps_compact_aggregates():
         "action_sampled_offense": 1,
         "action_sampled_defense": 1,
         "completion_rate": 1.0,
-        "mean_offense_score": 17.0,
+        "self_play_points_per_team_per_completed_game": 17.0,
         "mean_live_boundary_player_fraction": 0.4,
         "shot_make_rate": 0.5,
         "shot_attempts": 100,
@@ -3011,7 +3028,7 @@ def test_core_mlflow_deploy_metric_filter_keeps_compact_aggregates():
         "action_sampled_offense": 1,
         "action_sampled_defense": 1,
         "completion_rate": 1.0,
-        "mean_offense_score": 17.0,
+        "self_play_points_per_team_per_completed_game": 17.0,
         "mean_live_boundary_player_fraction": 0.4,
         "shot_make_rate": 0.5,
         "turnover_intercepted_share": 0.25,
@@ -3048,10 +3065,10 @@ def test_core_deploy_pace_retains_completed_game_clock_metrics(has_completed_gam
     )
     summary = summarize_deploy_eval_outputs([output], batch_size=4)
     filtered = _filter_mlflow_deploy_metrics(summary)
-    assert filtered["clock_team_a_pace_completed_offensive_possessions_per_game_minute"] == pytest.approx(
+    assert summary["scoring_diagnostics"]["clock_roster_slot_a_pace_completed_offensive_possessions_per_game_minute"] == pytest.approx(
         3.0 if has_completed_games else 0.0
     )
-    assert filtered["clock_team_b_pace_completed_offensive_possessions_per_game_minute"] == pytest.approx(
+    assert summary["scoring_diagnostics"]["clock_roster_slot_b_pace_completed_offensive_possessions_per_game_minute"] == pytest.approx(
         2.0 if has_completed_games else 0.0
     )
     assert filtered["clock_elapsed_game_clock_seconds_completed_games"] == (
@@ -3469,8 +3486,14 @@ def test_train_loop_emits_history_and_eval_dumps():
     assert "defense_learner_mean_reward" in result["final_metrics"]
     assert "offense_opponent_mean_reward" in result["final_metrics"]
     assert "defense_opponent_mean_reward" in result["final_metrics"]
-    assert "offense_learner_points_per_completed_episode" in result["final_metrics"]
-    assert "defense_opponent_points_per_completed_episode" in result["final_metrics"]
+    assert "learner_points_scored_per_completed_game" in result["final_metrics"]
+    assert "offense_learner_points_per_completed_episode" not in result["final_metrics"]
+    assert "learner_points_allowed_per_completed_game" in result["final_metrics"]
+    assert "defense_opponent_points_per_completed_episode" not in result["final_metrics"]
+    assert result["final_metrics"]["scoring_metric_schema_version"] == 2
+    assert deploy_metrics["scoring_metric_schema_version"] == 2
+    assert "mean_offense_score" not in deploy_metrics
+    assert result["eval_trajectories"][0]["scoring_summary"]["scoring_metric_schema_version"] == 2
     assert "offense_ppo_eligible_completed_episodes" in result["final_metrics"]
     assert "offense_completed_episode_count" in result["final_metrics"]
     assert "offense_completed_active_step_count" in result["final_metrics"]
@@ -3724,6 +3747,7 @@ def test_train_loop_checkpoint_resume_round_trip(tmp_path):
     first_args = parse_args(
         [
             "--run-train-loop",
+            "--prefer-higher-percentage-shot",
             "--enable-multi-possession",
             "--multi-possession-limit",
             "3",
@@ -3778,6 +3802,11 @@ def test_train_loop_checkpoint_resume_round_trip(tmp_path):
     assert payload["env_config"]["three_pt_std"] == 0.05
     assert payload["env_config"]["dunk_std"] == 0.3
     assert payload["env_config"]["allow_dunks"] is True
+    assert payload["scoring_metric_schema_version"] == 2
+    assert payload["last_metrics"]["scoring_metric_schema_version"] == 2
+    assert payload["env_config"]["prefer_higher_percentage_shot"] is True
+    assert payload["effective_env_config"]["prefer_higher_percentage_shot"] is True
+    assert payload["resolved_training_config"]["prefer_higher_percentage_shot"] is True
     assert payload["env_config"]["dunk_pct"] == 0.6
     assert payload["env_config"]["multi_possession_limit"] == 3
     assert payload["env_config"]["multi_possession_limit_start"] == 1
@@ -3805,9 +3834,18 @@ def test_train_loop_checkpoint_resume_round_trip(tmp_path):
     assert set(payload["current_state"]) == {"offense", "defense"}
     assert set(payload["eval_initial_state"]) == {"offense", "defense"}
 
+    # Simulate a pre-schema checkpoint while retaining its policy and optimizer state.
+    metadata_path = latest_checkpoint / "metadata.json"
+    legacy_metadata = json.loads(metadata_path.read_text())
+    legacy_metadata.pop("scoring_metric_schema_version")
+    legacy_metadata["last_metrics"].pop("scoring_metric_schema_version", None)
+    metadata_path.write_text(json.dumps(legacy_metadata))
+    assert load_checkpoint(latest_checkpoint)["scoring_metric_schema_version"] == 1
+
     resumed_args = parse_args(
         [
             "--run-train-loop",
+            "--prefer-higher-percentage-shot",
             "--enable-multi-possession",
             "--multi-possession-limit",
             "3",
@@ -3853,6 +3891,7 @@ def test_train_loop_checkpoint_resume_round_trip(tmp_path):
 
     assert resumed_result["resumed_from_checkpoint"] == str(latest_checkpoint)
     assert resumed_result["final_metrics"]["update_index"] == 2
+    assert resumed_result["final_metrics"]["scoring_metric_schema_version"] == 2
     assert resumed_result["final_metrics"]["multi_possession_limit_active"] == 2
     assert resumed_result["final_metrics"]["cumulative_active_step_count"] >= (
         first_result["final_metrics"]["cumulative_active_step_count"]

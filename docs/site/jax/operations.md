@@ -136,6 +136,31 @@ pace metric counts the terminal live action but excludes dead-ball inbound
 ticks, so mechanically correct transitions are not mistaken for a learned
 clearing strategy.
 
+### Current team strength from Skill Ratings
+
+In the development UI, open **Skill Ratings** and select a completed report
+under **Existing results → Study to inspect and apply to current teams**.
+The **Current team strength** panel at the top shows Blue and Red totals,
+their estimated skill advantage, and an expandable player contribution table.
+Selecting a report does not launch a study, reset the game, or change the model.
+Ratings update when the current roster or skills change; possession changes do
+not change team identity.
+
+Each player is scored with the direct skill model:
+`sum((current skill - pool mean) / pool SD * effect per pool SD)`.
+Team strength is the sum of its player ratings, in net-rating points per 100
+possessions relative to the study's average skill profile. The difference is a
+skill advantage, not a predicted final score or win probability. APM diagnostics
+and individual bootstrap bounds are not added into these totals.
+
+The report must match the game's 3v3, 4v4, or 5v5 roster size and both teams'
+checkpoint paths and updates. Missing skills, invalid coefficients, and older
+reports without a direct skill model show an explanation instead of ratings.
+Different action settings and skills far from the study average produce notes.
+Existing reports do not fingerprint checkpoint files or preserve all game-rule
+overrides, so path/update matching cannot verify replaced files or changed rules.
+Use the same model and rules that produced the selected study.
+
 ## MLflow
 
 `--log-mlflow` starts a run through the repository's MLflow configuration. The

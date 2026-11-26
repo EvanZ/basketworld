@@ -1,3 +1,4 @@
+import { scoringMetricDefinition } from './scoringMetrics.js'
 export function pfspRows(metrics = [], { includeInactiveModes = false } = {}) {
   const values = new Map(metrics.map(({ name, latest }) => [name, latest]))
   const prefix = 'jax/train/pfsp/'
@@ -101,5 +102,5 @@ export function metricDefinition(name) {
   if (name.includes('/pressure/')) return 'Live-state opportunities, split by current possession: learner attacking means pressure received; learner defending means pressure applied. ESV is expected points per hypothetical shot (not PPP). Uncontested ESV holds position and skill fixed with no shot contest; defended ESV uses the actual contest model. Reduction is their difference. Ball-handler samples exclude loose balls; offense averages on-court offensive players. Zero samples means unavailable. Deploy may use the same policy on both teams.'
   if (name.includes('/pfsp/')) return 'Pre-rollout PFSP sampling snapshot, separate sampled/deterministic opponents. w is a recent smoothed completed-game score (win 1, tie 0.5, loss 0), not an Elo rating. Prior-only w is 0.5. Evidence has a 500-update half-life, capped at 256 effective games plus a Beta(1,1) prior. Win % is actual learner wins / tracked completed games, without decay or a prior; ties are non-wins and truncations are excluded. Older runs may lack these counts; partial history is labeled. Probability is conditional on opponent action mode. Counts and freshness refer to the evidence used for this distribution.'
   if (name.includes('/w_eval/')) return 'Empirical completed-game win score: (wins + 0.5 × ties) / completed games against this frozen opponent. Excludes truncations. Not the Elo-fitted score and never used to update training PFSP estimates.'
-  return ''
+  return scoringMetricDefinition(name)
 }

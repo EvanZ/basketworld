@@ -13,6 +13,7 @@ from basketworld_jax.eval.fixed_pool_results import (
 )
 from basketworld_jax.eval.fixed_pool_study import (
     FixedPoolStudyRunError,
+    _load_or_create_pool,
     _study_skill_sampling_overrides,
     run_fixed_pool_study,
     write_fixed_pool_model_reanalysis,
@@ -170,7 +171,7 @@ def test_fixed_pool_cli_controls_are_opt_in_and_validate_study_only_requirements
 
 
 def test_study_pool_sampling_has_support_for_each_active_skill():
-    overrides = _study_skill_sampling_overrides()
+    overrides = _study_skill_sampling_overrides({"rim_protection_enabled": True, "contested_shooting_enabled": True})
     pool = generate_player_pool(
         player_count=16,
         seed=19,
@@ -178,8 +179,35 @@ def test_study_pool_sampling_has_support_for_each_active_skill():
     )
     for skill_name, override in overrides.items():
         values = {player.skills[skill_name] for player in pool.players}
-        assert override["std"] > 0.0
+        if skill_name == "rim_protection":
+            assert override["alpha"] > 0.0 and override["beta"] > 0.0
+        else:
+            assert override["std"] > 0.0
         assert len(values) > 1
+
+
+@pytest.mark.parametrize("environment,expected_count", [
+    ({}, 9),
+    ({"rim_protection_enabled": False, "contested_shooting_enabled": False}, 9),
+    ({"rim_protection_enabled": True}, 11),
+    ({"contested_shooting_enabled": True}, 11),
+    ({"rim_protection_enabled": True, "contested_shooting_enabled": True}, 11),
+])
+def test_new_study_pool_uses_checkpoint_skills(tmp_path, environment, expected_count):
+    args = _args(tmp_path, tmp_path / "checkpoint", create=True)
+    args.fixed_pool_size = 0
+    pool, _, created = _load_or_create_pool(args, environment)
+    expected_keys = set(_study_skill_sampling_overrides(environment))
+    assert created
+    assert len(expected_keys) == expected_count
+    assert len(pool.players) == expected_count * 8
+    assert {descriptor["key"] for descriptor in pool.skill_descriptors} == expected_keys
+    assert all(set(player.skills) == expected_keys for player in pool.players)
+    if expected_count == 9:
+        assert pool.skill_schema_version == 1
+        assert "rim_protection" not in expected_keys
+        assert "contested_shooting" not in expected_keys
+        assert "shot_contest" in expected_keys
 
 
 @pytest.mark.parametrize("team_size", [3, 4, 5])
@@ -209,6 +237,8 @@ def test_operational_runner_creates_then_reuses_immutable_inputs(
     assert created["schedule"]["team_size"] == team_size
     assert len(created["checkpoint_reports"]) == 1
     report = created["checkpoint_reports"][0]
+    assert "rim_protection" not in report["direct_skill_ratings"]["coefficients"]
+    assert "contested_shooting" not in report["direct_skill_ratings"]["coefficients"]
     assert report["raw_artifact_dependencies"]["root"].endswith(
         report["raw_artifact_dependencies"]["study_id"]
     )

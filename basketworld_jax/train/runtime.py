@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+from basketworld_jax.shot_defense_metrics import SHOT_DEFENSE_SHAPE, build_shot_defense_diagnostics, summarize_shot_defense_diagnostics
+
 from time import perf_counter_ns
 from typing import Any, Sequence
 
 import numpy as np
+
+from basketworld_jax.scoring_metrics import (
+    summarize_self_play_scoring,
+    separate_scoring_diagnostics,
+    retired_scoring_metric,
+)
 
 from basketworld_jax.train.pressure_metrics import (
     PRESSURE_SHAPE, build_pressure_diagnostics, summarize_pressure_diagnostics,
@@ -930,6 +938,21 @@ def _build_spatial_step_metrics(static, state, active_step, jnp) -> dict[str, An
     }
 
 
+def _terminal_scoring_diagnostics(static, state, jnp):
+    learner_a = static.training_player_mask[static.offense_ids[0]] > 0.5
+    # Scores are captured before automatic reset, never reconstructed from a rollout fragment.
+    return {
+        "terminal_learner_score": jnp.where(
+            learner_a, state.team_a_score, state.team_b_score
+        ),
+        "terminal_opponent_score": jnp.where(
+            learner_a, state.team_b_score, state.team_a_score
+        ),
+        "learner_started_with_possession": state.starting_offense_team
+        == jnp.where(learner_a, 0, 1),
+    }
+
+
 def _terminal_learner_win_score(static, state, jnp):
     learner_team_a = static.training_player_mask[static.offense_ids[0]] > 0.5
     difference = jnp.where(learner_team_a, state.team_a_score - state.team_b_score,
@@ -1425,6 +1448,7 @@ def _truncation_bootstrap_values(
         multi_possession_features=bool(
             getattr(spec, "multi_possession_features", False)
         ),
+        shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
         team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
         check_clearance_features=(
             int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -1571,6 +1595,7 @@ def build_compiled_rollout_runner(
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -1698,7 +1723,9 @@ def build_compiled_rollout_runner(
                 jnp.zeros_like(env_out.done.astype(jnp.int8)),
             )
             transition = TrajectoryBatch(
+                shot_defense_diagnostics=build_shot_defense_diagnostics(static, env_out, active_step, jnp),
                 pressure_diagnostics=build_pressure_diagnostics(static, policy_state, active_step, jnp),
+                **_terminal_scoring_diagnostics(static, env_out.state, jnp),
                 terminal_learner_win_score=_terminal_learner_win_score(static, env_out.state, jnp),
                 active_mask=active_step.astype(jnp.float32),
                 episode_start=(active_step & (policy_state.step_count == 0)).astype(jnp.int8),
@@ -1903,6 +1930,7 @@ def build_compiled_rollout_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -2058,6 +2086,7 @@ def build_compiled_frozen_opponent_rollout_runner(
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -2094,6 +2123,7 @@ def build_compiled_frozen_opponent_rollout_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -2252,7 +2282,9 @@ def build_compiled_frozen_opponent_rollout_runner(
                 jnp.zeros_like(env_out.done.astype(jnp.int8)),
             )
             transition = TrajectoryBatch(
+                shot_defense_diagnostics=build_shot_defense_diagnostics(static, env_out, active_step, jnp),
                 pressure_diagnostics=build_pressure_diagnostics(static, policy_state, active_step, jnp),
+                **_terminal_scoring_diagnostics(static, env_out.state, jnp),
                 terminal_learner_win_score=_terminal_learner_win_score(static, env_out.state, jnp),
                 active_mask=active_step.astype(jnp.float32),
                 episode_start=(active_step & (policy_state.step_count == 0)).astype(jnp.int8),
@@ -2502,6 +2534,7 @@ def build_compiled_frozen_opponent_rollout_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -2662,6 +2695,7 @@ def build_compiled_grouped_opponent_rollout_runner(
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -2694,6 +2728,7 @@ def build_compiled_grouped_opponent_rollout_runner(
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -2826,7 +2861,9 @@ def build_compiled_grouped_opponent_rollout_runner(
                 jnp.zeros_like(env_out.done.astype(jnp.int8)),
             )
             transition = TrajectoryBatch(
+                shot_defense_diagnostics=build_shot_defense_diagnostics(static, env_out, active_step, jnp),
                 pressure_diagnostics=build_pressure_diagnostics(static, policy_state, active_step, jnp),
+                **_terminal_scoring_diagnostics(static, env_out.state, jnp),
                 terminal_learner_win_score=_terminal_learner_win_score(static, env_out.state, jnp),
                 active_mask=active_step.astype(jnp.float32),
                 episode_start=(active_step & (policy_state.step_count == 0)).astype(jnp.int8),
@@ -3070,6 +3107,7 @@ def build_compiled_grouped_opponent_rollout_runner(
             rebound_win_prob_features=bool(spec.rebound_win_prob_features),
             rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -3156,6 +3194,7 @@ def build_compiled_eval_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -3195,6 +3234,7 @@ def build_compiled_eval_runner(
                     multi_possession_features=bool(
                         getattr(spec, "multi_possession_features", False)
                     ),
+                    shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                     team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                     check_clearance_features=(
                         int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -3235,6 +3275,7 @@ def build_compiled_eval_runner(
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             rebound_metrics = _build_rebound_transition_metrics(env_out, jnp)
             trace = EvalTrace(
+                shot_defense_diagnostics=build_shot_defense_diagnostics(static, env_out, ~state.episode_ended.astype(jnp.bool_), jnp),
                 pressure_diagnostics=build_pressure_diagnostics(static, state, ~state.episode_ended.astype(jnp.bool_), jnp),
                 positions=state.positions,
                 ball_holder=state.ball_holder,
@@ -3372,6 +3413,7 @@ def build_compiled_frozen_opponent_eval_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -3406,6 +3448,7 @@ def build_compiled_frozen_opponent_eval_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -3451,6 +3494,7 @@ def build_compiled_frozen_opponent_eval_runner(
                     multi_possession_features=bool(
                         getattr(spec, "multi_possession_features", False)
                     ),
+                    shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                     team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                     check_clearance_features=(
                         int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -3480,6 +3524,7 @@ def build_compiled_frozen_opponent_eval_runner(
                     multi_possession_features=bool(
                         getattr(spec, "multi_possession_features", False)
                     ),
+                    shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                     team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                     check_clearance_features=(
                         int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -3514,6 +3559,7 @@ def build_compiled_frozen_opponent_eval_runner(
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             rebound_metrics = _build_rebound_transition_metrics(env_out, jnp)
             trace = EvalTrace(
+                shot_defense_diagnostics=build_shot_defense_diagnostics(static, env_out, ~state.episode_ended.astype(jnp.bool_), jnp),
                 pressure_diagnostics=build_pressure_diagnostics(static, state, ~state.episode_ended.astype(jnp.bool_), jnp),
                 positions=state.positions,
                 ball_holder=state.ball_holder,
@@ -3962,6 +4008,7 @@ def build_compiled_historical_match_eval_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -3997,6 +4044,7 @@ def build_compiled_historical_match_eval_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -4036,6 +4084,7 @@ def build_compiled_historical_match_eval_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -4054,6 +4103,7 @@ def build_compiled_historical_match_eval_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -4334,6 +4384,7 @@ def build_compiled_grouped_opponent_eval_runner(
                     multi_possession_features=bool(
                         getattr(spec, "multi_possession_features", False)
                     ),
+                    shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                     team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                     check_clearance_features=(
                         int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -4392,6 +4443,7 @@ def build_compiled_grouped_opponent_eval_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -4442,6 +4494,7 @@ def build_compiled_grouped_opponent_eval_runner(
                     multi_possession_features=bool(
                         getattr(spec, "multi_possession_features", False)
                     ),
+                    shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                     team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                     check_clearance_features=(
                         int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -4470,6 +4523,7 @@ def build_compiled_grouped_opponent_eval_runner(
                     multi_possession_features=bool(
                         getattr(spec, "multi_possession_features", False)
                     ),
+                    shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                     team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                     check_clearance_features=(
                         int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -4500,6 +4554,7 @@ def build_compiled_grouped_opponent_eval_runner(
             shot_metrics = _build_shot_type_transition_metrics(static, env_out, jnp)
             rebound_metrics = _build_rebound_transition_metrics(env_out, jnp)
             trace = EvalTrace(
+                shot_defense_diagnostics=build_shot_defense_diagnostics(static, env_out, ~state.episode_ended.astype(jnp.bool_), jnp),
                 pressure_diagnostics=build_pressure_diagnostics(static, state, ~state.episode_ended.astype(jnp.bool_), jnp),
                 positions=state.positions,
                 ball_holder=state.ball_holder,
@@ -4609,6 +4664,8 @@ def build_compiled_deploy_eval_runner(
         zero = jnp.asarray(0.0, dtype=jnp.float32)
         initial_totals = DeployEvalTotals(
             *(
+                jnp.zeros(SHOT_DEFENSE_SHAPE, dtype=jnp.float32)
+                if field == "shot_defense_diagnostics" else
                 jnp.zeros(PRESSURE_SHAPE, dtype=jnp.float32)
                 if field == "pressure_diagnostics" else
                 jnp.zeros(initial_state.episode_ended.shape, dtype=jnp.float32)
@@ -4649,6 +4706,7 @@ def build_compiled_deploy_eval_runner(
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -4683,6 +4741,7 @@ def build_compiled_deploy_eval_runner(
                 multi_possession_features=bool(
                     getattr(spec, "multi_possession_features", False)
                 ),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -4719,6 +4778,7 @@ def build_compiled_deploy_eval_runner(
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -4733,6 +4793,7 @@ def build_compiled_deploy_eval_runner(
                 rebound_win_prob_features=bool(spec.rebound_win_prob_features),
                 rebound_target_observation_features=bool(getattr(spec, "rebound_target_observation_features", True)),
                 multi_possession_features=bool(getattr(spec, "multi_possession_features", False)),
+                shooting_skill_features=int(getattr(spec, 'observation_schema_version', 1)) >= 7,
                 team_clearance_features=(int(getattr(spec, "observation_schema_version", 1)) >= 6),
                 check_clearance_features=(
                     int(getattr(spec, "observation_schema_version", 1)) >= 5
@@ -4811,6 +4872,7 @@ def build_compiled_deploy_eval_runner(
             in_overtime = clock_transition["clock_period_index"] > 0
 
             step_totals = DeployEvalTotals(
+                shot_defense_diagnostics=jnp.sum(build_shot_defense_diagnostics(static, env_out, active_step, jnp), axis=0),
                 pressure_diagnostics=jnp.sum(build_pressure_diagnostics(static, state, active_step, jnp), axis=0),
                 active_steps=jnp.sum(active_step.astype(jnp.float32)),
                 completed_episode_steps=_active_sum(env_out.terminal_episode_steps),
@@ -5138,19 +5200,6 @@ def summarize_deploy_eval_outputs(
     )
     completed_episode_count = int(ended_count - safety_truncated_count)
     horizon_truncated_count = int(episode_count - ended_count)
-    offense_score = float(
-        sum(
-            float(np.asarray(output.final_state.offense_score, dtype=np.float64).sum())
-            for output in outputs
-        )
-    )
-    defense_score = float(
-        sum(
-            float(np.asarray(output.final_state.defense_score, dtype=np.float64).sum())
-            for output in outputs
-        )
-    )
-
     def _rate(numerator: float, denominator: float) -> float:
         return float(numerator / denominator) if denominator > 0.0 else 0.0
 
@@ -5238,9 +5287,6 @@ def summarize_deploy_eval_outputs(
         "auxiliary_reward_total": totals["auxiliary_reward"],
         "team_a_score_delta_total": totals["team_a_score_delta"],
         "team_b_score_delta_total": totals["team_b_score_delta"],
-        "mean_offense_score": _per_episode(offense_score),
-        "mean_defense_score": _per_episode(defense_score),
-        "mean_score_margin": _per_episode(offense_score - defense_score),
         "pass_attempts": int(pass_attempts),
         "completed_passes": int(totals["completed_passes"]),
         "assists": int(totals["assists"]),
@@ -5508,10 +5554,20 @@ def summarize_deploy_eval_outputs(
     metrics["clock_overtime_team_a_point_differential"] = (
         overtime_team_a_points - overtime_team_b_points
     )
+    shot_defense_totals = [output.totals.shot_defense_diagnostics for output in outputs
+                           if output.totals.shot_defense_diagnostics is not None]
+    if shot_defense_totals:
+        metrics.update(summarize_shot_defense_diagnostics(np.asarray(shot_defense_totals)))
     pressure_totals = [output.totals.pressure_diagnostics for output in outputs
                        if output.totals.pressure_diagnostics is not None]
     if pressure_totals:
         metrics.update(summarize_pressure_diagnostics(np.asarray(pressure_totals)))
+    metrics.update(summarize_self_play_scoring(
+        completed_team_a_points, completed_team_b_points,
+        completed_team_a_possessions, completed_team_b_possessions,
+        completed_episode_count, safety_truncated_count + horizon_truncated_count,
+    ))
+    metrics = separate_scoring_diagnostics(metrics)
     return metrics
 
 
@@ -6324,14 +6380,8 @@ def summarize_ppo_eligible_episode_metrics(
         f"{prefix}_reward_per_completed_episode": _per_completed_episode(reward_total),
         f"{prefix}_offense_points_total": offense_points_total,
         f"{prefix}_offense_points_per_step": _per_step(offense_points_total),
-        f"{prefix}_offense_points_per_completed_episode": _per_completed_episode(
-            offense_points_total
-        ),
         f"{prefix}_defense_points_total": defense_points_total,
         f"{prefix}_defense_points_per_step": _per_step(defense_points_total),
-        f"{prefix}_defense_points_per_completed_episode": _per_completed_episode(
-            defense_points_total
-        ),
     }
     if role == "offense":
         learner_points_total = offense_points_total
@@ -6347,14 +6397,8 @@ def summarize_ppo_eligible_episode_metrics(
             {
                 f"{prefix}_learner_points_total": learner_points_total,
                 f"{prefix}_learner_points_per_step": _per_step(learner_points_total),
-                f"{prefix}_learner_points_per_completed_episode": _per_completed_episode(
-                    learner_points_total
-                ),
                 f"{prefix}_opponent_points_total": opponent_points_total,
                 f"{prefix}_opponent_points_per_step": _per_step(opponent_points_total),
-                f"{prefix}_opponent_points_per_completed_episode": _per_completed_episode(
-                    opponent_points_total
-                ),
             }
         )
 
@@ -6465,6 +6509,7 @@ def summarize_ppo_eligible_episode_metrics(
         metrics[f"{prefix}_terminal_{name}_episodes"] = total
         metrics[f"{prefix}_terminal_{name}_share"] = _per_completed_episode(total)
 
+    metrics = {key: value for key, value in metrics.items() if not retired_scoring_metric(key)}
     return metrics
 
 
@@ -6893,6 +6938,7 @@ def summarize_training_step(
         "advantage_std": advantage_std,
     }
     summary.update(episode_metrics)
+    summary.update(summarize_shot_defense_diagnostics(getattr(rollout_out.trajectory, "shot_defense_diagnostics", None)))
     summary.update(summarize_pressure_diagnostics(getattr(rollout_out.trajectory, "pressure_diagnostics", None)))
     summary.update(
         summarize_completed_possession_pace(

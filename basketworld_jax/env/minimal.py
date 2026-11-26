@@ -7,6 +7,7 @@ from typing import Any, Mapping, NamedTuple, Sequence
 import numpy as np
 
 from basketworld.domain import ActionType, Team
+from basketworld_jax.shot_defense import SHOT_DEFENSE_DEFAULTS, rim_skill_from_block_sample
 from basketworld.utils.start_templates import (
     _mirror_anchor,
     _project_anchor_to_valid_cell,
@@ -45,6 +46,7 @@ def token_observation_dims(
     multi_possession_features: bool = False,
     check_clearance_features: bool = False,
     team_clearance_features: bool = False,
+    shooting_skill_features: bool = False,
 ) -> tuple[int, int]:
     """Return player/global token dimensions for the selected observation schema."""
     player_dim = TOKEN_OBS_PLAYER_DIM
@@ -58,12 +60,14 @@ def token_observation_dims(
     if bool(multi_possession_features):
         player_dim += TOKEN_OBS_MULTI_POSSESSION_PLAYER_DIM
         global_dim += TOKEN_OBS_MULTI_POSSESSION_GLOBAL_DIM
-    if bool(check_clearance_features):
+    if bool(check_clearance_features) and bool(multi_possession_features):
         player_dim += TOKEN_OBS_CHECK_CLEARANCE_PLAYER_DIM
         global_dim += TOKEN_OBS_CHECK_CLEARANCE_GLOBAL_DIM
     if team_clearance_features:
         player_dim += 1
         global_dim += 1
+    if shooting_skill_features:
+        player_dim += 2
     return player_dim, global_dim
 
 
@@ -74,6 +78,7 @@ def token_observation_labels(
     check_clearance_features: bool = False,
     episode_end_mode: str = "possessions",
     team_clearance_features: bool = False,
+    shooting_skill_features: bool = False,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Return the ordered labels for the selected token-observation schema."""
     player_labels = [
@@ -143,7 +148,7 @@ def token_observation_labels(
                 "restart_countdown_norm",
             )
         )
-    if bool(check_clearance_features):
+    if bool(check_clearance_features) and bool(multi_possession_features):
         player_labels.append("inside_check_clearance")
         global_labels.extend(
             (
@@ -157,6 +162,8 @@ def token_observation_labels(
     if team_clearance_features:
         player_labels.append("offense_cleared")
         global_labels.append("clearance_ready_to_shoot")
+    if shooting_skill_features:
+        player_labels.extend(("rim_protection_skill", "contested_shooting_skill"))
     return tuple(player_labels), tuple(global_labels)
 TURNOVER_REASON_NONE = 0
 TURNOVER_REASON_PASS_OUT_OF_BOUNDS = 1
@@ -317,6 +324,7 @@ class KernelStatic(NamedTuple):
     offensive_lane_by_cell: Any
     defensive_lane_by_cell: Any
     allow_dunks: Any
+    prefer_higher_percentage_shot: Any
     mask_occupied_moves: Any
     enable_pass_gating: Any
     shot_pressure_enabled: Any
@@ -451,6 +459,20 @@ class KernelStatic(NamedTuple):
     check_deadline_steps: Any
     check_setup_steps: Any
 
+    contested_shooting_enabled: Any
+    contested_shooting_skill_mean: Any
+    contested_shooting_skill_std: Any
+    contested_shooting_effect_weight: Any
+    rim_protection_enabled: Any
+    rim_protection_beta_alpha: Any
+    rim_protection_beta_beta: Any
+    rim_protection_block_distribution_max: Any
+    rim_protection_skill_block_reference: Any
+    rim_protection_block_base: Any
+    rim_protection_block_effect_weight: Any
+    rim_protection_contest_base: Any
+    rim_protection_contest_effect_weight: Any
+
 
 class KernelState(NamedTuple):
     positions: Any
@@ -540,6 +562,9 @@ class KernelState(NamedTuple):
     clearance_achieved: Any
     offense_clearance: Any
 
+    rim_protection_skill: Any = None
+    contested_shooting_skill: Any = None
+
 
 class StepBatchOutput(NamedTuple):
     state: KernelState
@@ -613,6 +638,16 @@ class StepBatchOutput(NamedTuple):
     check_pickup_steps: Any
     truncated: Any
     truncation_reason: Any
+
+    shot_suppression_before_resistance: Any
+    shot_suppression_after_resistance: Any
+    shot_blocked: Any
+    shot_blocker: Any
+    shot_is_finish: Any
+    shot_contested: Any
+    shot_open_probability: Any
+    shot_conditional_probability: Any
+    shot_block_probability: Any
 
 
 class ReboundDiagnosticTotals(NamedTuple):
@@ -879,6 +914,8 @@ def snapshot_state_from_env(env) -> dict[str, np.ndarray | int]:
         "ball_handling_skill": ball_handling_skill,
         "passing_skill": passing_skill,
         "shot_contest_skill": shot_contest_skill,
+        "rim_protection_skill": _player_episode_skill_array(env, "rim_protection_skill", 0.0),
+        "contested_shooting_skill": _player_episode_skill_array(env, "contested_shooting_skill", 0.0),
         "offense_team": TEAM_A,
         "starting_offense_team": TEAM_A,
         "team_a_completed_possessions": 0,
@@ -938,6 +975,8 @@ def stack_state_snapshots(
     xp,
 ) -> KernelState:
     return KernelState(
+        contested_shooting_skill=xp.asarray(np.stack([item.get("contested_shooting_skill", np.zeros_like(item["dunk_pct"])) for item in snapshots]), dtype=xp.float32),
+        rim_protection_skill=xp.asarray(np.stack([item.get("rim_protection_skill", np.zeros_like(item["dunk_pct"])) for item in snapshots]), dtype=xp.float32),
         positions=xp.asarray(
             np.stack([np.asarray(item["positions"], dtype=np.int32) for item in snapshots], axis=0),
             dtype=xp.int32,
@@ -1403,6 +1442,8 @@ def _compiled_rebound_target_probs(env, cells: list[tuple[int, int]]) -> np.ndar
     model = FittedReboundTableModel.load(model_dir, court=court)
     dense = np.zeros((4, n_cells, n_cells), dtype=np.float32)
     row_counts = np.zeros((4, n_cells), dtype=np.int32)
+    basket_distances = _hex_distance(np.asarray(cells), np.asarray(env.basket_position), np)
+    layup_neighbor_rows = []
     for jax_shot_idx in range(n_cells):
         court_shot_idx = int(jax_to_court[jax_shot_idx])
         shot_type_name = model.shot_type_for_shot(court, court_shot_idx)
@@ -1419,11 +1460,20 @@ def _compiled_rebound_target_probs(env, cells: list[tuple[int, int]]) -> np.ndar
             probs_jax = probs_jax / total
         dense[jax_type, jax_shot_idx, :] = probs_jax.astype(np.float32)
         row_counts[jax_type, jax_shot_idx] = 1
+        if basket_distances[jax_shot_idx] == 1:
+            # Every legal distance-one cell uses layup_pct. Keep its fitted
+            # geometry (including finger rolls) and already-reflected targets.
+            layup_neighbor_rows.append(probs_jax)
 
     for shot_type in range(1, 4):
         missing = row_counts[shot_type] == 0
         dense[shot_type, missing, :] = fallback[shot_type, missing, :]
     dense[SHOT_TYPE_NONE, :, :] = fallback[SHOT_TYPE_NONE, :, :]
+    if bool(getattr(env, "prefer_higher_percentage_shot", False)):
+        if not layup_neighbor_rows:
+            raise ValueError("Under-basket layup rebounds require legal distance-one cells.")
+        layup_mixture = np.mean(layup_neighbor_rows, axis=0)
+        dense[SHOT_TYPE_TWO, basket_idx, :] = layup_mixture / layup_mixture.sum()
     return dense
 
 def _compiled_start_template_arrays(env) -> dict[str, np.ndarray | float | bool]:
@@ -1792,6 +1842,8 @@ def _build_kernel_static_from_source(env, xp) -> KernelStatic:
             raise ValueError("Technical-foul inbound position must border the playable court.")
 
     return KernelStatic(
+        **{key: xp.asarray(getattr(env, key, default), dtype=xp.int8 if isinstance(default, bool) else xp.float32)
+           for key, default in SHOT_DEFENSE_DEFAULTS.items()},
         cell_coords=xp.asarray(np.asarray(cells, dtype=np.int32), dtype=xp.int32),
         basket_distance_by_cell=xp.asarray(basket_distance, dtype=xp.int32),
         cell_distance_matrix=xp.asarray(cell_distance_matrix, dtype=xp.int32),
@@ -1826,6 +1878,9 @@ def _build_kernel_static_from_source(env, xp) -> KernelStatic:
         offensive_lane_by_cell=xp.asarray(offensive_lane_mask, dtype=xp.int8),
         defensive_lane_by_cell=xp.asarray(defensive_lane_mask, dtype=xp.int8),
         allow_dunks=xp.asarray(1 if env.allow_dunks else 0, dtype=xp.int8),
+        prefer_higher_percentage_shot=xp.asarray(
+            env.prefer_higher_percentage_shot, dtype=xp.int8
+        ),
         mask_occupied_moves=xp.asarray(1 if env.mask_occupied_moves else 0, dtype=xp.int8),
         enable_pass_gating=xp.asarray(1 if env.enable_pass_gating else 0, dtype=xp.int8),
         shot_pressure_enabled=xp.asarray(1 if env.shot_pressure_enabled else 0, dtype=xp.int8),
@@ -2734,8 +2789,21 @@ def build_shot_profile_batch(static: KernelStatic, state: KernelState, jnp):
         base_prob - (static.three_pt_extra_hex_decay * extra_hexes),
         base_prob,
     )
+    is_dunk = (
+        static.allow_dunks.astype(jnp.bool_)
+        & (distances == 0)
+        & (
+            ~static.prefer_higher_percentage_shot.astype(jnp.bool_)
+            | (state.dunk_pct >= state.layup_pct)
+        )
+    )
+    shot_type = jnp.where(
+        is_dunk,
+        SHOT_TYPE_DUNK,
+        jnp.where(is_three & (distances > 0), SHOT_TYPE_THREE, SHOT_TYPE_TWO),
+    ).astype(jnp.int32)
     base_prob = jnp.where(
-        static.allow_dunks.astype(jnp.bool_) & (distances == 0),
+        is_dunk,
         state.dunk_pct,
         base_prob,
     )
@@ -2766,6 +2834,7 @@ def build_shot_profile_batch(static: KernelStatic, state: KernelState, jnp):
         -static.shot_pressure_lambda * (defender_distance - 1.0)
     )
     pressure_reduction = distance_reduction * (angle_factor**2)
+    geometric_reduction = pressure_reduction
     contest_adjusted_reduction = _skill_adjust_probability(
         pressure_reduction,
         state.shot_contest_skill[:, None, :],
@@ -2778,6 +2847,18 @@ def build_shot_profile_batch(static: KernelStatic, state: KernelState, jnp):
         pressure_reduction,
         contest_adjusted_reduction,
     )
+    suppression_before_resistance = jnp.max(jnp.where(valid_defender, pressure_reduction, 0.0), axis=-1)
+    resistance_skill = state.contested_shooting_skill
+    if resistance_skill is None:
+        resistance_skill = jnp.zeros_like(state.layup_pct)
+    resistance = static.contested_shooting_effect_weight * resistance_skill
+    resisted_reduction = _skill_adjust_probability(
+        geometric_reduction,
+        static.shot_contest_skill_effect_weight * state.shot_contest_skill[:, None, :] - resistance[:, :, None],
+        jnp.asarray(1.0, dtype=jnp.float32), jnp,
+    )
+    use_resistance = static.contested_shooting_enabled.astype(jnp.bool_) & (distances > 1) & (resistance != 0.0)
+    pressure_reduction = jnp.where(use_resistance[:, :, None], resisted_reduction, pressure_reduction)
     masked_reduction = jnp.where(
         valid_defender,
         pressure_reduction,
@@ -2796,18 +2877,53 @@ def build_shot_profile_batch(static: KernelStatic, state: KernelState, jnp):
         jnp.ones_like(pressure_multiplier),
     )
 
-    probability = jnp.clip(base_prob * pressure_multiplier, 0.01, 0.99)
-    shot_value = jnp.where(
-        static.allow_dunks.astype(jnp.bool_) & (distances == 0),
-        jnp.full_like(probability, 2.0),
-        jnp.where(is_three, jnp.full_like(probability, 3.0), jnp.full_like(probability, 2.0)),
+    legacy_probability = jnp.clip(base_prob * pressure_multiplier, 0.01, 0.99)
+    is_finish = distances <= 1
+    rim_enabled = static.rim_protection_enabled.astype(jnp.bool_) & is_finish
+    rim_eligible = (
+        static.opponent_mask[None, :, :].astype(jnp.bool_)
+        & (defender_distance == 1)
+        & found[:, :, None] & found[:, None, :]
+        & rim_enabled[:, :, None]
     )
+    rim_skill = state.rim_protection_skill
+    if rim_skill is None:  # Historical in-memory state without the new skill.
+        rim_skill = jnp.zeros_like(state.layup_pct)
+    individual_contest = _skill_adjust_probability(
+        static.rim_protection_contest_base, rim_skill[:, None, :],
+        static.rim_protection_contest_effect_weight, jnp,
+    )
+    individual_block = _skill_adjust_probability(
+        static.rim_protection_block_base, rim_skill[:, None, :],
+        static.rim_protection_block_effect_weight, jnp,
+    )
+    rim_reduction = jnp.max(jnp.where(rim_eligible, individual_contest, 0.0), axis=-1)
+    block_probability = jnp.max(jnp.where(rim_eligible, individual_block, 0.0), axis=-1)
+    blocker_candidates = rim_eligible & (individual_block == block_probability[:, :, None])
+    pressure_multiplier = jnp.where(rim_enabled, 1.0 - rim_reduction, pressure_multiplier)
+    conditional_probability = jnp.where(
+        rim_enabled, jnp.clip(base_prob * pressure_multiplier, 0.01, 0.99), legacy_probability,
+    )
+    probability = conditional_probability * (1.0 - block_probability)
+    shot_value = jnp.where(shot_type == SHOT_TYPE_THREE, 3.0, 2.0)
     expected_points = shot_value * probability
 
     return {
         "distance": distances,
         "is_three": is_three,
+        "shot_type": shot_type,
         "base_probability": base_prob,
+        "is_finish": is_finish,
+        "suppression_before_resistance": jnp.where(
+            rim_enabled, rim_reduction,
+            jnp.where(static.shot_pressure_enabled.astype(jnp.bool_), suppression_before_resistance, 0.0),
+        ),
+        "suppression_after_resistance": 1.0 - pressure_multiplier,
+        "rim_contested": jnp.any(rim_eligible, axis=-1),
+        "block_probability": block_probability,
+        "blocker_candidates": blocker_candidates,
+        "conditional_probability": conditional_probability,
+        "contested": jnp.where(rim_enabled, jnp.any(rim_eligible, axis=-1), has_pressure & static.shot_pressure_enabled.astype(jnp.bool_)),
         "pressure_multiplier": pressure_multiplier,
         "probability": probability,
         "shot_value": shot_value,
@@ -2830,8 +2946,8 @@ def _build_legacy_phi_expected_points_batch(static: KernelStatic, state: KernelS
     The JAX shot-profile features intentionally interpolate make probability by
     continuous court distance.  The legacy Python potential function instead
     calls ``_calculate_shot_probability`` with *hex* distance.  Keep that
-    distinction here so Phi shaping remains transition-equivalent without
-    changing the observation/profile contract.
+    distance convention here while sharing the current dunk/layup selection
+    with the shot profile.
     """
     profile = build_shot_profile_batch(static, state, jnp)
     distances = profile["distance"].astype(jnp.float32)
@@ -2849,7 +2965,7 @@ def _build_legacy_phi_expected_points_batch(static: KernelStatic, state: KernelS
         base_probability,
     )
     base_probability = jnp.where(
-        static.allow_dunks.astype(jnp.bool_) & (distances == 0.0),
+        profile["shot_type"] == SHOT_TYPE_DUNK,
         state.dunk_pct,
         base_probability,
     )
@@ -2859,16 +2975,8 @@ def _build_legacy_phi_expected_points_batch(static: KernelStatic, state: KernelS
         0.01,
         0.99,
     )
-    shot_value = jnp.where(
-        static.allow_dunks.astype(jnp.bool_) & (distances == 0.0),
-        jnp.full_like(probability, 2.0),
-        jnp.where(
-            profile["is_three"],
-            jnp.full_like(probability, 3.0),
-            jnp.full_like(probability, 2.0),
-        ),
-    )
-    return shot_value * probability
+    shot_value = profile["shot_value"]
+    return shot_value * probability * (1.0 - profile["block_probability"])
 
 
 def _local_rebound_contest_mask_from_distances(
@@ -2996,25 +3104,11 @@ def build_rebound_observation_features_batch(
         jnp.asarray(0, dtype=jnp.int32),
     )
 
-    holder_distance = jnp.take_along_axis(
-        shot_profile["distance"],
+    shot_type = jnp.take_along_axis(
+        shot_profile["shot_type"],
         safe_holder[:, None],
         axis=1,
     )[:, 0]
-    holder_is_three = jnp.take_along_axis(
-        shot_profile["is_three"].astype(jnp.int8),
-        safe_holder[:, None],
-        axis=1,
-    )[:, 0].astype(jnp.bool_)
-    shot_type = jnp.where(
-        static.allow_dunks.astype(jnp.bool_) & (holder_distance == 0),
-        jnp.asarray(SHOT_TYPE_DUNK, dtype=jnp.int32),
-        jnp.where(
-            holder_is_three,
-            jnp.asarray(SHOT_TYPE_THREE, dtype=jnp.int32),
-            jnp.asarray(SHOT_TYPE_TWO, dtype=jnp.int32),
-        ),
-    )
     rebound_available = (
         static.enable_rebounds.astype(jnp.bool_)
         & holder_valid
@@ -4026,6 +4120,7 @@ def build_flat_observation_batch_with_role_flag(
     multi_possession_features: bool = False,
     check_clearance_features: bool = False,
     team_clearance_features: bool = False,
+    shooting_skill_features: bool = False,
 ):
     batch_size = state.positions.shape[0]
     role_flag = _broadcast_role_flag_batch(role_flag_value, batch_size, jnp)[:, None]
@@ -4077,6 +4172,9 @@ def build_flat_observation_batch_with_role_flag(
             static, state, jnp
         )
         parts.extend([team_players.reshape(batch_size, -1), team_globals])
+    if shooting_skill_features:
+        parts.extend([jnp.where(static.rim_protection_enabled, state.rim_protection_skill, 0.0),
+                      jnp.where(static.contested_shooting_enabled, state.contested_shooting_skill, 0.0)])
     parts.extend(
         [
             role_flag,
@@ -4096,6 +4194,7 @@ def build_flat_observation_batch(
     multi_possession_features: bool = False,
     check_clearance_features: bool = False,
     team_clearance_features: bool = False,
+    shooting_skill_features: bool = False,
 ):
     return build_flat_observation_batch_with_role_flag(
         static,
@@ -4106,6 +4205,7 @@ def build_flat_observation_batch(
         rebound_target_observation_features=rebound_target_observation_features,
         multi_possession_features=multi_possession_features,
         check_clearance_features=check_clearance_features,
+        shooting_skill_features=shooting_skill_features,
         team_clearance_features=team_clearance_features,
     )
 
@@ -4140,6 +4240,7 @@ def build_token_observation_components_batch(
     multi_possession_features: bool = False,
     check_clearance_features: bool = False,
     team_clearance_features: bool = False,
+    shooting_skill_features: bool = False,
 ):
     """Build set-observation components matching the production token layout."""
     batch_size, n_players, _ = state.positions.shape
@@ -4314,6 +4415,9 @@ def build_token_observation_components_batch(
         )
         players = jnp.concatenate([players, team_players], axis=-1)
         globals_vec = jnp.concatenate([globals_vec, team_globals], axis=-1)
+    if shooting_skill_features:
+        players = jnp.concatenate([players, jnp.stack([jnp.where(static.rim_protection_enabled, state.rim_protection_skill, 0.0),
+                                                     jnp.where(static.contested_shooting_enabled, state.contested_shooting_skill, 0.0)], axis=-1)], axis=-1)
     role_flag = _broadcast_role_flag_batch(role_flag_value, batch_size, jnp)[:, None]
     return players, globals_vec, role_flag
 
@@ -4357,6 +4461,7 @@ def build_token_observation_batch_with_role_flag(
     multi_possession_features: bool = False,
     check_clearance_features: bool = False,
     team_clearance_features: bool = False,
+    shooting_skill_features: bool = False,
 ):
     players, globals_vec, role_flag = build_token_observation_components_batch(
         static,
@@ -4367,6 +4472,7 @@ def build_token_observation_batch_with_role_flag(
         rebound_target_observation_features=rebound_target_observation_features,
         multi_possession_features=multi_possession_features,
         check_clearance_features=check_clearance_features,
+        shooting_skill_features=shooting_skill_features,
         team_clearance_features=team_clearance_features,
     )
     players = canonicalize_player_tokens_by_active_role(
@@ -4395,6 +4501,7 @@ def build_token_observation_batch(
     multi_possession_features: bool = False,
     check_clearance_features: bool = False,
     team_clearance_features: bool = False,
+    shooting_skill_features: bool = False,
 ):
     return build_token_observation_batch_with_role_flag(
         static,
@@ -4405,6 +4512,7 @@ def build_token_observation_batch(
         rebound_target_observation_features=rebound_target_observation_features,
         multi_possession_features=multi_possession_features,
         check_clearance_features=check_clearance_features,
+        shooting_skill_features=shooting_skill_features,
         team_clearance_features=team_clearance_features,
     )
 
@@ -4421,6 +4529,7 @@ def build_policy_observation_batch_with_role_flag(
     multi_possession_features: bool = False,
     check_clearance_features: bool = False,
     team_clearance_features: bool = False,
+    shooting_skill_features: bool = False,
 ):
     if str(model_type) == "attention":
         return build_token_observation_batch_with_role_flag(
@@ -4432,6 +4541,7 @@ def build_policy_observation_batch_with_role_flag(
             rebound_target_observation_features=rebound_target_observation_features,
             multi_possession_features=multi_possession_features,
             check_clearance_features=check_clearance_features,
+            shooting_skill_features=shooting_skill_features,
             team_clearance_features=team_clearance_features,
         )
     return build_flat_observation_batch_with_role_flag(
@@ -4443,6 +4553,7 @@ def build_policy_observation_batch_with_role_flag(
         rebound_target_observation_features=rebound_target_observation_features,
         multi_possession_features=multi_possession_features,
         check_clearance_features=check_clearance_features,
+        shooting_skill_features=shooting_skill_features,
         team_clearance_features=team_clearance_features,
     )
 
@@ -4458,6 +4569,7 @@ def build_policy_observation_batch(
     multi_possession_features: bool = False,
     check_clearance_features: bool = False,
     team_clearance_features: bool = False,
+    shooting_skill_features: bool = False,
 ):
     return build_policy_observation_batch_with_role_flag(
         static,
@@ -4469,6 +4581,7 @@ def build_policy_observation_batch(
         rebound_target_observation_features=rebound_target_observation_features,
         multi_possession_features=multi_possession_features,
         check_clearance_features=check_clearance_features,
+        shooting_skill_features=shooting_skill_features,
         team_clearance_features=team_clearance_features,
     )
 
@@ -6190,6 +6303,15 @@ def _step_single_minimal(
 
     def _already_done(_):
         return StepBatchOutput(
+            shot_suppression_before_resistance=zero_float,
+            shot_suppression_after_resistance=zero_float,
+            shot_blocked=zero_flag,
+            shot_blocker=no_player,
+            shot_is_finish=zero_flag,
+            shot_contested=zero_flag,
+            shot_open_probability=zero_float,
+            shot_conditional_probability=zero_float,
+            shot_block_probability=zero_float,
             state=state,
             rewards=zero_rewards,
             done=jnp.asarray(True),
@@ -6950,6 +7072,15 @@ def _step_single_minimal(
                 & pressure_state.clearance_achieved.astype(jnp.bool_)
             )
             return StepBatchOutput(
+                shot_suppression_before_resistance=zero_float,
+                shot_suppression_after_resistance=zero_float,
+                shot_blocked=zero_flag,
+                shot_blocker=no_player,
+                shot_is_finish=zero_flag,
+                shot_contested=zero_flag,
+                shot_open_probability=zero_float,
+                shot_conditional_probability=zero_float,
+                shot_block_probability=zero_float,
                 state=pressure_state,
                 rewards=pressure_rewards,
                 done=pressure_done,
@@ -7089,11 +7220,9 @@ def _step_single_minimal(
 
             if_state = _single_state_to_batched(shot_clock_state, jnp)
             shot_profile = build_shot_profile_batch(static, if_state, jnp)
-            shot_probabilities = shot_profile["probability"][0]
             shot_values = shot_profile["shot_value"][0]
             shot_ep_all = shot_profile["expected_points"][0]
             shot_distances = shot_profile["distance"][0]
-            shot_is_three = shot_profile["is_three"][0]
 
             def _do_clearance_violation(_):
                 return (
@@ -7114,9 +7243,17 @@ def _step_single_minimal(
                     no_player,
                 )
 
+            block_draw = jax.random.uniform(jax.random.fold_in(shot_key, 84))
+            blocked = block_draw < shot_profile["block_probability"][0, safe_holder]
+            blocker_candidates = shot_profile["blocker_candidates"][0, safe_holder]
+            blocker = jax.random.categorical(
+                jax.random.fold_in(shot_key, 85),
+                jnp.where(blocker_candidates, 0.0, -jnp.inf),
+            ).astype(jnp.int32)
+
             def _do_shot(_):
                 draw = jax.random.uniform(shot_key)
-                success = draw < shot_probabilities[safe_holder]
+                success = (~blocked) & (draw < shot_profile["conditional_probability"][0, safe_holder])
                 new_holder = jnp.where(success, ball_holder_after, jnp.asarray(-1, dtype=jnp.int32))
                 return (
                     new_holder,
@@ -7294,15 +7431,7 @@ def _step_single_minimal(
 
             shot_type = jnp.where(
                 shot_active,
-                jnp.where(
-                    shot_distance <= 0.0,
-                    jnp.asarray(SHOT_TYPE_DUNK, dtype=jnp.int32),
-                    jnp.where(
-                        shot_is_three[safe_holder].astype(jnp.bool_),
-                        jnp.asarray(SHOT_TYPE_THREE, dtype=jnp.int32),
-                        jnp.asarray(SHOT_TYPE_TWO, dtype=jnp.int32),
-                    ),
-                ),
+                shot_profile["shot_type"][0, safe_holder],
                 jnp.asarray(SHOT_TYPE_NONE, dtype=jnp.int32),
             )
 
@@ -7692,6 +7821,19 @@ def _step_single_minimal(
                 operand=None,
             )
             per_team_violation = static.violation_reward / static.offense_ids.shape[0]
+            # The defensive technical controls this tick's restart. Its
+            # interrupted pass must not also count as a completion, failed
+            # pass, turnover, or steal in training/evaluation statistics.
+            rewards = rewards - (
+                jnp.where(offense_mask, per_team_pass, -per_team_pass)
+                * (defensive_lane_violation & pass_success).astype(jnp.float32)
+            )
+            pass_success = pass_success & (~defensive_lane_violation)
+            is_pass = is_pass & (~defensive_lane_violation)
+            pass_attempt = is_pass.astype(jnp.int8)
+            offensive_three_seconds_turnover = (
+                offensive_three_seconds_turnover & (~defensive_lane_violation)
+            )
             rewards = rewards + (
                 jnp.where(offense_mask, per_team_violation, -per_team_violation)
                 * defensive_lane_violation.astype(jnp.float32)
@@ -7700,10 +7842,13 @@ def _step_single_minimal(
             shot_clock_turnover = (final_state.shot_clock <= 0) & (~shot_active)
             done = done | offensive_three_seconds_turnover
             turnover_event = (
-                turnover_from_action
-                | movement_turnover
-                | offensive_three_seconds_turnover
-                | shot_clock_turnover
+                (
+                    turnover_from_action
+                    | movement_turnover
+                    | offensive_three_seconds_turnover
+                    | shot_clock_turnover
+                )
+                & (~defensive_lane_violation)
             ).astype(jnp.int8)
             turnover_player = jnp.where(
                 turnover_from_action,
@@ -7737,7 +7882,7 @@ def _step_single_minimal(
             )
             turnover_player = jnp.where(turnover_event.astype(jnp.bool_), turnover_player, no_player)
             turnover_reason = jnp.where(turnover_event.astype(jnp.bool_), turnover_reason, no_reason)
-            possession_ended = done | shot_clock_turnover
+            possession_ended = (done | shot_clock_turnover) & (~defensive_lane_violation)
             possession_end_reason = jnp.where(
                 turnover_event.astype(jnp.bool_),
                 jnp.asarray(POSSESSION_END_TURNOVER, dtype=jnp.int32),
@@ -7796,7 +7941,13 @@ def _step_single_minimal(
                 return (
                     _restart_after_defensive_technical_single(
                         static,
-                        final_state,
+                        _replace_state(
+                            final_state,
+                            # Locate the restart from the interrupted offense,
+                            # not the nullified interception's new holder.
+                            ball_holder=shot_clock_state.ball_holder,
+                            clearance_achieved=state.clearance_achieved,
+                        ),
                         shot_clock_before_interruption=state.shot_clock,
                         inbound_selection_key=inbound_selection_key,
                         jax=jax,
@@ -7864,6 +8015,15 @@ def _step_single_minimal(
                 )
             )
             return StepBatchOutput(
+                shot_suppression_before_resistance=jnp.where(shot_active, shot_profile["suppression_before_resistance"][0, safe_holder], zero_float),
+                shot_suppression_after_resistance=jnp.where(shot_active, shot_profile["suppression_after_resistance"][0, safe_holder], zero_float),
+                shot_blocked=(shot_active & blocked).astype(jnp.int8),
+                shot_blocker=jnp.where(shot_active & blocked, blocker, no_player),
+                shot_is_finish=(shot_active & shot_profile["is_finish"][0, safe_holder]).astype(jnp.int8),
+                shot_contested=(shot_active & shot_profile["contested"][0, safe_holder]).astype(jnp.int8),
+                shot_open_probability=jnp.where(shot_active, shot_profile["base_probability"][0, safe_holder], zero_float),
+                shot_conditional_probability=jnp.where(shot_active, shot_profile["conditional_probability"][0, safe_holder], zero_float),
+                shot_block_probability=jnp.where(shot_active, shot_profile["block_probability"][0, safe_holder], zero_float),
                 state=final_state,
                 rewards=rewards,
                 done=done,
@@ -8664,7 +8824,18 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         static.enable_intent_learning.astype(jnp.bool_)
         & (jax.random.uniform(intent_visible_key) < static.intent_visible_to_defense_prob)
     )
+    rim_protection_skill = rim_skill_from_block_sample(
+        static.rim_protection_block_distribution_max * jax.random.beta(
+            jax.random.fold_in(key, 107), static.rim_protection_beta_alpha,
+            static.rim_protection_beta_beta, shape=(n_players,), dtype=jnp.float32,
+        ), static.rim_protection_skill_block_reference, jnp,
+    )
+    contested_shooting_skill = static.contested_shooting_skill_mean + static.contested_shooting_skill_std * jax.random.normal(
+        jax.random.fold_in(key, 108), shape=(n_players,), dtype=jnp.float32,
+    )
     initial_state = KernelState(
+        contested_shooting_skill=contested_shooting_skill,
+        rim_protection_skill=rim_protection_skill,
         positions=positions,
         ball_holder=ball_holder,
         shot_clock=shot_clock,

@@ -1,10 +1,11 @@
-import copy
 import time
 import multiprocessing as mp
 
 from fastapi import APIRouter, HTTPException
 from fastapi.encoders import jsonable_encoder
 import numpy as np
+from basketworld_jax.scoring_metrics import read_native_scoring_summary
+
 from basketworld.domain import Team
 from basketworld_jax.eval import can_run_native_jax_evaluation
 
@@ -45,7 +46,7 @@ _ACTION_MODE_MATRIX = (
 
 def _action_mode_matrix_cell(raw_results: dict, *, player_deterministic: bool, ai_deterministic: bool) -> dict:
     diagnostics = raw_results.get("eval_diagnostics", {}) or {}
-    summary = diagnostics.get("jax_native_summary", {}) or {}
+    summary = read_native_scoring_summary(diagnostics.get("jax_native_summary", {}) or {})
     completed = int(summary.get("completed_games", 0) or 0)
 
     def _rate(key: str) -> float:
@@ -54,8 +55,8 @@ def _action_mode_matrix_cell(raw_results: dict, *, player_deterministic: bool, a
     keys = (
         "completion_rate",
         "completed_margin_mean",
-        "user_points_per_possession",
-        "opponent_points_per_possession",
+        "user_points_per_completed_offensive_possession",
+        "opponent_points_per_completed_offensive_possession",
         "spatial_live_step_count",
         "mean_live_all_player_pair_distance",
         "mean_live_offense_teammate_pair_distance",

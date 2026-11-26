@@ -187,6 +187,22 @@ def get_shot_probability(player_id: int):
     if game_state.env is None:
         raise HTTPException(status_code=400, detail="Game not initialized")
     try:
+        runtime = getattr(game_state, "jax_runtime", None)
+        if runtime is not None:
+            from basketworld_jax.env.minimal import build_shot_profile_batch, SHOT_TYPE_DUNK
+            if not 0 <= player_id < runtime.n_players:
+                raise ValueError("Player ID is out of range.")
+            profile = runtime.jax.device_get(build_shot_profile_batch(runtime.static, runtime.state, runtime.jnp))
+            return {
+                "player_id": player_id,
+                "shot_probability": float(profile["base_probability"][0, player_id]),
+                "shot_probability_final": float(profile["probability"][0, player_id]),
+                "shot_probability_if_unblocked": float(profile["conditional_probability"][0, player_id]),
+                "block_probability": float(profile["block_probability"][0, player_id]),
+                "distance": int(profile["distance"][0, player_id]),
+                "is_three": bool(profile["is_three"][0, player_id]),
+                "is_dunk": int(profile["shot_type"][0, player_id]) == SHOT_TYPE_DUNK,
+            }
         env = getattr(game_state.env, "unwrapped", game_state.env)
         player_pos = env.positions[player_id]
         basket_pos = env.basket_position

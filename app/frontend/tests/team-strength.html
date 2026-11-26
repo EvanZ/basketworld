@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en"><head><meta charset="UTF-8"><title>Team strength UI regression</title></head>
+<body>
+<div id="app"></div>
+<script type="module">
+import { createApp, h, ref } from 'vue';
+import SkillRatingsWorkbench from '/src/components/SkillRatingsWorkbench.vue';
+import { teamStrengthFixture } from './team-strength-fixtures.mjs';
+import '/src/assets/main.css';
+const fixture = teamStrengthFixture();
+let finishSlowReport = () => {};
+// This test page never talks to the live game or launches studies.
+window.fetch = async (url) => {
+  const parsed = new URL(url, location.href);
+  let body;
+  if (parsed.pathname.endsWith('/reports')) body = { reports: ['test-study', 'other-model', 'slow-report', 'failed-report'].map(path => ({ ...fixture.report.summary, path, study_id: path })) };
+  else if (parsed.pathname.endsWith('/report')) {
+    if (parsed.searchParams.get('path') === 'slow-report') await new Promise(resolve => { finishSlowReport = resolve; });
+    if (parsed.searchParams.get('path') === 'failed-report') return new Response(JSON.stringify({ detail: 'Test report unavailable' }), { status: 500 });
+    body = structuredClone(fixture.report);
+    if (parsed.searchParams.get('path') === 'other-model') body.summary.checkpoint = '/other/model';
+  } else if (parsed.pathname.endsWith('/jobs/active')) body = { job: null };
+  else throw new Error('Unexpected test request: ' + url);
+  return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+};
+createApp({
+  components: { SkillRatingsWorkbench },
+  setup() {
+    const state = ref(fixture.state);
+    function changeSkills() { state.value.player_rebound_skills[0] = 2; }
+    function wrongTeamSize() { state.value.team_a_ids.pop(); }
+    return () => h('main', { style: 'max-width:1200px;margin:auto;padding:20px' }, [
+      h('button', { onClick: changeSkills }, 'Change current skills'),
+      h('button', { onClick: wrongTeamSize }, 'Change team size'),
+      h('button', { onClick: () => finishSlowReport() }, 'Finish slow report'),
+      h(SkillRatingsWorkbench, { gameState: state.value, checkpointPath: state.value.model_metadata.checkpoint_path, checkpointUpdate: 2500, modelBackend: 'jax' }),
+    ]);
+  },
+}).mount('#app');
+</script>
+</body></html>

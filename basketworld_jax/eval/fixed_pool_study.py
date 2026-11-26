@@ -16,6 +16,7 @@ from time import perf_counter
 from typing import Any, Callable, Mapping, Sequence
 
 from basketworld.utils.mlflow_config import setup_mlflow
+from basketworld_jax.shot_defense import shot_defense_contract, shot_defense_enabled
 from basketworld_jax.checkpoints import load_checkpoint, load_checkpoint_metadata
 from basketworld_jax.config import JaxEnvironmentConfig
 from basketworld_jax.eval.fixed_pool import (
@@ -42,7 +43,7 @@ from basketworld_jax.eval.lineup_schedule import (
 )
 from basketworld_jax.inference import require_checkpoint_path
 from basketworld_jax.eval.native import run_native_jax_evaluation
-from basketworld_jax.eval.skills import ACTIVE_PLAYER_SKILL_REGISTRY
+from basketworld_jax.eval.skills import registry_for_environment
 
 
 FIXED_POOL_REPORT_NAMESPACE = "fixed_pool_reports"
@@ -50,7 +51,7 @@ FIXED_POOL_OPERATION_SCHEMA_VERSION = 1
 FIXED_POOL_SAMPLING_SCHEME = "independent_skill_coverage_v1"
 # Bump whenever the derived model semantics change so immutable historical
 # reports remain interpretable alongside later analyses of the same raw games.
-FIXED_POOL_REANALYSIS_SCHEMA_VERSION = 8
+FIXED_POOL_REANALYSIS_SCHEMA_VERSION = 9
 
 
 class FixedPoolStudyRunError(ValueError):
@@ -130,16 +131,16 @@ def _parse_checkpoint_paths(args) -> list[Path]:
     return deduplicated
 
 
-def _study_skill_sampling_overrides() -> dict[str, dict[str, float]]:
+def _study_skill_sampling_overrides(environment=None) -> dict[str, dict[str, float]]:
     """Return deliberate skill variation for an estimable study pool.
 
-    Production defaults intentionally leave every synthetic skill at its
-    baseline.  A fixed-pool study needs nonzero support for every registered
-    coefficient, otherwise skill and player-value models are rank deficient
-    before a game is played.
+    Vary the skills supported by the checkpoint's trained rules. Legacy
+    checkpoints must not acquire new abilities simply because the evaluator
+    has been upgraded. New skill sampling follows the trained distribution.
     """
     overrides: dict[str, dict[str, float]] = {}
-    for descriptor in ACTIVE_PLAYER_SKILL_REGISTRY.descriptors:
+    registry = registry_for_environment(environment)
+    for descriptor in registry.descriptors:
         defaults = dict(descriptor.sampling_defaults)
         mean = float(defaults.get("default_mean", 0.0))
         if descriptor.minimum is not None and descriptor.maximum is not None:
@@ -151,10 +152,23 @@ def _study_skill_sampling_overrides() -> dict[str, dict[str, float]]:
             # deviation supplies balanced positive and negative support.
             std = 1.0
         overrides[descriptor.key] = {"mean": mean, "std": float(std)}
+    environment = environment or {}
+    if "rim_protection" not in registry.keys:
+        return overrides
+    overrides["rim_protection"] = {
+        "alpha": float(environment.get("rim_protection_beta_alpha", 1.0)),
+        "beta": float(environment.get("rim_protection_beta_beta", 3.0)),
+        "maximum": float(environment.get("rim_protection_block_distribution_max", 0.1)),
+        "reference": float(environment.get("rim_protection_skill_block_reference", 0.02)),
+    }
+    overrides["contested_shooting"] = {
+        "mean": float(environment.get("contested_shooting_skill_mean", 0.0)),
+        "std": float(environment.get("contested_shooting_skill_std", 1.0)),
+    }
     return overrides
 
 
-def _load_or_create_pool(args) -> tuple[PlayerPool, Path, bool]:
+def _load_or_create_pool(args, environment=None) -> tuple[PlayerPool, Path, bool]:
     path_text = str(getattr(args, "fixed_pool_path", "") or "").strip()
     if not path_text:
         raise FixedPoolStudyRunError("--fixed-pool-path is required for a study run.")
@@ -165,23 +179,28 @@ def _load_or_create_pool(args) -> tuple[PlayerPool, Path, bool]:
             raise FixedPoolStudyRunError(
                 "--fixed-pool-create requires a new path; immutable pool already exists."
             )
-        return load_player_pool(path), path, False
+        pool = load_player_pool(path)
+        if shot_defense_enabled(environment or {}) and pool.skill_schema_version < 2:
+            raise FixedPoolStudyRunError("This checkpoint requires the two new persistent skills; create a new pool instead of resampling historical players.")
+        return pool, path, False
     if not create:
         raise FixedPoolStudyRunError(
             "Fixed pool does not exist. Pass --fixed-pool-create to create it."
         )
     configured_size = int(getattr(args, "fixed_pool_size", 0) or 0)
+    registry = registry_for_environment(environment)
     default_size = fixed_pool_study_budget(
-        len(ACTIVE_PLAYER_SKILL_REGISTRY.descriptors)
+        len(registry.descriptors)
     )["seeded_players"]
     pool = generate_player_pool(
         player_count=configured_size if configured_size > 0 else default_size,
         seed=int(getattr(args, "fixed_pool_seed", 0)),
-        sampling_overrides=_study_skill_sampling_overrides(),
+        registry=registry,
+        sampling_overrides=_study_skill_sampling_overrides(environment),
         extra_fields={
             "fixed_pool_sampling": {
                 "scheme": FIXED_POOL_SAMPLING_SCHEME,
-                "overrides": _study_skill_sampling_overrides(),
+                "overrides": _study_skill_sampling_overrides(environment),
             }
         },
     )
@@ -212,7 +231,7 @@ def _load_or_create_schedule(
         )
     configured_games = int(getattr(args, "fixed_pool_games", 0) or 0)
     default_games = fixed_pool_study_budget(
-        len(ACTIVE_PLAYER_SKILL_REGISTRY.descriptors), team_size=team_size
+        len(pool.skill_descriptors), team_size=team_size
     )["games"]
     game_count = configured_games if configured_games > 0 else default_games
     schedule = build_balanced_lineup_schedule(
@@ -255,6 +274,9 @@ def _checkpoint_study_environments(
             "All checkpoints in a fixed-pool study must use the same team size. "
             "Create separate studies for different team sizes."
         )
+    contracts = [shot_defense_contract(params[0]) for params in environments.values()]
+    if any(contract != contracts[0] for contract in contracts[1:]):
+        raise FixedPoolStudyRunError("All checkpoints must use the same shot-defense rule and skill-distribution contract.")
     return environments
 
 
@@ -597,6 +619,7 @@ def _longitudinal_payload(reports: Sequence[Mapping[str, Any]]) -> dict[str, Any
             report.get("schema_compatibility", {}).get(
                 "environment_observation_schema_version"
             ),
+            json.dumps(report.get("schema_compatibility", {}).get("shot_defense_contract"), sort_keys=True),
         )
         for report in reports
     }
@@ -644,7 +667,7 @@ def run_fixed_pool_study(
     checkpoint_paths = _parse_checkpoint_paths(args)
     environments = _checkpoint_study_environments(checkpoint_paths)
     team_size = int(environments[checkpoint_paths[0]][0]["players"])
-    pool, pool_path, pool_created = _load_or_create_pool(args)
+    pool, pool_path, pool_created = _load_or_create_pool(args, environments[checkpoint_paths[0]][0])
     _validate_pool_team_size(len(pool.players), team_size)
     extension_source_text = str(
         getattr(args, "fixed_pool_extension_source", "") or ""
@@ -654,6 +677,13 @@ def run_fixed_pool_study(
     if extension_source_text:
         extension_source_root = Path(extension_source_text).expanduser().resolve()
         source = load_fixed_pool_study_artifacts(extension_source_root)
+        source_contract = (source.get("manifest") or {}).get("environment_contract")
+        current_contract = shot_defense_contract(environments[checkpoint_paths[0]][0])
+        if source_contract is not None:
+            if source_contract.get("shot_defense") != current_contract:
+                raise FixedPoolStudyRunError("Extension checkpoint has different shot-defense settings from the source study.")
+        elif shot_defense_enabled(environments[checkpoint_paths[0]][0]):
+            raise FixedPoolStudyRunError("A legacy study cannot be extended with newly enabled shot-defense rules.")
         base_schedule = load_lineup_schedule(
             extension_source_root / "schedule_manifest.json", pool=pool
         )

@@ -7,6 +7,7 @@ from threading import Lock
 from typing import Any
 
 from basketworld.utils.historical_eval_elo import build_deterministic_elo_ladder
+from basketworld_jax.scoring_metrics import read_historical_scoring_summary
 
 
 HISTORICAL_EVAL_FILENAME = "historical_opponent_evaluation.json"
@@ -248,6 +249,10 @@ def historical_elo_summary(artifact_path: str | Path) -> dict[str, Any]:
         payload = json.load(handle)
     if not isinstance(payload, dict):
         raise ValueError("Historical evaluation artifact must contain a JSON object.")
+    payload = {**payload, "matches": [
+        read_historical_scoring_summary(row) if isinstance(row, dict) else row
+        for row in payload.get("matches", []) or []
+    ]}
     summary = _compact_summary(payload, source_path=path, signature=signature)
     with _cache_lock:
         _summary_cache[cache_key] = (signature, summary)

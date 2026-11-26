@@ -1,5 +1,7 @@
 import argparse
 
+from basketworld_jax.shot_defense import SHOT_DEFENSE_DEFAULTS
+
 
 def get_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train PPO models using self-play.")
@@ -1520,6 +1522,14 @@ def get_parser() -> argparse.ArgumentParser:
         default="directional",
         help="Passing mode. 'directional' uses pass direction resolution; 'pointer_targeted' supports explicit teammate targets.",
     )
+    for key, default in SHOT_DEFENSE_DEFAULTS.items():
+        option = "--" + key.replace("_", "-")
+        if isinstance(default, bool):
+            parser.add_argument(option, action=argparse.BooleanOptionalAction, default=default,
+                                help="Opt-in trained shot-defense rule; legacy models remain disabled.")
+        else:
+            parser.add_argument(option, type=float, default=default,
+                                help="Shot-defense sampling or mechanics parameter; stored in the trained rule contract.")
     return parser
 
 

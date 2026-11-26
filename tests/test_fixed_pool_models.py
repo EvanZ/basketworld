@@ -413,6 +413,18 @@ def test_direct_skill_ratings_fit_game_outcomes_without_apm_as_the_target():
         "team_a_minus_team_b_net_rating"
     )
     agreement = report["direct_skill_ratings"]["apm_agreement"]
+    direct_report = report["direct_skill_ratings"]
+    assert direct_report["coefficient_bootstrap"]["population"] == "all_included_games"
+    assert direct_report["coefficient_bootstrap"]["confidence_level"] == 0.9
+    for coefficient in direct_report["coefficients"].values():
+        interval = coefficient["bootstrap_interval"]
+        if coefficient["status"] != "estimated":
+            assert interval is None
+        elif interval and interval["per_skill_unit"]:
+            for bound in ("p05", "p95"):
+                assert interval["per_pool_standard_deviation"][bound] == pytest.approx(
+                    interval["per_skill_unit"][bound] * coefficient["pool_standard_deviation"]
+                )
     assert agreement["sample_count"] == len(true_values)
     assert agreement["overlap_k"] == len(true_values)
     assert agreement["rating_pearson_correlation"] is not None
@@ -507,3 +519,43 @@ def test_budget_preserves_player_appearances_for_smaller_teams(
     assert budget["games"] == expected_games
     assert budget["seeded_players"] == 64
     assert budget["game_appearances_per_player"] == 100
+
+
+def test_skill_coefficient_bootstrap_keeps_pairs_and_unidentified_features(monkeypatch):
+    from collections import Counter
+    from itertools import combinations
+    from basketworld_jax.eval import fixed_pool_models as models
+
+    values = np.array([[-1., 0., 1.], [0., 1., 1.], [1., -1., 1.], [2., 2., 1.]])
+    ids = ['a', 'b', 'c', 'd']
+    episodes, target = [], []
+    for group, (a, b) in enumerate(list(combinations(range(4), 2)) * 3):
+        for left, right in [(a, b), (b, a)]:
+            episodes.append({'pair_id': str(group), 'team_a_player_ids': [ids[left]],
+                             'team_b_player_ids': [ids[right]], 'starting_team': 'team_a'})
+            target.append(float((values[left] - values[right]) @ np.array([2., -3., 0.])))
+    original = models._fit_direct_skill_rating_model
+
+    def checked_fit(rows, *args, **kwargs):
+        counts = Counter((row['pair_id'], row['team_a_player_ids'][0]) for row in rows)
+        for pair_id in {row['pair_id'] for row in rows}:
+            assert len({count for (pair, _), count in counts.items() if pair == pair_id}) == 1
+            assert sum(pair == pair_id for pair, _ in counts) == 2
+        return original(rows, *args, **kwargs)
+
+    monkeypatch.setattr(models, '_fit_direct_skill_rating_model', checked_fit)
+    kwargs = dict(player_ids=ids, skill_keys=['positive', 'negative', 'constant'],
+                  skill_values=values, ridge_alpha=0., bootstrap_samples=30, seed=17)
+    result = models._paired_bootstrap_direct_skill_intervals(episodes, target, **kwargs)
+    assert result == models._paired_bootstrap_direct_skill_intervals(episodes, target, **kwargs)
+    for key, expected in [('positive', 2.), ('negative', -3.)]:
+        interval = result['coefficient_intervals'][key]
+        assert interval['successful_samples'] == 30
+        assert interval['per_skill_unit']['p05'] == pytest.approx(expected)
+        assert interval['per_skill_unit']['p95'] == pytest.approx(expected)
+    assert result['coefficient_intervals']['constant']['per_skill_unit'] is None
+    kwargs['bootstrap_samples'] = 0
+    assert models._paired_bootstrap_direct_skill_intervals(episodes, target, **kwargs)['coefficient_intervals'] == {}
+    kwargs['bootstrap_samples'] = 1
+    single = models._paired_bootstrap_direct_skill_intervals(episodes, target, **kwargs)
+    assert single['coefficient_intervals']['positive']['per_skill_unit'] is None

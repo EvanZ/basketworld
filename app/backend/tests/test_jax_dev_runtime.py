@@ -684,13 +684,9 @@ def test_jax_dev_runtime_fast_self_play_returns_board_state_with_value_overlay_o
     assert len(start["state"]["player_rebound_skills"]) == runtime.n_players
     assert len(start["state"]["player_rebound_skill_specialists"]) == runtime.n_players
     assert len(start["state"]["player_episode_skills"]) == runtime.n_players
-    assert set(start["state"]["player_episode_skills"]["0"]) == {
-        "pressure",
-        "shot_contest",
-        "steal",
-        "ball_handling",
-        "passing",
-    }
+    from basketworld_jax.eval.skills import ACTIVE_PLAYER_SKILL_REGISTRY
+    assert set(start["state"]["player_episode_skills"]["0"]) == set(ACTIVE_PLAYER_SKILL_REGISTRY.keys)
+    assert start["state"]["shot_defense_parameters"]["rim_protection_enabled"] is False
     assert len(start["state"]["team_a_shooting_pct_by_player"]["layup"]) == runtime.n_players // 2
     assert len(start["state"]["team_b_shooting_pct_by_player"]["layup"]) == runtime.n_players // 2
     assert start["state"]["episode_parameters"]["shot"] == start["state"]["shot_params"]
@@ -1188,7 +1184,8 @@ def test_jax_dev_runtime_selector_multiselect_prefers_checkpoint_metadata():
     assert debug["min_play_steps"] == 4
 
 
-def test_jax_dev_runtime_action_results_preserve_assisted_shot_metadata():
+@pytest.mark.parametrize("shot_type,is_dunk", [(SHOT_TYPE_DUNK, True), (2, False)])
+def test_jax_dev_runtime_action_results_preserve_assisted_shot_metadata(shot_type, is_dunk):
     runtime = _make_runtime()
     prev_state = runtime.state
     out = SimpleNamespace(
@@ -1199,7 +1196,7 @@ def test_jax_dev_runtime_action_results_preserve_assisted_shot_metadata():
         shot_expected_points=np.asarray([1.4], dtype=np.float32),
         shot_distance=np.asarray([0.0], dtype=np.float32),
         shot_success=np.asarray([1], dtype=np.int8),
-        shot_type=np.asarray([SHOT_TYPE_DUNK], dtype=np.int32),
+        shot_type=np.asarray([shot_type], dtype=np.int32),
         assist=np.asarray([1], dtype=np.int8),
         potential_assist=np.asarray([1], dtype=np.int8),
         assist_passer=np.asarray([0], dtype=np.int32),
@@ -1214,6 +1211,8 @@ def test_jax_dev_runtime_action_results_preserve_assisted_shot_metadata():
     shot = results["shots"]["1"]
     assert shot["success"] is True
     assert shot["distance"] == 0
+    assert shot["is_dunk"] is is_dunk
+    assert shot["is_three"] is False
     assert shot["assist_full"] is True
     assert shot["assist_potential"] is True
     assert shot["assist_passer_id"] == 0
@@ -1961,6 +1960,7 @@ def test_jax_dev_runtime_box_score_accumulates_authoritative_events_and_team_tot
         "reb": 0,
         "ast": 0,
         "stl": 0,
+        "blk": 0,
         "tov": 1,
     }
     assert player_rows[passer]["ast"] == 1
@@ -2498,3 +2498,36 @@ def test_team_clearance_observations_and_fast_state_round_trip():
         assert body["clearance_ready_to_shoot"] is False
     assert full["obs_tokens"]["players_labels"][-1] == "offense_cleared"
     assert full["obs_tokens"]["globals_labels"][-1] == "clearance_ready_to_shoot"
+
+
+@pytest.mark.parametrize("saved", [None, False, True])
+def test_checkpoint_shot_rule_reaches_kernel_and_full_and_fast_ui(saved):
+    metadata = {"env_config": {"allow_dunks": True}}
+    if saved is not None:
+        metadata["env_config"]["prefer_higher_percentage_shot"] = saved
+    policy = _FakeRawJaxModel(metadata=metadata)
+    required, optional, _, _ = lifecycle_routes._jax_local_env_config_from_metadata(policy)
+    runtime = JaxDevRuntime(
+        required_params={**required, "players": 3}, env_params=optional,
+        unified_policy=policy, opponent_policy=policy, user_team=Team.OFFENSE,
+    )
+    runtime.reset(seed=17)
+    assert runtime.environment_config.prefer_higher_percentage_shot is bool(saved)
+    assert bool(runtime.static.prefer_higher_percentage_shot) is bool(saved)
+    game_state = GameState()
+    game_state.jax_runtime = runtime
+    game_state.env = runtime.environment
+    game_state.unified_policy = policy
+    game_state.user_team = Team.OFFENSE
+    for compact in (False, True):
+        payload = runtime.get_full_game_state(
+            game_state, include_policy_probs=False, compact=compact,
+            include_episode_metadata=True,
+        )
+        assert payload["shot_params"]["prefer_higher_percentage_shot"] is bool(saved)
+
+    # Checkpoint swaps also replace the flag, including reverting to legacy mode.
+    replacement = _FakeRawJaxModel(metadata={"env_config": {"allow_dunks": True}})
+    runtime.replace_policies(unified_policy=replacement, opponent_policy=replacement)
+    assert runtime.environment_config.prefer_higher_percentage_shot is False
+    assert not bool(runtime.static.prefer_higher_percentage_shot)

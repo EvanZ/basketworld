@@ -345,3 +345,22 @@ def test_team_clearance_visible_config_round_trips_into_copy_and_resume_command(
         assert "--require-all-offense-clear" in preview.argv
         assert "--no-require-all-offense-clear" not in preview.argv
     assert not TrainingRunConfig.model_validate({}).require_all_offense_clear
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_shot_rule_round_trips_through_saved_config_and_preview(tmp_path, enabled):
+    from app.training_backend.application_training import resolve_run_config_schema
+
+    original = TrainingRunConfig(overrides={"prefer_higher_percentage_shot": enabled})
+    copied = TrainingRunConfig.model_validate_json(original.model_dump_json())
+    for checkpoint in (None, "/tmp/checkpoint"):
+        preview = build_halfcourt_multi_possession_preview(
+            config=copied, run_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            repo_root=tmp_path, data_dir=tmp_path / "data", resume_checkpoint=checkpoint,
+        )
+        option = "--prefer-higher-percentage-shot" if enabled else "--no-prefer-higher-percentage-shot"
+        assert option in preview.argv
+        field = next(f for f in resolve_run_config_schema(tuple(preview.argv))
+                     if f["name"] == "prefer_higher_percentage_shot")
+        assert field["editable"]
+        assert field["value"] is enabled

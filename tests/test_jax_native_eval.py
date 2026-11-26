@@ -247,6 +247,8 @@ def test_native_custom_setup_freezes_every_skill_for_every_player():
             "steal": -0.10 + player_id * 0.10,
             "ball_handling": player_id * 0.10,
             "passing": 0.10 + player_id * 0.10,
+            "rim_protection": -0.4 + player_id * 0.1,
+            "contested_shooting": 0.3 + player_id * 0.1,
         }
         for player_id in range(player_count)
     }
@@ -533,6 +535,19 @@ def test_native_multi_possession_evaluation_pairs_starters_and_separates_cutoffs
         summary["win_count"] + summary["loss_count"] + summary["tie_count"]
         == summary["completed_games"]
     )
+    assert summary["scoring_metric_schema_version"] == 2
+    assert "offense_points_per_episode" not in summary
+    assert "user_points_per_possession" not in summary
+    if summary["completed_games"]:
+        assert summary["completed_win_rate"] == summary["win_count"] / summary["completed_games"]
+        assert summary["completed_win_score"] == (summary["win_count"] + .5 * summary["tie_count"]) / summary["completed_games"]
+    for side in ("user", "opponent"):
+        possessions = summary[f"completed_{side}_offensive_possessions"]
+        ppp = summary[f"{side}_points_per_completed_offensive_possession"]
+        if possessions:
+            assert ppp == summary[f"completed_{side}_score_total"] / possessions
+        else:
+            assert ppp is None
     assert summary["evaluation_horizon_guard"]["cutoff_is_completed_game"] is False
     assert summary["evaluation_horizon_guard"]["cutoff_is_tie"] is False
     assert "inbound_timeout_turnover_count" in summary
@@ -572,13 +587,13 @@ def test_native_multi_possession_evaluation_pairs_starters_and_separates_cutoffs
     assert np.isfinite(summary["mean_live_team_centroid_distance"])
     if summary["completed_user_offensive_possessions"] > 0:
         assert np.isclose(
-            summary["user_points_per_possession"],
+            summary["user_points_per_completed_offensive_possession"],
             summary["completed_user_score_total"]
             / summary["completed_user_offensive_possessions"],
         )
     if summary["completed_opponent_offensive_possessions"] > 0:
         assert np.isclose(
-            summary["opponent_points_per_possession"],
+            summary["opponent_points_per_completed_offensive_possession"],
             summary["completed_opponent_score_total"]
             / summary["completed_opponent_offensive_possessions"],
         )

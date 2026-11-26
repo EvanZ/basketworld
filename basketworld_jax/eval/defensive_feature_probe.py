@@ -339,6 +339,7 @@ def _observation_kwargs(policy_spec: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "check_clearance_features": schema_version >= 5,
         "team_clearance_features": schema_version >= 6,
+        "shooting_skill_features": schema_version >= 7,
     }
 
 

@@ -1779,6 +1779,29 @@ const sampledReboundSkillRows = computed(() => {
   });
 });
 
+const trainedShotDefenseRows = computed(() => {
+  const values = props.gameState?.shot_defense_parameters;
+  if (!values) return [];
+  const labels = {
+    rim_protection_enabled: 'Rim protection enabled',
+    rim_protection_beta_alpha: 'Rim sampling Beta alpha',
+    rim_protection_beta_beta: 'Rim sampling Beta beta',
+    rim_protection_block_distribution_max: 'Sampled block upper bound (sampling only)',
+    rim_protection_skill_block_reference: 'Rim skill centering reference',
+    rim_protection_block_base: 'Neutral block probability',
+    rim_protection_block_effect_weight: 'Block skill effect weight',
+    rim_protection_contest_base: 'Neutral rim suppression',
+    rim_protection_contest_effect_weight: 'Rim contest effect weight',
+    contested_shooting_enabled: 'Contested shooting enabled',
+    contested_shooting_skill_mean: 'Contested shooting sampling mean',
+    contested_shooting_skill_std: 'Contested shooting sampling standard deviation',
+    contested_shooting_effect_weight: 'Contested shooting effect weight',
+  };
+  return Object.entries(labels).map(([key, label]) => ({
+    key, label, value: typeof values[key] === 'boolean' ? (values[key] ? 'Yes' : 'No') : (values[key] ?? 'Unavailable'),
+  }));
+});
+
 const sampledEpisodeSkillRows = computed(() => {
   const liveSkills = props.gameState?.player_episode_skills;
   if (!liveSkills || typeof liveSkills !== 'object') return [];
@@ -1804,6 +1827,8 @@ const sampledEpisodeSkillRows = computed(() => {
       steal: Number(raw.steal),
       ballHandling: Number(raw.ball_handling),
       passing: Number(raw.passing),
+      rimProtection: Number(raw.rim_protection),
+      contestedShooting: Number(raw.contested_shooting),
     }];
   });
 });
@@ -3257,6 +3282,8 @@ function normalizeEvalRosterProfiles(rawProfiles, { probabilities = true } = {})
       steal: rawValue('steal'),
       ball_handling: rawValue('ball_handling'),
       passing: rawValue('passing'),
+      ...(raw.rim_protection !== undefined ? { rim_protection: rawValue('rim_protection') } : {}),
+      ...(raw.contested_shooting !== undefined ? { contested_shooting: rawValue('contested_shooting') } : {}),
     };
   }
   return normalized;
@@ -3709,6 +3736,8 @@ const evalPlayerSkillRows = computed(() => {
       steal: numberOrZero('steal'),
       ballHandling: numberOrZero('ball_handling'),
       passing: numberOrZero('passing'),
+      rimProtection: Number(raw.rim_protection),
+      contestedShooting: Number(raw.contested_shooting),
     };
   });
 });
@@ -5460,8 +5489,8 @@ const actionModeMatrixRows = computed(() => {
     label: `PL ${cell?.player_action_mode || '?'} · AI ${cell?.ai_action_mode || '?'}`,
     record: `${Number(cell?.player_wins || 0)}-${Number(cell?.ties || 0)}-${Number(cell?.player_losses || 0)}`,
     margin: formatDebugNumber(cell?.completed_margin_mean, 2),
-    playerPpp: formatDebugNumber(cell?.user_points_per_possession, 2),
-    aiPpp: formatDebugNumber(cell?.opponent_points_per_possession, 2),
+    playerPpp: formatDebugNumber(cell?.user_points_per_completed_offensive_possession ?? cell?.user_points_per_possession, 2),
+    aiPpp: formatDebugNumber(cell?.opponent_points_per_completed_offensive_possession ?? cell?.opponent_points_per_possession, 2),
     pressure: formatDebugProb(cell?.live_ball_handler_pressure_rate),
     centroid: formatDebugNumber(cell?.mean_live_team_centroid_distance, 2),
   }));
@@ -5911,6 +5940,7 @@ function aggregatePlayerStats(entries) {
     potential_assists: 0,
     turnovers: 0,
     steals: 0,
+    blocks: 0,
     points: 0,
     offensive_rebounds: 0,
     defensive_rebounds: 0,
@@ -5928,6 +5958,7 @@ function aggregatePlayerStats(entries) {
     base.potential_assists += Number(entry.potential_assists || 0);
     base.turnovers += Number(entry.turnovers || 0);
     base.steals += Number(entry.steals || 0);
+    base.blocks += Number(entry.blocks || 0);
     base.points += Number(entry.points || 0);
     base.offensive_rebounds += Number(entry.offensive_rebounds || 0);
     base.defensive_rebounds += Number(entry.defensive_rebounds || 0);
@@ -5992,6 +6023,7 @@ function buildEvalAggregateRow(entry) {
     potentialAssists: Number(entry?.potential_assists || 0),
     turnovers: Number(entry?.turnovers || 0),
     steals: Number(entry?.steals || 0),
+    blocks: Number(entry?.blocks || 0),
     points,
     offensiveRebounds,
     defensiveRebounds,
@@ -6213,8 +6245,8 @@ async function recordEpisodeStats(finalState, skipApiCall = false, episodeData =
   if (shotEntries.length > 0) {
     const [, shot] = shotEntries[0];
     const distance = Number(shot?.distance ?? 9999);
-    const isDunk = distance === 0;
-    const isThree = !isDunk && distance >= Number(finalState?.three_point_distance ?? 4);
+    const isDunk = Boolean(shot?.is_dunk ?? (distance === 0));
+    const isThree = !isDunk && Boolean(shot?.is_three ?? (distance >= Number(finalState?.three_point_distance ?? 4)));
     const isTwo = !isDunk && !isThree;
     const made = Boolean(shot?.success);
     const assisted = Boolean(shot?.assist_full);
@@ -6401,8 +6433,8 @@ function applyEvaluationStats(
       const potentialAssisted = Boolean(shot?.assist_potential) && !made;
       if (!potentialAssisted) continue;
       const distance = Number(shot?.distance ?? 9999);
-      const isDunk = distance === 0;
-      const isThree = !isDunk && distance >= Number(row?.final_state?.three_point_distance ?? 4);
+      const isDunk = Boolean(shot?.is_dunk ?? (distance === 0));
+      const isThree = !isDunk && Boolean(shot?.is_three ?? (distance >= Number(row?.final_state?.three_point_distance ?? 4)));
       if (isDunk) {
         next.dunk.potentialAssists += 1;
       } else if (isThree) {
@@ -9225,6 +9257,7 @@ function offenseSkillDeltaLabel(idx) {
                 <th title="Potential assists">Pot AST</th>
                 <th>TOV</th>
                 <th>STL</th>
+                <th>BLK</th>
                 <th>ORB</th>
                 <th>DRB</th>
                 <th title="Mean sampled layup make probability">Layup</th>
@@ -9236,6 +9269,8 @@ function offenseSkillDeltaLabel(idx) {
                 <th title="Mean sampled shot-contest skill">Contest</th>
                 <th title="Mean sampled steal skill">Steal</th>
                 <th title="Mean sampled rebounding skill">Rebound</th>
+                <th title="Mean sampled rim-protection skill">Rim</th>
+                <th title="Mean sampled contested-shooting skill">Contested shooting</th>
               </tr>
             </thead>
             <tbody>
@@ -9251,6 +9286,7 @@ function offenseSkillDeltaLabel(idx) {
                 <td>{{ row.potentialAssists }}</td>
                 <td>{{ row.turnovers }}</td>
                 <td>{{ row.steals }}</td>
+                <td>{{ row.blocks }}</td>
                 <td>{{ row.offensiveRebounds }}</td>
                 <td>{{ row.defensiveRebounds }}</td>
                 <td class="skill-cell offense-skill">{{ formatEvalProbabilitySkill(row.sampledSkills.layup) }}</td>
@@ -9258,10 +9294,12 @@ function offenseSkillDeltaLabel(idx) {
                 <td class="skill-cell offense-skill">{{ formatEvalProbabilitySkill(row.sampledSkills.dunk) }}</td>
                 <td class="skill-cell offense-skill">{{ formatEvalLatentSkill(row.sampledSkills.ball_handling) }}</td>
                 <td class="skill-cell offense-skill">{{ formatEvalLatentSkill(row.sampledSkills.passing) }}</td>
-                <td class="skill-cell defense-skill">{{ formatEvalLatentSkill(row.sampledSkills.turnover_pressure) }}</td>
+                <td class="skill-cell defense-skill">{{ formatEvalLatentSkill(row.sampledSkills.pressure) }}</td>
                 <td class="skill-cell defense-skill">{{ formatEvalLatentSkill(row.sampledSkills.shot_contest) }}</td>
                 <td class="skill-cell defense-skill">{{ formatEvalLatentSkill(row.sampledSkills.steal) }}</td>
                 <td class="skill-cell shared-skill">{{ formatEvalLatentSkill(row.sampledSkills.rebound) }}</td>
+                <td class="skill-cell defense-skill">{{ formatEvalLatentSkill(row.sampledSkills.rim_protection) }}</td>
+                <td class="skill-cell offense-skill">{{ formatEvalLatentSkill(row.sampledSkills.contested_shooting) }}</td>
               </tr>
             </tbody>
           </table>
@@ -11593,6 +11631,8 @@ function offenseSkillDeltaLabel(idx) {
                   <th title="Steal/interception skill">Steal</th>
                   <th title="Ball-handling skill">Handle</th>
                   <th title="Passing accuracy skill">Pass</th>
+                  <th>Rim protection</th>
+                  <th>Contested shooting</th>
                 </tr>
               </thead>
               <tbody>
@@ -11608,6 +11648,8 @@ function offenseSkillDeltaLabel(idx) {
                   <td><input type="number" step="0.05" :value="row.steal" @input="updateEvalPlayerSkill(row.playerId, 'steal', $event.target.value)" /></td>
                   <td><input type="number" step="0.05" :value="row.ballHandling" @input="updateEvalPlayerSkill(row.playerId, 'ball_handling', $event.target.value)" /></td>
                   <td><input type="number" step="0.05" :value="row.passing" @input="updateEvalPlayerSkill(row.playerId, 'passing', $event.target.value)" /></td>
+                  <td><input type="number" step="0.05" :value="row.rimProtection" @input="updateEvalPlayerSkill(row.playerId, 'rim_protection', $event.target.value)" /></td>
+                  <td><input type="number" step="0.05" :value="row.contestedShooting" @input="updateEvalPlayerSkill(row.playerId, 'contested_shooting', $event.target.value)" /></td>
                 </tr>
               </tbody>
             </table>
@@ -11702,6 +11744,10 @@ function offenseSkillDeltaLabel(idx) {
     <!-- Skill Ratings Tab -->
     <div v-if="activeTab === 'skill_ratings'" class="tab-content skill-ratings-tab">
       <SkillRatingsWorkbench
+        :game-state="props.gameState"
+        :player-display-names="props.playerDisplayNames"
+        :player-deterministic="props.deterministic"
+        :opponent-deterministic="props.opponentDeterministic"
         :checkpoint-path="jaxModelMetadata?.checkpoint_path || jaxModelMetadata?.unified_checkpoint_path || ''"
         :checkpoint-update="jaxModelMetadata?.update_index"
         :model-backend="props.gameState?.model_backend || ''"
@@ -12135,6 +12181,10 @@ function offenseSkillDeltaLabel(idx) {
                 <span class="param-name">Dunks allowed:</span>
                 <span class="param-value">{{ props.gameState.shot_params.allow_dunks ? '✓ Yes' : '✗ No' }}</span>
               </div>
+              <div class="param-row">
+                <span class="param-label">Prefer higher-percentage shot:</span>
+                <span class="param-value">{{ props.gameState.shot_params.prefer_higher_percentage_shot ? '✓ Yes' : '✗ No' }}</span>
+              </div>
             </div>
           </div>
           <div
@@ -12215,6 +12265,14 @@ function offenseSkillDeltaLabel(idx) {
               </div>
             </div>
           </div>
+          <div class="param-category" v-if="trainedShotDefenseRows.length">
+            <h5>Shot Defense (Trained Rules)</h5>
+            <p>These settings come from the loaded model. Disabled skills do not affect play.</p>
+            <div class="param-row" v-for="row in trainedShotDefenseRows" :key="row.key">
+              <span class="param-name">{{ row.label }}:</span>
+              <span class="param-value">{{ row.value }}</span>
+            </div>
+          </div>
           <div class="param-category" v-if="sampledEpisodeSkillRows.length">
             <h5>Offensive Skills (Episode)</h5>
             <div class="offense-skills-editor">
@@ -12223,6 +12281,7 @@ function offenseSkillDeltaLabel(idx) {
                 <span>Team</span>
                 <span>Handle</span>
                 <span>Passing</span>
+                <span title="Resistance to jump-shot pressure; active only when trained with contested shooting">Contested shot</span>
               </div>
               <div
                 class="offense-skills-row sampled-episode-skills-row"
@@ -12234,6 +12293,7 @@ function offenseSkillDeltaLabel(idx) {
                 <span class="param-value" :class="`skill-team-${row.team.toLowerCase()}`">{{ row.team }}</span>
                 <span class="param-value">{{ formatEpisodeSkill(row.ballHandling) }}</span>
                 <span class="param-value">{{ formatEpisodeSkill(row.passing) }}</span>
+                <span class="param-value">{{ formatEpisodeSkill(row.contestedShooting) }}</span>
               </div>
             </div>
           </div>
@@ -12246,6 +12306,7 @@ function offenseSkillDeltaLabel(idx) {
                 <span>Pressure</span>
                 <span>Contest</span>
                 <span>Steal</span>
+                <span title="Adjacent finishing defense and blocks; active only when trained with rim protection">Rim</span>
               </div>
               <div
                 class="offense-skills-row sampled-episode-skills-row sampled-defense-skills-row"
@@ -12258,6 +12319,7 @@ function offenseSkillDeltaLabel(idx) {
                 <span class="param-value">{{ formatEpisodeSkill(row.pressure) }}</span>
                 <span class="param-value">{{ formatEpisodeSkill(row.shotContest) }}</span>
                 <span class="param-value">{{ formatEpisodeSkill(row.steal) }}</span>
+                <span class="param-value">{{ formatEpisodeSkill(row.rimProtection) }}</span>
               </div>
             </div>
           </div>
@@ -14897,11 +14959,11 @@ function offenseSkillDeltaLabel(idx) {
 }
 
 .offense-skills-row.sampled-episode-skills-row {
-  grid-template-columns: 0.9fr 0.75fr repeat(2, 1fr);
+  grid-template-columns: 0.9fr 0.75fr repeat(3, 1fr);
 }
 
 .offense-skills-row.sampled-defense-skills-row {
-  grid-template-columns: 0.9fr 0.75fr repeat(3, 1fr);
+  grid-template-columns: 0.9fr 0.75fr repeat(4, 1fr);
 }
 
 .skill-team-player {
