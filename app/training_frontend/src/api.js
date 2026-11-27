@@ -37,6 +37,15 @@ async function requestText(path) {
 }
 
 export const api = {
+  leagueOptions: () => request('/leagues/options'),
+  listLeagues: (includeArchived = false) => request(`/leagues?include_archived=${includeArchived}`),
+  getLeague: (id) => request(`/leagues/${id}`),
+  deleteLeague: (id, revision, name) => request(`/leagues/${id}`, { method: 'DELETE', body: JSON.stringify({revision, name}) }),
+  createLeague: (payload) => request('/leagues', { method: 'POST', body: JSON.stringify(payload) }),
+  saveLeagueDraft: (id, payload) => request(`/leagues/${id}/draft`, { method: 'PUT', body: JSON.stringify(payload) }),
+  publishLeague: (id, revision) => request(`/leagues/${id}/versions`, { method: 'POST', body: JSON.stringify({revision}) }),
+  getLeagueVersion: (id, version) => request(`/leagues/${id}/versions/${version}`),
+  archiveLeague: (id, archived, version = null) => request(`/leagues/${id}${version === null ? '' : `/versions/${version}`}/archive`, { method: 'POST', body: JSON.stringify({archived}) }),
   getConfigSchema: () => request('/config-schema'),
   importMlflowRun: (trackingUri, runId) => request('/mlflow/import-run', {
     method: 'POST',

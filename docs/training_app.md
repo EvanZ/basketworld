@@ -225,3 +225,109 @@ This rule differs from ball-handler clearance and from `check_clearance`, which
 protects the check-ball area from defenders. It may slow possessions and increase
 the coordination needed to get a shot. Use the existing pace metrics to assess
 that effect; no new time-to-clearance metric is added.
+
+## Leagues, rosters, and players (#86)
+
+Open **Leagues → Create league**. Choose a name, 3v3/4v4/5v5 format, team
+count (64 by default, configurable from 2–512), generation seed, and skill rules.
+Expand **Player generation settings** to change each supported distribution.
+The initial defaults follow the trainer recipe where available, with the shared
+skill-registry defaults otherwise. Rim protection uses the existing scaled-beta
+logit sampler; other skills use the existing fixed-pool normal sampler, clipped
+to a skill's supported bounds. Rebounding uses that pool sampler's Gaussian
+mode; specialist roster construction is not part of this slice.
+
+Generating a league creates its players once and randomly assigns complete
+rosters. Curated place/nickname combinations generate unique team names. A
+separate seeded cosmetic RNG samples unique first/last-name combinations and
+jerseys from 0–99 without changing skill draws. The supported maximum 2,560-player
+league fits within the name vocabulary; generation has no duplicate full names.
+Manual duplicate player names are allowed. Identity always comes from the ID.
+
+Select a league, then a roster, then a player. Edit names, jersey numbers, roster
+assignments, and all supported skill values. Changes automatically save after a
+short typing pause; wait for **All changes saved**. The browser warns before
+leaving with pending edits. Invalid edits show an error and remain unsaved until
+corrected. Another tab's newer draft produces a conflict instead of overwriting
+it; reload the league before retrying. Rule and generation settings are fixed
+when a league is created; individual skill edits are recorded as overrides to
+original generated values. An independently disabled new skill is shown as
+inactive, and legacy leagues have only the original nine skills.
+
+Drafts may have incomplete/overfull rosters or unassigned players. **Publish
+version** requires exactly the configured players per roster, every player
+assigned once, unique team names, and unique integer jerseys within each team.
+Publication saves an immutable numbered snapshot. **Published versions** lets
+you inspect old versions read-only and return to the current editable draft.
+Neither draft edits nor a later publication changes an earlier version.
+
+Archive leagues or individual published versions to hide them from normal
+browsing and new-run selection. **Show archived leagues and versions** reveals
+restore controls. There is no permanent-delete or duplicate-league action.
+Stable IDs and membership-scoped jersey numbers leave room for future trades
+and drafts without rewriting history.
+
+### Training availability and lifecycle
+
+The new-run form can select a specific published league version. **League-backed
+training is unavailable until #85 slice 2 is implemented.** Selecting a version
+disables Launch, and the API rejects a launch with a league reference. Clear the
+selection to use current random skill sampling. Saving/publishing a league does
+not change the running worker or the skills it samples. No new metrics or
+per-training-game statistics are introduced by this feature.
+
+The integration contract stores `league_reference = {league_id, version,
+sha256}` in run configuration and the exact selected snapshot at
+`runs/<run-id>/league.json` before league-backed launch is enabled. Run copies
+retain the source's exact reference, not the library's latest version; users may
+explicitly select another compatible version before launching. Resume and
+extension load only the pinned run artifact and fail on missing, corrupt or
+incompatible data. They never regenerate skills. Archiving does not prevent
+existing runs from loading their snapshots. Ordinary training never populates
+competition records; season/tournament evaluation follows in #85 slices 3/5.
+
+### Storage and reusable artifact contract
+
+Drafts, revision numbers, archive flags, and version metadata live in the existing
+trainer DuckDB database (`BW_TRAINING_DB_PATH`). Published snapshots live at
+`<BW_TRAINING_DATA_DIR>/leagues/<league-id>/v<version>.json`; the defaults are under
+`var/training_app/`. Back up both the database and configured data directory.
+Backend restarts and page refreshes preserve these records. Database schema 3
+adds the league tables without modifying existing runs.
+
+Artifact schema 1 includes:
+
+- Stable `league_id`, roster IDs, and league-owned player IDs.
+- `team_size`, `team_count`, explicit roster `members` with `player_id` and
+  `jersey_number`, and exact player skill dictionaries.
+- `generated_skills`, `skill_overrides`, source pool/player provenance, seed,
+  resolved sampling settings, and cosmetic name-set version.
+- The registry's `skill_schema_version`, `skill_schema_hash`, skill descriptors,
+  and complete versioned shot-defense rule contract.
+- Publication version, draft revision, timestamp, and SHA-256 of canonical JSON
+  excluding its own `sha256` field.
+
+`basketworld_jax.leagues.load_league_snapshot(path, reference=..., environment=...)`
+is the shared loader for future training, evaluation and play-UI consumers. It
+validates complete membership, skill domains/schema, checksum/reference, team
+size (`environment['players']`), and the saved shot-defense contract. Other
+simulation settings, such as court dimensions or clock duration, belong to the
+consumer's environment and are not fixed by this player library. Consumers must
+use stable IDs and these exact skills, never regenerate from the seed. Player
+IDs are league-owned; a future cross-league copy must use a new ID and retain
+source provenance.
+
+Trainer endpoints are under `/api/v1/leagues`: GET collection/options/detail,
+POST collection (generate), PUT `/{id}/draft` (revision-checked update), POST
+`/{id}/versions` (publish at a given revision), GET `/{id}/versions/{version}`,
+and POST `/{id}/archive` or `/{id}/versions/{version}/archive` with an `archived`
+boolean. No endpoint edits or overwrites a published artifact.
+
+For browser workflow verification, start a separate trainer API with temporary
+`BW_TRAINING_DATA_DIR` and `BW_TRAINING_DB_PATH`, then run
+`node app/training_frontend/tests/league-workflow.browser.mjs` with
+`LEAGUE_TEST_API_URL` set to that isolated API origin and `TRAINER_UI_URL` set to
+the trainer frontend. Supply `PLAYWRIGHT_MODULE` if Playwright is not installed
+in the normal Node resolution path and `CHROME_BIN` if needed. This test creates
+leagues only in the explicitly supplied test API; never point it at a user
+library. Backend coverage lives in `app/training_backend/tests/test_leagues.py`.

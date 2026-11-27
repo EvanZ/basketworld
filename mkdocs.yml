@@ -83,5 +83,6 @@ nav:
       - RL training: jax/training.md
       - Intent and play discovery: jax/intents.md
       - Training operations: jax/operations.md
+      - League authoring: jax/leagues.md
   - Historical SB3 implementation:
       - SB3 architecture and migration: history/sb3.md

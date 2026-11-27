@@ -23,6 +23,8 @@ import { launchGitCommit, launchWorktreeState } from './runProvenance'
 import { pfspRows, metricDefinition } from './pfsp'
 import { isLegacyLayupMetric, metricPickerCatalog, scoringMetricGroup } from './scoringMetrics'
 import OpponentUsageChart from './OpponentUsageChart.vue'
+import LeagueManager from './LeagueManager.vue'
+import LeagueSelector from './LeagueSelector.vue'
 
 const defaultConfig = () => ({
   name: `halfcourt-${new Date().toISOString().slice(0, 10)}`,
@@ -44,6 +46,7 @@ const defaultConfig = () => ({
   require_all_offense_clear: false,
   multi_possession_use_inbounds: true,
   overrides: {},
+  league_reference: null,
 })
 
 const PIN_STORAGE_KEY = 'basketworld.training.pinned-configs.v1'
@@ -986,6 +989,7 @@ onBeforeUnmount(() => {
       <nav>
         <button :class="{ active: activeView === 'runs' }" @click="activeView = 'runs'">Runs</button>
         <button :class="{ active: activeView === 'new' }" @click="openNewRun">New run</button>
+        <button :class="{ active: activeView === 'leagues' }" @click="activeView = 'leagues'">Leagues</button>
         <button :disabled="!selected" :class="{ active: activeView === 'detail' }" @click="activeView = 'detail'">Run detail</button>
       </nav>
       <div class="worker-card">
@@ -1000,12 +1004,14 @@ onBeforeUnmount(() => {
       <header>
         <div>
           <p class="eyebrow">STANDALONE CONTROL PLANE</p>
-          <h1>{{ activeView === 'new' ? 'Launch training' : activeView === 'detail' ? 'Run detail' : 'Training runs' }}</h1>
+          <h1>{{ activeView === 'leagues' ? 'Leagues' : activeView === 'new' ? 'Launch training' : activeView === 'detail' ? 'Run detail' : 'Training runs' }}</h1>
         </div>
         <button class="ghost" @click="refreshApp">Refresh</button>
       </header>
 
       <div v-if="error" class="error-banner">{{ error }}</div>
+
+      <LeagueManager v-show="activeView === 'leagues'" />
 
       <section v-if="activeView === 'runs'" class="panel">
         <div class="panel-heading">
@@ -1133,10 +1139,11 @@ onBeforeUnmount(() => {
               </article>
             </div>
           </details>
+          <LeagueSelector v-model="config.league_reference" />
           <div class="launch-row wide">
             <p v-if="activeRun">The single v0 worker is occupied by {{ activeRun.name }}.</p>
             <p v-else>Launches as a detached worker; closing this page will not stop it.</p>
-            <button class="primary" :disabled="launching || Boolean(activeRun)">{{ launching ? 'Launching…' : 'Launch training' }}</button>
+            <button class="primary" :disabled="launching || Boolean(activeRun) || Boolean(config.league_reference)">{{ launching ? 'Launching…' : 'Launch training' }}</button>
           </div>
         </form>
         <aside class="panel command-panel">
@@ -1149,7 +1156,7 @@ onBeforeUnmount(() => {
         </aside>
       </section>
 
-      <section v-else class="detail-grid">
+      <section v-else-if="activeView === 'detail'" class="detail-grid">
         <div v-if="!selected" class="panel empty">Select a run from the Runs page.</div>
         <template v-else>
           <div class="panel hero-panel">

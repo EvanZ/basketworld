@@ -13,6 +13,7 @@ from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.training_backend.config import Settings
+from app.training_backend.league_routes import league_router
 from app.training_backend.application_training import (
     load_application_config_schema,
     resolve_run_config_schema,
@@ -85,6 +86,9 @@ app.add_middleware(
 )
 
 
+app.include_router(league_router(lambda: repository, lambda: settings))
+
+
 def _run_or_404(run_id: str) -> dict:
     run = repository.get_run(run_id)
     if run is None:
@@ -106,6 +110,8 @@ def _action(run_id: str, callback, message: str) -> RunActionResponse:
                 "provenance_comparison": exc.comparison,
             },
         ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return RunActionResponse(run=TrainingRun.model_validate(run), message=message)
@@ -149,7 +155,10 @@ def import_run_from_mlflow(request: MlflowImportRequest) -> dict:
 
 @app.post("/api/v1/runs/preview", response_model=RunPreview)
 def preview_run(config: TrainingRunConfig) -> RunPreview:
-    return manager.preview(config)
+    try:
+        return manager.preview(config)
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/runs", response_model=TrainingRun, status_code=201)
@@ -159,6 +168,8 @@ def create_run(request: RunCreateRequest) -> TrainingRun:
             config=request.config,
             idempotency_key=request.idempotency_key,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return TrainingRun.model_validate(run)

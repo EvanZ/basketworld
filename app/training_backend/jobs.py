@@ -10,6 +10,8 @@ from typing import Any
 from uuid import uuid4
 
 from app.training_backend.config import Settings
+from app.training_backend.leagues import LeagueLibrary
+from basketworld_jax.leagues import LEAGUE_TRAINING_AVAILABLE, UNAVAILABLE_MESSAGE
 from app.training_backend.database import TrainingRepository, utc_now
 from app.training_backend.models import RunStatus, TrainingRunConfig
 from app.training_backend.presets import build_halfcourt_multi_possession_preview, _historical_updates
@@ -99,12 +101,17 @@ class JobManager:
         )
 
     def preview(self, config: TrainingRunConfig, *, run_id: str | None = None):
-        return build_halfcourt_multi_possession_preview(
+        preview = build_halfcourt_multi_possession_preview(
             config=config,
             run_id=run_id or str(uuid4()),
             repo_root=self.settings.repo_root,
             data_dir=self.settings.data_dir,
         )
+
+        if config.league_reference:
+            LeagueLibrary(self.repository, self.settings.data_dir).load(
+                config.league_reference, environment=resolve_run_training_config(tuple(preview.argv)))
+        return preview
 
     def create_and_launch(
         self,
@@ -116,6 +123,8 @@ class JobManager:
             existing = self.repository.get_run_by_idempotency_key(idempotency_key)
             if existing is not None:
                 return existing
+            if config.league_reference and not LEAGUE_TRAINING_AVAILABLE:
+                raise RuntimeError(UNAVAILABLE_MESSAGE)
             active = self.repository.list_active_runs()
             if active:
                 raise RuntimeError(
@@ -137,6 +146,9 @@ class JobManager:
                     }
                 }
             )
+            if config.league_reference:
+                LeagueLibrary(self.repository, self.settings.data_dir).pin_for_run(
+                    config.league_reference, run_id, environment=resolved)
             now = utc_now()
             created = self.repository.create_run(
                 {
@@ -450,6 +462,12 @@ class JobManager:
             resume_checkpoint=checkpoint,
             mlflow_resume_run_id=run.get("mlflow_run_id"),
         )
+        if config.league_reference:
+            LeagueLibrary(self.repository, self.settings.data_dir).restore_for_run(
+                config.league_reference, run_id,
+                environment=resolve_run_training_config(tuple(preview.argv)))
+            if not LEAGUE_TRAINING_AVAILABLE:
+                raise RuntimeError(UNAVAILABLE_MESSAGE)
         checkpoint_metadata, provenance_comparison = self._preflight_resume(
             checkpoint=checkpoint,
             preview=preview,

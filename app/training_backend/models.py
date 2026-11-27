@@ -19,6 +19,9 @@ class RunStatus(str, Enum):
     FAILED = "failed"
 
 
+from app.training_backend.leagues import LeagueReference
+
+
 class TrainingRunConfig(BaseModel):
     name: str = Field(
         default="halfcourt-multi-possession", min_length=1, max_length=120
@@ -46,6 +49,7 @@ class TrainingRunConfig(BaseModel):
     require_all_offense_clear: bool = False
     random_check_location: bool = False
     multi_possession_use_inbounds: bool = True
+    league_reference: LeagueReference | None = None
     overrides: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("name", "mlflow_tracking_uri", "mlflow_experiment_name")

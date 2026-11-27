@@ -10,7 +10,7 @@ from typing import Any, Iterator
 import duckdb
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utc_now() -> datetime:
@@ -93,6 +93,8 @@ class TrainingRepository:
                 )
                 """
             )
+            from app.training_backend.leagues import initialize_league_tables
+            initialize_league_tables(connection)
             connection.execute(
                 """
                 INSERT INTO schema_migrations (version, applied_at)
