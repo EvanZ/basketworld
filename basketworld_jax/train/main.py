@@ -40,6 +40,11 @@ from basketworld_jax.train.opponent_cache import (
 )
 from basketworld_jax.train.pressure_metrics import summarize_pressure_diagnostics
 from basketworld_jax.shot_defense_metrics import summarize_shot_defense_diagnostics
+from basketworld_jax.block_metrics import (
+    TRAIN_BLOCK_METRICS, DEPLOY_BLOCK_METRICS, TrainingBlockMetrics, filter_block_logging,
+    TRAIN_RIM_CONTEST_METRICS, DEPLOY_RIM_CONTEST_METRICS,
+    TRAIN_LAYUP_METRICS, DEPLOY_LAYUP_METRICS,
+)
 
 from basketworld.utils.mlflow_config import setup_mlflow
 from basketworld.utils.play_names import (
@@ -4547,6 +4552,7 @@ def _log_mlflow_params(
 def _log_mlflow_metrics(
     mlflow, metrics: dict[str, Any], *, step: int, prefix: str
 ) -> None:
+    metrics = filter_block_logging(metrics, prefix=prefix)
     if callable(getattr(mlflow, "log_metrics", None)):
         numeric = [(f"{prefix}/{key}", float(value)) for key, value in metrics.items()
                    if isinstance(value, (int, float, np.integer, np.floating))]
@@ -4836,6 +4842,7 @@ def _filter_mlflow_train_metrics(
     *,
     profile: str = "core",
 ) -> dict[str, Any]:
+    metrics = filter_block_logging(metrics, prefix="jax/train")
     metrics = {
         key: value
         for key, value in metrics.items()
@@ -4850,8 +4857,7 @@ def _filter_mlflow_train_metrics(
     return {
         key: value
         for key, value in metrics.items()
-        if key in {"blocks", "learner_blocks", "opponent_blocks", "blocks_per_completed_possession"}
-        or "shot_defense_" in key
+        if key in TRAIN_BLOCK_METRICS | TRAIN_RIM_CONTEST_METRICS | TRAIN_LAYUP_METRICS
         or key in _CORE_TRAIN_METRICS
         or key.startswith(
             (
@@ -4880,6 +4886,7 @@ def _filter_mlflow_deploy_metrics(
     *,
     profile: str = "core",
 ) -> dict[str, Any]:
+    metrics = filter_block_logging(metrics, prefix="jax/eval_deploy")
     metrics = {
         key: value
         for key, value in metrics.items()
@@ -4896,8 +4903,7 @@ def _filter_mlflow_deploy_metrics(
     return {
         key: value
         for key, value in metrics.items()
-        if key in {"blocks", "learner_blocks", "opponent_blocks", "blocks_per_completed_possession"}
-        or "shot_defense_" in key
+        if key in DEPLOY_BLOCK_METRICS | DEPLOY_RIM_CONTEST_METRICS | DEPLOY_LAYUP_METRICS
         or key in _CORE_DEPLOY_METRICS
         or key.startswith(("clock_", "pressure/", "self_play_", "roster_assignment_"))
         or key
@@ -8385,6 +8391,7 @@ def run_training_loop(args) -> dict[str, Any]:
         periodic_checkpoint_updates = _periodic_checkpoint_updates(args)
         historical_milestone_set = set(historical_milestone_updates)
         pause_requested = False
+        block_metric_accumulator = TrainingBlockMetrics()
         last_completed_update = int(completed_updates)
 
         for update_idx in range(completed_updates + 1, int(args.num_updates) + 1):
@@ -8990,6 +8997,7 @@ def run_training_loop(args) -> dict[str, Any]:
                     role: role_rollouts[role].final_state for role in TRAINING_ROLES
                 }
 
+            block_metric_accumulator.consume(rollout_out.trajectory)
             last_metrics = summarize_training_step(
                 rollout_out,
                 ppo_batch,
@@ -9210,6 +9218,7 @@ def run_training_loop(args) -> dict[str, Any]:
                 )
             )
             if should_log_history:
+                last_metrics.update(block_metric_accumulator.flush())
                 train_history.append(last_metrics)
                 if mlflow is not None:
                     _log_mlflow_metrics(

@@ -40,6 +40,7 @@ SHOT_DEFENSE_COUNTERS = (
     "contested_dunk_attempts",
     "contested_dunk_makes",
     "completed_possessions",
+    "rim_contest_probability_drop_sum",
 )
 SHOT_DEFENSE_SHAPE = (2, len(SHOT_DEFENSE_COUNTERS))
 
@@ -107,13 +108,21 @@ def build_shot_defense_diagnostics(static, out, active, xp):
             [category.astype(xp.float32), (made & category).astype(xp.float32)]
         )
     values.append(xp.zeros_like(attempt, dtype=xp.float32))
+    rim_contested = finish & contested & static.rim_protection_enabled.astype(bool)
+    # Conditional make probability excludes the independent block probability.
+    # Include blocked attempts too, so block outcomes cannot bias this average.
+    values.append(xp.where(
+        rim_contested,
+        xp.maximum(0.0, out.shot_open_probability - out.shot_conditional_probability),
+        0.0,
+    ))
     counters = xp.stack(values, axis=-1)
     shooter = xp.clip(out.shot_shooter, 0, static.training_player_mask.shape[0] - 1)
     learner_shot = static.training_player_mask[shooter] > 0.5
     sides = xp.stack([learner_shot, ~learner_shot], axis=-1).astype(xp.float32)
     result = sides[..., :, None] * counters[..., None, :]
     # A shared denominator counts each completed possession exactly once.
-    return result.at[..., 0, -1].set(
+    return result.at[..., 0, SHOT_DEFENSE_COUNTERS.index("completed_possessions")].set(
         (active & out.possession_ended.astype(bool)).astype(xp.float32)
     )
 
@@ -121,15 +130,16 @@ def build_shot_defense_diagnostics(static, out, active, xp):
 def summarize_shot_defense_diagnostics(diagnostics):
     if diagnostics is None:
         return {}
-    array = (
-        np.asarray(diagnostics, dtype=np.float64)
-        .reshape(-1, *SHOT_DEFENSE_SHAPE)
-        .sum(axis=0)
-    )
+    raw = np.asarray(diagnostics, dtype=np.float64)
+    # Historical diagnostic arrays predate the appended contest counter.
+    counter_names = SHOT_DEFENSE_COUNTERS
+    if raw.shape[-1] == len(SHOT_DEFENSE_COUNTERS) - 1:
+        counter_names = SHOT_DEFENSE_COUNTERS[:-1]
+    array = raw.reshape(-1, 2, len(counter_names)).sum(axis=0)
     output = {}
     rows = {"learner": array[0], "opponent": array[1], "all": array.sum(axis=0)}
     for side, row in rows.items():
-        counters = dict(zip(SHOT_DEFENSE_COUNTERS, map(float, row), strict=True))
+        counters = dict(zip(counter_names, map(float, row), strict=True))
         prefix = f"{side}_shot_defense"
         output.update({f"{prefix}_{key}": value for key, value in counters.items()})
         for label in (
@@ -187,7 +197,7 @@ def summarize_shot_defense_diagnostics(diagnostics):
     output["learner_blocks"] = float(array[1, blocked_index])
     output["opponent_blocks"] = float(array[0, blocked_index])
     output["blocks"] = output["learner_blocks"] + output["opponent_blocks"]
-    possessions = float(array[:, -1].sum())
+    possessions = float(array[:, SHOT_DEFENSE_COUNTERS.index("completed_possessions")].sum())
     if possessions:
         output["blocks_per_completed_possession"] = output["blocks"] / possessions
     return output

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from basketworld_jax.block_metrics import (
+    empty_block_metric_state, advance_block_metrics, summarize_block_metrics,
+)
+
 from basketworld_jax.shot_defense_metrics import SHOT_DEFENSE_SHAPE, build_shot_defense_diagnostics, summarize_shot_defense_diagnostics
 
 from time import perf_counter_ns
@@ -4674,6 +4678,7 @@ def build_compiled_deploy_eval_runner(
                 for field in DeployEvalTotals._fields
             )
         )
+        initial_block_metrics = empty_block_metric_state(initial_state.episode_ended.shape[0], jnp)
         initial_rebound_totals = zero_rebound_diagnostic_totals_like(zero, jnp)
         initial_completed_pass_boundary = jnp.zeros(
             initial_state.episode_ended.shape,
@@ -4691,6 +4696,7 @@ def build_compiled_deploy_eval_runner(
                 offensive_rebound_boundary,
                 totals,
                 rebound_totals,
+                block_metrics,
             ) = carry
             key, env_key = jax.random.split(key, 2)
             offense_key = jax.random.fold_in(key, 101)
@@ -4871,8 +4877,17 @@ def build_compiled_deploy_eval_runner(
             clock_segment = clock_transition["regulation_clock_segment"]
             in_overtime = clock_transition["clock_period_index"] > 0
 
+            shot_defense_step = build_shot_defense_diagnostics(static, env_out, active_step, jnp)
+            next_block_metrics = advance_block_metrics(
+                block_metrics, shot_defense_step, active=active_step,
+                episode_start=state.step_count == 0,
+                possession_ended=env_out.possession_ended.astype(jnp.bool_),
+                done=env_out.done.astype(jnp.bool_),
+                truncated=env_out.truncated.astype(jnp.bool_),
+                training_role=training_role_flags, xp=jnp,
+            )
             step_totals = DeployEvalTotals(
-                shot_defense_diagnostics=jnp.sum(build_shot_defense_diagnostics(static, env_out, active_step, jnp), axis=0),
+                shot_defense_diagnostics=jnp.sum(shot_defense_step, axis=0),
                 pressure_diagnostics=jnp.sum(build_pressure_diagnostics(static, state, active_step, jnp), axis=0),
                 active_steps=jnp.sum(active_step.astype(jnp.float32)),
                 completed_episode_steps=_active_sum(env_out.terminal_episode_steps),
@@ -5092,9 +5107,10 @@ def build_compiled_deploy_eval_runner(
                 next_offensive_rebound_boundary,
                 next_totals,
                 next_rebound_totals,
+                next_block_metrics,
             ), None
 
-        (final_state, _, _, _, totals, rebound_totals), _ = jax.lax.scan(
+        (final_state, _, _, _, totals, rebound_totals, block_metrics), _ = jax.lax.scan(
             _scan_step,
             (
                 initial_state,
@@ -5103,6 +5119,7 @@ def build_compiled_deploy_eval_runner(
                 initial_offensive_rebound_boundary,
                 initial_totals,
                 initial_rebound_totals,
+                initial_block_metrics,
             ),
             xs=None,
             length=int(horizon),
@@ -5111,6 +5128,7 @@ def build_compiled_deploy_eval_runner(
             final_state=final_state,
             totals=totals,
             rebound_diagnostic_totals=rebound_totals,
+            block_metric_totals=block_metrics.totals,
         )
 
     return jax.jit(_runner, static_argnums=(4, 6, 7))
@@ -5554,6 +5572,10 @@ def summarize_deploy_eval_outputs(
     metrics["clock_overtime_team_a_point_differential"] = (
         overtime_team_a_points - overtime_team_b_points
     )
+    block_totals = [output.block_metric_totals for output in outputs
+                    if output.block_metric_totals is not None]
+    if block_totals:
+        metrics.update(summarize_block_metrics(np.asarray(block_totals).sum(axis=0), combined=True))
     shot_defense_totals = [output.totals.shot_defense_diagnostics for output in outputs
                            if output.totals.shot_defense_diagnostics is not None]
     if shot_defense_totals:

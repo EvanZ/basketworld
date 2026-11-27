@@ -198,13 +198,16 @@ def test_block_metrics_survive_default_mlflow_filters():
         _filter_mlflow_deploy_metrics,
     )
 
-    metrics = {
-        "blocks": 3.0,
-        "learner_blocks": 2.0,
-        "opponent_blocks": 1.0,
-        "blocks_per_completed_possession": 0.1,
-        "all_shot_defense_rim_opportunities": 15.0,
-        "all_shot_defense_block_rate_per_eligible_attempt": 0.2,
-    }
-    assert _filter_mlflow_train_metrics(metrics) == metrics
-    assert _filter_mlflow_deploy_metrics(metrics) == metrics
+    from basketworld_jax.block_metrics import (
+        TRAIN_BLOCK_METRICS, DEPLOY_BLOCK_METRICS,
+        TRAIN_RIM_CONTEST_METRICS, DEPLOY_RIM_CONTEST_METRICS,
+        TRAIN_LAYUP_METRICS, DEPLOY_LAYUP_METRICS,
+    )
+
+    metrics = {key: 1.0 for key in TRAIN_BLOCK_METRICS | DEPLOY_BLOCK_METRICS
+               | TRAIN_RIM_CONTEST_METRICS | DEPLOY_RIM_CONTEST_METRICS
+               | TRAIN_LAYUP_METRICS | DEPLOY_LAYUP_METRICS}
+    metrics.update(blocks=3.0, all_shot_defense_rim_opportunities=15.0)
+    for profile in ("core", "full"):
+        assert set(_filter_mlflow_train_metrics(metrics, profile=profile)) == TRAIN_BLOCK_METRICS | TRAIN_RIM_CONTEST_METRICS | TRAIN_LAYUP_METRICS
+        assert set(_filter_mlflow_deploy_metrics(metrics, profile=profile)) == DEPLOY_BLOCK_METRICS | DEPLOY_RIM_CONTEST_METRICS | DEPLOY_LAYUP_METRICS

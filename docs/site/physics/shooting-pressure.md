@@ -236,16 +236,77 @@ A block is recorded as `shot_blocked` and `shot_blocker`. The dev box score has
 BLK, the play-by-play identifies shooter and blocker with shot type, distance,
 and clock, and live/replay visuals show the credited defender's swat.
 
-MLflow train, evaluation, and deployment diagnostics include `blocks`,
-`learner_blocks`, `opponent_blocks`, and `blocks_per_completed_possession`.
-`{learner,opponent,all}_shot_defense_*` counters group by **shooting side**,
-including attempts, makes, eligible rim opportunities, blocks suffered, and
-blocked-shot offensive/defensive recoveries. Rates include blocks per eligible
-attempt and per shot, and recovery fractions per blocked shot. Open/contested
-finish and jumper make rates, separate layup/dunk rates, open/conditional/
-marginal probabilities, and jump suppression before/after resistance aid
-interpretation. These count observed active steps, including partial games;
-zero-denominator rates are omitted. They are behavior diagnostics, not Elo.
+MLflow records exactly nine block series in both the core and full profiles:
+
+- `jax/train/learner_block_pct`
+- `jax/train/learner_blocks_per_defensive_possession`
+- `jax/train/learner_blocks_per_episode`
+- `jax/train/opponent_block_pct`
+- `jax/train/opponent_blocks_per_defensive_possession`
+- `jax/train/opponent_blocks_per_episode`
+- `jax/eval_deploy/block_pct`
+- `jax/eval_deploy/blocks_per_possession`
+- `jax/eval_deploy/blocks_per_episode`
+
+Block percentage is blocks divided by opposing layup + dunk attempts, multiplied
+by 100. Open and contested finishes are included; jump shots are excluded.
+Training credits each defending side separately; deploy combines both teams.
+Per-possession and percentage metrics count events only from completed possessions,
+with matching denominators. Per-episode metrics count all blocks in completed
+games, excluding partial and truncated games; deploy counts each game once.
+Training accumulates between logging points and carries pending possessions and
+games across updates. After resuming, a partial possession/game whose beginning
+was not observed is excluded until a complete one can be measured.
+Zero-denominator values are unavailable, not zero.
+
+Detailed `shot_defense_*` diagnostics remain available in evaluation artifacts;
+they and the old raw block aliases are no longer logged to MLflow, including
+role-specific evaluation. Historical MLflow data remains unchanged. No training
+rule or checkpoint schema change is needed; resume a paused worker to use the
+new logging code.
+
+Three additional rim-contest metrics measure the probability reduction separately
+from blocks:
+
+- `jax/train/learner_rim_contest_mean_reduction_pp`
+- `jax/train/opponent_rim_contest_mean_reduction_pp`
+- `jax/eval_deploy/rim_contest_mean_reduction_pp`
+
+Each is the average of `100 × (open make probability − conditional make
+probability if unblocked)` over contested layups and dunks with rim protection
+enabled, using completed possessions. For example, 80% reduced to 60% contributes
+20 percentage points. Blocked attempts are included using their conditional
+probability, so the independent block outcome/probability does not affect this
+metric. Open finishes and perimeter shots are excluded. Training credits the
+defending team; deploy pools attempts from both teams before dividing. No
+qualifying attempts means unavailable. These use the existing diagnostics group
+in the trainer UI and require a worker restart/resume before new values log.
+
+Rim-contest frequency uses six additional metrics:
+
+- `jax/train/learner_rim_contested_shots_per_episode`
+- `jax/train/learner_rim_contested_shot_pct`
+- `jax/train/opponent_rim_contested_shots_per_episode`
+- `jax/train/opponent_rim_contested_shot_pct`
+- `jax/eval_deploy/rim_contested_shots_per_episode`
+- `jax/eval_deploy/rim_contested_shot_pct`
+
+These six use **completed games only**, excluding partial and truncated games.
+Training credits the named defending team: its contested layup/dunk attempts
+divided by completed games, and its contested attempts divided by all opposing
+layup/dunk attempts times 100. Deployment pools both teams; its per-episode
+count is divided by **twice the completed game count**, reporting an average
+per team per game. The deploy percentage pools contested attempts and all
+layup/dunk attempts before dividing; it is not an average of team percentages.
+A contest requires an adjacent eligible defender with rim protection enabled;
+blocked attempts count. Zero denominators are unavailable. Training aggregates
+games completed since the previous log; deployment aggregates its evaluation
+batch. Pending game counts carry across updates and logging points. These
+appear in the existing diagnostics group, with no additional raw interval counts.
+All six are searchable and pinnable before their first logged value. The picker
+labels them "Not logged yet" until MLflow has observations; empty charts do not
+display invented zero values. A worker started before this logging update must
+be paused and resumed to begin producing the new series.
 
 Skill Ratings schema 2 declares all eleven skills: layup, three-point shooting,
 dunk, rebound, pressure, shot contest, steal, ball handling, passing, rim
@@ -272,3 +333,33 @@ Disabled, constant, and otherwise unestimated coefficients have no interval;
 neither do coefficients with fewer than two identifiable bootstrap fits.
 Older reports remain unchanged and show unavailable intervals. A new analysis
 revision can calculate intervals from their saved games without new simulation.
+
+
+### Compact layup metrics
+
+The normal trainer picker replaces 108 historical shot-defense layup diagnostics
+with nine selectable metrics in the existing diagnostics group:
+
+- `jax/train/learner_layup_attempts_per_episode`
+- `jax/train/learner_layup_makes_per_episode`
+- `jax/train/learner_layup_fg_pct`
+- `jax/train/opponent_layup_attempts_per_episode`
+- `jax/train/opponent_layup_makes_per_episode`
+- `jax/train/opponent_layup_fg_pct`
+- `jax/eval_deploy/layup_attempts_per_episode`
+- `jax/eval_deploy/layup_makes_per_episode`
+- `jax/eval_deploy/layup_fg_pct`
+
+All use completed games only, excluding partial and truncated games. Training
+credits the named shooting team: attempts or makes divided by completed games.
+Deploy divides both teams' counts by **2 × completed games**, an average per team
+per game. FG% pools makes and attempts before dividing and multiplying by 100;
+it is never divided by two. Blocked layups count as missed attempts. Dunks and
+jump shots are excluded. Zero denominators mean unavailable; valid zero counts
+are reported as zero. Training pools games completed since the previous log;
+deploy pools the evaluation batch. Unfinished games carry across logging windows.
+
+All nine can be pinned before any values log and show "Not logged yet".
+Historical diagnostics are preserved and can be found through "Include scoring
+diagnostics and legacy metrics"; existing pinned history is preserved. Workers
+started before this update require pause/resume to produce the new series.

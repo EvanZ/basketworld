@@ -159,9 +159,12 @@ label.toggle { display: flex; flex-direction: row; align-items: center; gap: 9px
 .elo-warning { grid-column: 1 / -1; margin: -3px 0 0; color: #f5c16c; font-size: 11px; }
 .empty-elo { min-height: 112px; display: grid; place-items: center; color: #7186a5; font-size: 12px; text-align: center; }
 .metrics-heading { align-items: flex-end; }
-.metric-picker { display: grid; grid-template-columns: minmax(300px, 1fr) auto; gap: 8px; width: min(620px, 56%); }
+.metric-picker { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; width: min(620px, 56%); min-width: 0; }
 .metric-picker > button { border: 1px solid #36749a; border-radius: 8px; padding: 8px 14px; color: #bcecff; background: #12324b; }
-.metric-picker-search { position: relative; }
+.metric-picker-search { position: relative; min-width: 0; }
+.metric-picker .metric-picker-search > input { width: 100%; min-width: 0; }
+.metric-picker-options { grid-column: 1 / -1; font-size: 12px; }
+.metric-picker .metric-picker-options input { width: auto; flex: 0 0 auto; margin: 0; }
 .metric-picker-menu { position: absolute; z-index: 20; top: calc(100% + 5px); right: 0; left: 0; max-height: 310px; overflow: auto; border: 1px solid #31577e; border-radius: 9px; background: #081426; box-shadow: 0 18px 45px #000b; }
 .metric-picker-menu button { width: 100%; padding: 9px 11px; border: 0; border-top: 1px solid #172943; display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #bcecff; background: transparent; text-align: left; }
 .metric-picker-menu button:first-child { border-top: 0; }

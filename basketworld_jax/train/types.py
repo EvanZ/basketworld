@@ -406,6 +406,7 @@ class DeployEvalOutput(NamedTuple):
     final_state: Any
     totals: DeployEvalTotals
     rebound_diagnostic_totals: Any
+    block_metric_totals: Any = None
 
 
 def compute_gae_and_returns(

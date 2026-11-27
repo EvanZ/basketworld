@@ -21,7 +21,7 @@ import {
 } from './configEditing'
 import { launchGitCommit, launchWorktreeState } from './runProvenance'
 import { pfspRows, metricDefinition } from './pfsp'
-import { scoringMetricGroup } from './scoringMetrics'
+import { isLegacyLayupMetric, metricPickerCatalog, scoringMetricGroup } from './scoringMetrics'
 import OpponentUsageChart from './OpponentUsageChart.vue'
 
 const defaultConfig = () => ({
@@ -305,11 +305,14 @@ const filteredRunConfig = computed(() => {
     JSON.stringify(field.value),
   ].some((value) => String(value || '').toLowerCase().includes(query)))
 })
-const availableMetricNames = computed(() => new Set(availableMetrics.value.map((metric) => metric.name)))
+const selectableMetrics = computed(() => metricPickerCatalog(availableMetrics.value))
+const availableMetricNames = computed(() => new Set(selectableMetrics.value.map((metric) => metric.name)))
+const loggedMetricNames = computed(() => new Set(availableMetrics.value.map((metric) => metric.name)))
 const showScoringDiagnostics = ref(false)
-const addableMetrics = computed(() => availableMetrics.value.filter((metric) =>
+const addableMetrics = computed(() => selectableMetrics.value.filter((metric) =>
   !selectedMetricNames.value.includes(metric.name) && (showScoringDiagnostics.value ||
-    !['Roster and opening-possession diagnostics', 'Legacy scoring (schema 1)'].includes(scoringMetricGroup(metric.name)))))
+    (!isLegacyLayupMetric(metric.name) &&
+      !['Roster and opening-possession diagnostics', 'Legacy scoring (schema 1)'].includes(scoringMetricGroup(metric.name))))))
 const metricPickerResults = computed(() => {
   const query = metricToAdd.value.trim().toLowerCase()
   return addableMetrics.value
@@ -319,7 +322,7 @@ const metricPickerResults = computed(() => {
 const metricCards = computed(() => selectedMetricNames.value.map((name) => ({
   name,
   points: metricSeries.value[name] || [],
-  available: availableMetricNames.value.has(name),
+  available: loggedMetricNames.value.has(name),
 })))
 const metricCardGroups = computed(() => {
   const order = ['Learner scoring', 'Learner evaluation', 'Self-play behavior', 'Opponent comparisons', 'RL health and other diagnostics', 'Roster and opening-possession diagnostics', 'Legacy scoring (schema 1)']
@@ -513,7 +516,7 @@ async function loadMetrics({ refreshCatalog = false } = {}) {
   metricsLoading.value = true
   metricsError.value = ''
   try {
-    const shouldRefreshCatalog = !metricPickerOpen.value && (
+    const shouldRefreshCatalog = (
       refreshCatalog
       || !availableMetrics.value.length
       || Date.now() - lastMetricCatalogAt > 30000
@@ -1355,14 +1358,14 @@ onBeforeUnmount(() => {
               </div>
             </details>
             <div class="detail-section-heading metrics-heading">
-              <div><h3>MLflow metrics</h3><span>{{ selectedMetricNames.length }} pinned · {{ availableMetrics.length }} available</span></div>
+              <div><h3>MLflow metrics</h3><span>{{ selectedMetricNames.length }} pinned · {{ selectableMetrics.length }} available</span></div>
               <div class="metric-picker">
-                <label><input v-model="showScoringDiagnostics" type="checkbox" /> Include scoring diagnostics and legacy metrics</label>
+                <label class="toggle metric-picker-options"><input v-model="showScoringDiagnostics" type="checkbox" /> Include scoring diagnostics and legacy metrics</label>
                 <div class="metric-picker-search">
                   <input v-model="metricToAdd" autocomplete="off" aria-label="Metric to add" placeholder="Search or paste a metric name…" @focus="metricPickerOpen = true" @input="metricPickerOpen = true" @blur="closeMetricPicker" @keyup.enter="addMetric" @keydown.esc="metricPickerOpen = false" />
                   <div v-if="metricPickerOpen" class="metric-picker-menu">
                     <button v-for="metric in metricPickerResults" :key="metric.name" type="button" @mousedown.prevent="chooseMetric(metric.name)">
-                      <span>{{ metric.name }}</span><small>{{ formatMetricValue(metric.latest) }}</small>
+                      <span>{{ metric.name }}</span><small>{{ metric.logged ? formatMetricValue(metric.latest) : 'Not logged yet' }}</small>
                     </button>
                     <p v-if="!metricPickerResults.length">No matching unpinned metrics.</p>
                   </div>
