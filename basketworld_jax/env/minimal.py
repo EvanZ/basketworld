@@ -473,6 +473,9 @@ class KernelStatic(NamedTuple):
     rim_protection_contest_base: Any
     rim_protection_contest_effect_weight: Any
 
+    league_pool: Any = None
+    league_team_probability: Any = None
+
 
 class KernelState(NamedTuple):
     positions: Any
@@ -564,6 +567,10 @@ class KernelState(NamedTuple):
 
     rim_protection_skill: Any = None
     contested_shooting_skill: Any = None
+    roster_rng: Any = None
+    roster_ids: Any = None
+    roster_counts: Any = None
+    roster_seen: Any = None
 
 
 class StepBatchOutput(NamedTuple):
@@ -975,6 +982,10 @@ def stack_state_snapshots(
     xp,
 ) -> KernelState:
     return KernelState(
+        roster_rng=xp.zeros((len(snapshots), 2), dtype=xp.uint32),
+        roster_ids=xp.full((len(snapshots), 2), -1, dtype=xp.int32),
+        roster_counts=xp.zeros((len(snapshots), 3), dtype=xp.int32),
+        roster_seen=xp.zeros((len(snapshots), 0), dtype=xp.bool_),
         contested_shooting_skill=xp.asarray(np.stack([item.get("contested_shooting_skill", np.zeros_like(item["dunk_pct"])) for item in snapshots]), dtype=xp.float32),
         rim_protection_skill=xp.asarray(np.stack([item.get("rim_protection_skill", np.zeros_like(item["dunk_pct"])) for item in snapshots]), dtype=xp.float32),
         positions=xp.asarray(
@@ -8834,6 +8845,10 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
         jax.random.fold_in(key, 108), shape=(n_players,), dtype=jnp.float32,
     )
     initial_state = KernelState(
+        roster_rng=jnp.zeros((2,), dtype=jnp.uint32),
+        roster_ids=jnp.full((2,), -1, dtype=jnp.int32),
+        roster_counts=jnp.zeros((3,), dtype=jnp.int32),
+        roster_seen=jnp.zeros((0 if static.league_pool is None else static.league_pool.skills.shape[0],), dtype=jnp.bool_),
         contested_shooting_skill=contested_shooting_skill,
         rim_protection_skill=rim_protection_skill,
         positions=positions,
@@ -8941,8 +8956,16 @@ def _reset_single_minimal(static: KernelStatic, key, jax, jnp):
     )
 
 
-def reset_batch_minimal(static: KernelStatic, rng_keys, jax, jnp):
-    return jax.vmap(lambda key: _reset_single_minimal(static, key, jax, jnp))(rng_keys)
+def reset_batch_minimal(static: KernelStatic, rng_keys, jax, jnp, roster_state=None):
+    state = jax.vmap(lambda key: _reset_single_minimal(static, key, jax, jnp))(rng_keys)
+    if static.league_pool is None:
+        return state
+    from basketworld_jax.roster_sampling import assign_rosters
+    keys = (jax.vmap(lambda k: jax.random.fold_in(k, 8701))(rng_keys)
+            if roster_state is None else roster_state.roster_rng)
+    counts = state.roster_counts if roster_state is None else roster_state.roster_counts
+    seen = state.roster_seen if roster_state is None else roster_state.roster_seen
+    return jax.vmap(lambda s, k, c, v: assign_rosters(static, s, k, c, v, jax, jnp))(state, keys, counts, seen)
 
 
 def sample_state_batch(args, xp) -> tuple[KernelStatic, KernelState]:

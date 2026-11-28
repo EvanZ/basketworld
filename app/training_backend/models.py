@@ -49,8 +49,18 @@ class TrainingRunConfig(BaseModel):
     require_all_offense_clear: bool = False
     random_check_location: bool = False
     multi_possession_use_inbounds: bool = True
+    roster_source: Literal["random", "league"] = "random"
+    league_team_probability: float = Field(default=0.75, ge=0, le=1, allow_inf_nan=False)
     league_reference: LeagueReference | None = None
     overrides: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_roster_source(self):
+        if self.roster_source == "league" and self.league_reference is None:
+            raise ValueError("Select a published league version for league training.")
+        if self.roster_source == "random" and self.league_reference is not None:
+            raise ValueError("Select League + fresh teams to use a league version.")
+        return self
 
     @field_validator("name", "mlflow_tracking_uri", "mlflow_experiment_name")
     @classmethod

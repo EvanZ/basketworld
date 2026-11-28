@@ -19,7 +19,13 @@ from basketworld_jax.league_names import FIRST_NAMES, LAST_NAMES, PLACES, NICKNA
 from basketworld_jax.shot_defense import SHOT_DEFENSE_DEFAULTS, shot_defense_contract, validate_shot_defense
 
 LEAGUE_SCHEMA_VERSION = 1
-LEAGUE_TRAINING_AVAILABLE = False
+# Shooting probabilities use the trainer recipe's scale, not unit-normal skills.
+SHOOTING_GENERATION_DEFAULTS = {
+    'layup': {'mean': .60, 'std': .05},
+    'three_pt': {'mean': .37, 'std': .05},
+    'dunk': {'mean': .60, 'std': .30},
+}
+LEAGUE_TRAINING_AVAILABLE = True
 UNAVAILABLE_MESSAGE = 'League-backed training is unavailable until #85 slice 2 is implemented. Published leagues can be authored and inspected now.'
 
 
@@ -46,7 +52,7 @@ def generation_settings(registry, overrides=None):
         defaults = dict(d.sampling_defaults)
         default = ({k: defaults[k] for k in ('alpha', 'beta', 'maximum', 'reference')}
                    if d.sampling_distribution == 'scaled_beta_logit_centered'
-                   else {'mean': defaults.get('default_mean', 0), 'std': 1.0})
+                   else SHOOTING_GENERATION_DEFAULTS.get(d.key, {'mean': defaults.get('default_mean', 0), 'std': 1.0}))
         supplied = overrides.get(d.key, {})
         if not isinstance(supplied, dict) or set(supplied) - set(default):
             raise ValueError(f'Unknown distribution settings for {d.key}.')
@@ -185,6 +191,20 @@ def validate_league(draft, *, complete=False):
     return draft
 
 
+def _gameplay_rules(contract):
+    # League sampling owns these values. Keep the full immutable contract in the
+    # artifact, but do not reject runs for unused trainer generation settings.
+    generation_parameters = {
+        'rim_protection_beta_alpha', 'rim_protection_beta_beta',
+        'rim_protection_block_distribution_max', 'rim_protection_skill_block_reference',
+        'contested_shooting_skill_mean', 'contested_shooting_skill_std',
+    }
+    return {**contract, 'parameters': {
+        key: value for key, value in contract['parameters'].items()
+        if key not in generation_parameters
+    }}
+
+
 def validate_snapshot(snapshot, reference=None, environment=None):
     try:
         validate_league(snapshot, complete=True)
@@ -197,7 +217,7 @@ def validate_snapshot(snapshot, reference=None, environment=None):
         if environment is not None:
             if int(environment.get('players', 5)) != snapshot['team_size']:
                 raise ValueError(f'League requires {snapshot["team_size"]} players per team; adjust the run team size.')
-            if shot_defense_contract(environment) != snapshot['rules']:
+            if _gameplay_rules(shot_defense_contract(environment)) != _gameplay_rules(snapshot['rules']):
                 raise ValueError('League shot-defense rules do not match this run. Select a compatible published version or match its rule settings.')
     except (KeyError, TypeError) as exc:
         raise ValueError(f'Incomplete league artifact: {exc}.') from exc

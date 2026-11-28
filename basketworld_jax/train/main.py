@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from basketworld_jax.roster_sampling import (training_league, compile_league, evaluation_static, flush_roster_metrics, roster_contract, validate_roster_resume, METRICS as ROSTER_METRICS)
+
 import argparse
 import json
 from copy import copy, deepcopy
@@ -490,6 +492,9 @@ def build_train_parser():
     parser = build_parser("JAX trainer: reduced actor-critic + compiled rollout path.")
     _suppress_legacy_opponent_help(parser)
     parser.set_defaults(**TRAIN_FROZEN_VALUES)
+    parser.add_argument('--roster-source', choices=('random', 'league'), default='random', help='Use random teams or the selected league with fresh teams.')
+    parser.add_argument('--league-team-probability', type=float, default=.75, help='Independent per-team probability of choosing a saved league roster (0 to 1).')
+    parser.add_argument('--league-snapshot-path', default='', help='Path to the immutable published league JSON used by this run.')
     parser.add_argument(
         "--kernel-batch-size",
         type=int,
@@ -1688,6 +1693,7 @@ def _config_category(dest: str) -> str:
 def build_train_config_schema(args) -> list[dict[str, Any]]:
     parser = build_train_parser()
     app_internal = {
+        "roster_source", "league_team_probability", "league_snapshot_path",
         "run_train_loop",
         "dump_config_schema",
         "checkpoint_dir",
@@ -1795,6 +1801,10 @@ def _values_match(actual: Any, expected: Any) -> bool:
 
 
 def validate_train_args(args) -> None:
+    try:
+        args._league_snapshot = training_league(args)
+    except (ValueError, OSError) as exc:
+        raise SystemExit(str(exc)) from exc
     try:
         validate_shot_defense(shot_defense_values(args))
     except ValueError as exc:
@@ -2784,6 +2794,7 @@ def _checkpoint_trainer_config_from_args(
         str(key): to_builtin(value) for key, value in asdict(trainer_config).items()
     }
     selector_fields = {
+        **roster_contract(args),
         "eval_deploy_every_updates": int(getattr(args, "eval_deploy_every_updates", 0)),
         "eval_deploy_batches": int(getattr(args, "eval_deploy_batches", 20)),
         "eval_deploy_horizon": int(getattr(args, "eval_deploy_horizon", 128)),
@@ -3275,6 +3286,10 @@ def _validate_resume_checkpoint_payload(
     spec: ActorCriticSpec,
     args,
 ) -> None:
+    try:
+        validate_roster_resume(payload, args)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     _validate_checkpoint_episode_semantics(
         payload,
         args=args,
@@ -3463,6 +3478,10 @@ def _save_training_checkpoint(
     )
     save_checkpoint(numbered_path, payload)
     save_checkpoint(latest_path, payload)
+    if getattr(args, '_league_snapshot', None) is not None:
+        from basketworld_jax.leagues import canonical_bytes
+        for checkpoint_path in (numbered_path, latest_path):
+            (Path(checkpoint_path) / 'league.json').write_bytes(canonical_bytes(args._league_snapshot))
     return str(latest_path), str(numbered_path), checkpoint_source_provenance
 
 
@@ -4135,6 +4154,8 @@ def _log_mlflow_params(
             mlflow.set_tag("basketworld.continuation_latest_source_run", continuation_run_id)
         return
     params = {
+        "jax/roster_source": getattr(args, "roster_source", "random"),
+        "jax/league_team_probability": float(getattr(args, "league_team_probability", .75)),
         "jax/script": "basketworld_jax/train/main.py",
         "jax/mode": "train_loop" if bool(args.run_train_loop) else "scaffold",
         "jax/kernel_batch_size": int(args.kernel_batch_size),
@@ -4857,7 +4878,7 @@ def _filter_mlflow_train_metrics(
     return {
         key: value
         for key, value in metrics.items()
-        if key in TRAIN_BLOCK_METRICS | TRAIN_RIM_CONTEST_METRICS | TRAIN_LAYUP_METRICS
+        if key in set(ROSTER_METRICS) | TRAIN_BLOCK_METRICS | TRAIN_RIM_CONTEST_METRICS | TRAIN_LAYUP_METRICS
         or key in _CORE_TRAIN_METRICS
         or key.startswith(
             (
@@ -5664,8 +5685,9 @@ def _run_historical_match_evaluation(
     episode_count = int(getattr(args, "historical_eval_episodes", 200))
     episodes_per_assignment = episode_count // 2
     root_key = jax.random.PRNGKey(int(getattr(args, "historical_eval_seed", 3_000_000)))
-    root_key = jax.random.fold_in(root_key, int(candidate_update))
-    root_key = jax.random.fold_in(root_key, int(opponent_update))
+    if getattr(args, "roster_source", "random") != "league":
+        root_key = jax.random.fold_in(root_key, int(candidate_update))
+        root_key = jax.random.fold_in(root_key, int(opponent_update))
     reset_key = jax.random.fold_in(root_key, 0)
     rollout_key = jax.random.fold_in(root_key, 1)
     reset_keys = jax.random.split(reset_key, episodes_per_assignment)
@@ -7669,6 +7691,9 @@ def run_training_loop(args) -> dict[str, Any]:
     statics = {
         role: sample_state_batch(role_args[role], xp=jnp)[0] for role in TRAINING_ROLES
     }
+    if args._league_snapshot is not None:
+        pool = compile_league(args._league_snapshot, jnp)
+        statics = {role: value._replace(league_pool=pool, league_team_probability=jnp.asarray(args.league_team_probability, dtype=jnp.float32)) for role, value in statics.items()}
     initial_training_statics = {
         role: statics[role]._replace(
             multi_possession_limit=jnp.asarray(
@@ -8026,6 +8051,11 @@ def run_training_loop(args) -> dict[str, Any]:
             continuation_checkpoint_info is not None
             and not continuation_preserves_env_state
         )
+        if args._league_snapshot is not None and reset_resume_env_state:
+            raise SystemExit(
+                "League training must preserve its roster assignments and RNG on resume; "
+                "remove --resume-reset-env-state and use --continue-preserve-env-state for continuation."
+            )
         if reset_resume_env_state:
             print(
                 "[resume] Reset transient JAX env state and RNG; restored policy, "
@@ -8420,7 +8450,7 @@ def run_training_loop(args) -> dict[str, Any]:
             # Same-policy deployment evaluation has no older checkpoint, so it
             # uses this update's active game rules. Policy matchups select a
             # shared older-checkpoint context at evaluation time below.
-            deployment_eval_statics = active_statics
+            deployment_eval_statics = {role: evaluation_static(value, jnp) for role, value in active_statics.items()}
             selector_alpha, selector_eps = _selector_schedules_for_update(
                 args, update_idx
             )
@@ -8981,6 +9011,7 @@ def run_training_loop(args) -> dict[str, Any]:
             if single_episode_rollout:
                 base_key, reset_block_key = jax.random.split(base_key)
                 role_reset_keys = jax.random.split(reset_block_key, len(TRAINING_ROLES))
+                prior_states = {role: role_rollouts[role].final_state for role in TRAINING_ROLES}
                 current_states = {}
                 for role, role_reset_key in zip(
                     TRAINING_ROLES, role_reset_keys, strict=True
@@ -8989,7 +9020,7 @@ def run_training_loop(args) -> dict[str, Any]:
                         role_reset_key, int(args.kernel_batch_size)
                     )
                     current_states[role] = reset_batch_minimal(
-                        active_statics[role], reset_keys, jax, jnp
+                        active_statics[role], reset_keys, jax, jnp, roster_state=prior_states[role]
                     )
                 block_until_ready_tree(current_states)
             else:
@@ -9218,6 +9249,9 @@ def run_training_loop(args) -> dict[str, Any]:
                 )
             )
             if should_log_history:
+                if args._league_snapshot is not None:
+                    roster_metrics, current_states = flush_roster_metrics(current_states, jnp)
+                    last_metrics.update(roster_metrics)
                 last_metrics.update(block_metric_accumulator.flush())
                 train_history.append(last_metrics)
                 if mlflow is not None:
@@ -9277,6 +9311,7 @@ def run_training_loop(args) -> dict[str, Any]:
                     )
                     for role in TRAINING_ROLES
                 }
+                eval_statics = {role: evaluation_static(value, jnp) for role, value in eval_statics.items()}
                 opponent_selector_active = (
                     _selector_active_for_update(
                         args,
@@ -9783,7 +9818,7 @@ def run_training_loop(args) -> dict[str, Any]:
                     )
                     checkpoint_eval_initial_states = {
                         role: reset_batch_minimal(
-                            active_statics[role],
+                            evaluation_static(active_statics[role], jnp),
                             jax.random.split(
                                 reset_key,
                                 int(args.kernel_batch_size),
@@ -10040,6 +10075,7 @@ def run_training_loop(args) -> dict[str, Any]:
                             )
                             for role in TRAINING_ROLES
                         }
+                        match_statics = {role: evaluation_static(value, jnp) for role, value in match_statics.items()}
                         candidate_match_selector_active = _selector_active_for_update(
                             args,
                             update_idx,
@@ -10255,6 +10291,14 @@ def run_train_scaffold(args) -> dict[str, Any]:
     validate_train_args(args)
     jax, jnp = ensure_jax_available("basketworld_jax/train/main.py")
     static, state = sample_state_batch(args, xp=jnp)
+    if args._league_snapshot is not None:
+        static = static._replace(
+            league_pool=compile_league(args._league_snapshot, jnp),
+            league_team_probability=jnp.asarray(args.league_team_probability, dtype=jnp.float32),
+        )
+        state = reset_batch_minimal(static, jax.random.split(
+            jax.random.PRNGKey(int(args.sample_reset_seed)), int(args.kernel_batch_size)
+        ), jax, jnp)
     training_player_ids = training_player_ids_from_static(static)
     training_player_ids_jnp = jnp.asarray(training_player_ids, dtype=jnp.int32)
 

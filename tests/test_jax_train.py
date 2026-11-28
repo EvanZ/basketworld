@@ -745,7 +745,9 @@ def test_historical_clock_summary_excludes_safety_truncations_and_keeps_events()
     assert summary["clock_events"][1]["period_index"] == 1
 
 
-def test_historical_match_evaluation_passes_runner_diagnostics_to_summary(monkeypatch):
+@pytest.mark.parametrize('roster_source', ['random', 'league'])
+@pytest.mark.parametrize('updates', [(10, 5), (20, 10)])
+def test_historical_match_evaluation_passes_runner_diagnostics_to_summary(monkeypatch, roster_source, updates):
     class FakeRandom:
         @staticmethod
         def PRNGKey(seed):
@@ -763,6 +765,8 @@ def test_historical_match_evaluation_passes_runner_diagnostics_to_summary(monkey
         random = FakeRandom()
 
     def _fake_reset(static, keys, jax, jnp):
+        expected_seed = 3_000_000 + (sum(updates) if roster_source == 'random' else 0)
+        np.testing.assert_array_equal(keys, [expected_seed])
         del keys, jax, jnp
         return static
 
@@ -793,11 +797,12 @@ def test_historical_match_evaluation_passes_runner_diagnostics_to_summary(monkey
         statics={"offense": "candidate_team_a", "defense": "candidate_team_b"},
         candidate_params=object(),
         opponent_params=object(),
-        candidate_update=10,
-        opponent_update=5,
+        candidate_update=updates[0],
+        opponent_update=updates[1],
         candidate_selector_active=True,
         opponent_selector_active=False,
         args=SimpleNamespace(
+            roster_source=roster_source,
             historical_eval_episodes=2,
             historical_eval_seed=3_000_000,
             historical_eval_horizon=1024,

@@ -608,9 +608,23 @@ class JobManager:
             raise RuntimeError(f"Resume checkpoint cannot be inspected: {exc}") from exc
         self._validate_checkpoint_metadata(metadata)
 
+        expected_roster = self._resolved_config_from_preview(preview)
+        saved_roster = metadata.get("trainer_config", {})
+        for key, default in (("roster_source", "random"), ("league_team_probability", .75)):
+            if saved_roster.get(key, default) != expected_roster.get(key, default):
+                raise RuntimeError(f"Resume roster configuration mismatch for {key}; create a new run to change it.")
+        if expected_roster.get("roster_source", "random") == "league":
+            from basketworld_jax.leagues import load_league_snapshot
+            snapshot = load_league_snapshot(expected_roster["league_snapshot_path"])
+            reference = {key: snapshot[key] for key in ("league_id", "version", "sha256")}
+            if saved_roster.get("league_reference") != reference:
+                raise RuntimeError("Resume checkpoint league reference does not match the pinned snapshot.")
         saved_config = metadata.get("resolved_training_config")
         if isinstance(saved_config, dict):
             saved_config = dict(saved_config)
+            saved_config.setdefault("roster_source", "random")
+            saved_config.setdefault("league_team_probability", 0.75)
+            saved_config.setdefault("league_snapshot_path", "")
             saved_config.setdefault("require_all_offense_clear", False)
             saved_config.setdefault("prefer_higher_percentage_shot", False)
             # Old checkpoints used recency; introducing opt-in PFSP must not

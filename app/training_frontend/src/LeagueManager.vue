@@ -56,12 +56,22 @@ watch(() => filteredPlayers.value.length, count => { playerPage.value = Math.min
 const unassignedCount = computed(() => (shown.value?.players || []).filter(p => !members.value.has(p.id)).length)
 const activeSkills = computed(() => shown.value?.skill_descriptors || [])
 const profile = computed(() => options.value?.profiles[profileIndex.value])
+// Keep edits for temporarily disabled skills when switching rule profiles.
+const samplingDrafts = {}
 function inactiveSkill(key, rules) {
   return (key === 'rim_protection' && !rules.rim_protection_enabled) || (key === 'contested_shooting' && !rules.contested_shooting_enabled)
 }
 function useProfile() {
-  creation.value.rules = copy(profile.value.rules)
-  creation.value.sampling = copy(profile.value.sampling)
+  Object.assign(samplingDrafts, copy(creation.value.sampling))
+  creation.value.rules = {
+    ...copy(profile.value.rules), ...creation.value.rules,
+    rim_protection_enabled: profile.value.rules.rim_protection_enabled,
+    contested_shooting_enabled: profile.value.rules.contested_shooting_enabled,
+  }
+  creation.value.sampling = Object.fromEntries(
+    Object.entries(profile.value.sampling).map(([skill, defaults]) =>
+      [skill, {...copy(defaults), ...copy(samplingDrafts[skill] || {})}]),
+  )
 }
 async function refresh() {
   try { leagues.value = await api.listLeagues(showArchived.value) } catch (e) { error.value = e.message }
@@ -211,7 +221,7 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="league-manager">
-    <p class="league-notice">Create reusable leagues here. League-backed training will be available in #85 slice 2. Season records and player statistics will come with competition evaluation.</p>
+    <p class="league-notice">Create reusable leagues here, then select a published version when starting league training. Season records and player statistics will come with competition evaluation.</p>
     <div v-if="error" role="alert" class="error-banner">{{ error }} <button v-if="dirty" @click="saveDraft">Retry save</button></div>
     <div class="league-toolbar">
       <label class="toggle"><input v-model="showArchived" type="checkbox" @change="refresh" /> Show archived leagues and versions</label>
@@ -253,12 +263,29 @@ onBeforeUnmount(() => {
           <button :disabled="busy" @click="startDelete">Delete league…</button>
         </div>
         <div v-if="deletingLeague" class="league-delete" role="group" aria-label="Delete league confirmation">
-          <p>Permanently delete <strong>{{ draft.name }}</strong>, all its players, rosters, and published versions? This cannot be undone. Leagues used by training runs cannot be deleted.</p>
+          <p>Permanently delete <strong>{{ draft.name }}</strong>, all its players, rosters, and published versions from the league library? This cannot be undone. Active or paused runs block deletion. Stopped, completed, and failed runs retain their own saved league snapshots and checkpoints.</p>
           <label>Type the league name to confirm<input v-model="deleteName" :disabled="busy" aria-label="League name to delete" /></label>
           <button :disabled="busy || deleteName !== draft.name" @click="deleteLeague">Permanently delete league</button>
           <button :disabled="busy" @click="deletingLeague = false">Cancel deletion</button>
         </div>
         <p>{{ shown.team_count }} teams · {{ shown.team_size }} players per team · Skill schema {{ shown.skill_schema_version }} · Seed {{ shown.seed }}</p>
+        <section class="league-config" aria-label="Saved league configuration">
+          <h3>League configuration</h3>
+          <p>{{ snapshot ? `Published v${snapshot.version}` : 'Current draft' }} · Saved settings, read only. Individual player edits do not change these distributions.</p>
+          <details open>
+            <summary>Player generation settings</summary>
+            <div class="league-config-grid">
+              <div v-for="skill in activeSkills" :key="skill.key" class="league-config-skill" :data-skill="skill.key">
+                <strong>{{ skill.display_label }}<small v-if="inactiveSkill(skill.key, shown.rules.parameters)"> (inactive)</small></strong>
+                <dl><div v-for="(value, key) in shown.sampling[skill.key]" :key="key"><dt>{{ key }}</dt><dd>{{ value }}</dd></div></dl>
+              </div>
+            </div>
+          </details>
+          <details>
+            <summary>Rule compatibility settings</summary>
+            <dl class="league-config-rules"><div v-for="(value, key) in shown.rules.parameters" :key="key"><dt>{{ key }}</dt><dd>{{ value }}</dd></div></dl>
+          </details>
+        </section>
         <details class="league-versions"><summary>Published versions ({{ selected.versions.length }})</summary>
           <button :disabled="busy" @click="inspectVersion(null)">Edit current draft</button>
           <div v-for="v in selected.versions.filter(v => showArchived || !v.archived)" :key="v.version" class="league-toolbar">
@@ -319,6 +346,15 @@ button:disabled { opacity: .5; cursor: default; }
 .league-layout { display: grid; grid-template-columns: 230px minmax(0, 1fr); gap: 18px; }
 .league-list, .league-content, .league-create { padding: 20px; }
 .league-content { min-width: 0; }
+.league-config { margin: 16px 0; padding: 16px; border: 1px solid #344158; border-radius: 10px; }
+.league-config h3 { margin: 0; }
+.league-config p { color: #b6c2d2; line-height: 1.5; }
+.league-config-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; }
+.league-config dl { margin: 8px 0 0; }
+.league-config dl > div { display: flex; justify-content: space-between; gap: 16px; padding: 4px 0; }
+.league-config dt { color: #b6c2d2; overflow-wrap: anywhere; min-width: 0; }
+.league-config dd { margin: 0; font-variant-numeric: tabular-nums; }
+.league-config-rules { max-width: 640px; }
 .league-list-item { display: flex; flex-direction: column; text-align: left; width: 100%; gap: 6px; margin: 8px 0; }
 .league-list-item.active { border-color: #f7994a; }
 .league-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; margin: 16px 0; }

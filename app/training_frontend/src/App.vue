@@ -46,6 +46,8 @@ const defaultConfig = () => ({
   require_all_offense_clear: false,
   multi_possession_use_inbounds: true,
   overrides: {},
+  roster_source: 'random',
+  league_team_probability: 0.75,
   league_reference: null,
 })
 
@@ -217,6 +219,7 @@ const eloError = ref('')
 const activeView = ref('runs')
 let refreshTimer = null
 let previewTimer = null
+let previewRequest = 0
 let metricRefreshTimer = null
 let lastMetricCatalogAt = 0
 
@@ -344,6 +347,8 @@ const estimatedRemainingCaption = computed(() => remainingTrainingTimeCaption(
 ))
 
 const applicationConfigValues = computed(() => ({
+  roster_source: config.value.roster_source,
+  league_team_probability: config.value.league_team_probability,
   num_updates: config.value.num_updates,
   policy_seed: config.value.policy_seed,
   historical_eval_updates: config.value.historical_eval_updates,
@@ -638,7 +643,17 @@ function fieldLabel(field) {
   return labels[field.name] || field.name.replaceAll('_', ' ')
 }
 
+const leagueGenerationFields = new Set([
+  'layup_pct', 'layup_std', 'three_pt_pct', 'three_pt_std', 'dunk_pct', 'dunk_std',
+  'rebound_skill_std', 'rebound_skill_sampling', 'rebound_skill_sampling_mode', 'rebound_skill_low', 'rebound_skill_high',
+  ...['pressure', 'shot_contest', 'steal', 'ball_handling', 'passing', 'contested_shooting'].flatMap(k => [`${k}_skill_mean`, `${k}_skill_std`]),
+  'rim_protection_beta_alpha', 'rim_protection_beta_beta', 'rim_protection_block_distribution_max', 'rim_protection_skill_block_reference',
+])
+function fieldUsesLeagueSkills(field) {
+  return config.value.roster_source === 'league' && leagueGenerationFields.has(field.name)
+}
 function fieldIsEditable(field) {
+  if (fieldUsesLeagueSkills(field)) return false
   return field.editable || Object.prototype.hasOwnProperty.call(APP_CONFIG_KEYS, field.name)
 }
 
@@ -834,16 +849,21 @@ async function selectRun(run) {
 }
 
 async function loadPreview() {
+  const request = ++previewRequest
   try {
-    preview.value = await api.previewRun(config.value)
+    const result = await api.previewRun(config.value)
+    if (request !== previewRequest) return
+    preview.value = result
     error.value = ''
   } catch (cause) {
+    if (request !== previewRequest) return
     preview.value = null
     error.value = cause.message
   }
 }
 
 watch(config, () => {
+  previewRequest++
   window.clearTimeout(previewTimer)
   previewTimer = window.setTimeout(loadPreview, 250)
 }, { deep: true })
@@ -1090,7 +1110,8 @@ onBeforeUnmount(() => {
                   <span class="label-title">{{ fieldLabel(field) }} <button type="button" class="info-button" :title="configHelp(field.name)">i</button></span>
                   <button type="button" class="pin-button active" :aria-label="`Unpin ${field.name}`" :title="`Unpin ${field.name}`" @click="togglePinned(field)">📌</button>
                 </div>
-                <label v-if="field.type === 'bool'" class="toggle config-input">
+                <span v-if="fieldUsesLeagueSkills(field)" class="field-meta">Uses selected league · see Fresh-team skill distributions below</span>
+                <label v-else-if="field.type === 'bool'" class="toggle config-input">
                   <input type="checkbox" :checked="Boolean(configFieldValue(field))" :disabled="!fieldIsEditable(field)" @change="setConfigField(field, $event.target.checked)" />
                   <span>{{ configFieldValue(field) ? 'true' : 'false' }}</span>
                 </label>
@@ -1099,7 +1120,7 @@ onBeforeUnmount(() => {
                 </select>
                 <input v-else class="config-input" :type="inputType(field)" :inputmode="field.type === 'float' ? 'decimal' : undefined" :value="inputValue(field)" :disabled="!fieldIsEditable(field)" @input="setConfigField(field, $event.target.value)" />
                 <small v-if="checkRuleNote(field.name)" class="field-meta">{{ checkRuleNote(field.name) }}</small>
-                <small class="field-meta">{{ field.name }} · {{ field.type }}<span v-if="!fieldIsEditable(field)"> · {{ field.frozen ? 'frozen' : 'internal' }}</span></small>
+                <small class="field-meta">{{ field.name }} · {{ field.type }}<span v-if="!fieldIsEditable(field)"> · {{ fieldUsesLeagueSkills(field) ? 'league-controlled' : field.frozen ? 'frozen' : 'internal' }}</span></small>
               </article>
             </div>
             <p v-else class="empty-pins">No configs pinned. Pin one from All training configs below.</p>
@@ -1123,7 +1144,8 @@ onBeforeUnmount(() => {
                   <small>{{ field.category }}</small>
                   <small v-if="checkRuleNote(field.name)">{{ checkRuleNote(field.name) }}</small>
                 </div>
-                <label v-if="field.type === 'bool'" class="toggle config-input">
+                <span v-if="fieldUsesLeagueSkills(field)" class="field-meta">Uses selected league · see Fresh-team skill distributions below</span>
+                <label v-else-if="field.type === 'bool'" class="toggle config-input">
                   <input type="checkbox" :checked="Boolean(configFieldValue(field))" :disabled="!fieldIsEditable(field)" @change="setConfigField(field, $event.target.checked)" />
                   <span>{{ configFieldValue(field) ? 'true' : 'false' }}</span>
                 </label>
@@ -1133,17 +1155,24 @@ onBeforeUnmount(() => {
                 <input v-else class="config-input" :type="inputType(field)" :inputmode="field.type === 'float' ? 'decimal' : undefined" :value="inputValue(field)" :disabled="!fieldIsEditable(field)" @input="setConfigField(field, $event.target.value)" />
                 <div class="field-actions">
                   <button type="button" class="pin-button" :class="{ active: isPinned(field) }" :aria-label="`${isPinned(field) ? 'Unpin' : 'Pin'} ${field.name}`" :title="`${isPinned(field) ? 'Unpin' : 'Pin'} ${field.name}`" @click="togglePinned(field)">📌</button>
-                  <button v-if="Object.prototype.hasOwnProperty.call(config.overrides, field.name)" type="button" class="reset-button" title="Restore preset default" @click="resetOverride(field)">Reset</button>
-                  <span v-else-if="!fieldIsEditable(field)" class="lock-label">{{ field.frozen ? 'frozen' : 'internal' }}</span>
+                  <button v-if="!fieldUsesLeagueSkills(field) && Object.prototype.hasOwnProperty.call(config.overrides, field.name)" type="button" class="reset-button" title="Restore preset default" @click="resetOverride(field)">Reset</button>
+                  <span v-else-if="!fieldIsEditable(field)" class="lock-label">{{ fieldUsesLeagueSkills(field) ? 'league-controlled' : field.frozen ? 'frozen' : 'internal' }}</span>
                 </div>
               </article>
             </div>
           </details>
-          <LeagueSelector v-model="config.league_reference" />
+          <div class="wide league-roster-controls">
+            <label>Roster source<select v-model="config.roster_source" @change="config.league_reference = null"><option value="random">Random teams</option><option value="league">League + fresh teams</option></select></label>
+            <template v-if="config.roster_source === 'league'">
+              <label>League team probability (%)<input aria-label="League team probability (%)" type="number" min="0" max="100" step="1" :value="config.league_team_probability * 100" @input="config.league_team_probability = Number($event.target.value) / 100" /></label>
+              <p>Saved players keep the published league's exact skills, and fresh teams use its saved distributions. Copied run skill-distribution settings are inactive in this mode; all other copied settings are retained. Each side chooses its source independently. Roster settings stay fixed through resume and extensions.</p>
+              <LeagueSelector v-model="config.league_reference" />
+            </template>
+          </div>
           <div class="launch-row wide">
             <p v-if="activeRun">The single v0 worker is occupied by {{ activeRun.name }}.</p>
             <p v-else>Launches as a detached worker; closing this page will not stop it.</p>
-            <button class="primary" :disabled="launching || Boolean(activeRun) || Boolean(config.league_reference)">{{ launching ? 'Launching…' : 'Launch training' }}</button>
+            <button class="primary" :disabled="launching || Boolean(activeRun) || (config.roster_source === 'league' && !config.league_reference)">{{ launching ? 'Launching…' : 'Launch training' }}</button>
           </div>
         </form>
         <aside class="panel command-panel">

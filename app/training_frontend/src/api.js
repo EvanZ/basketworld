@@ -24,6 +24,7 @@ async function request(path, options = {}) {
     const detail = payload.detail
     const message = responseErrorMessage(payload, response.status)
     const error = new Error(message)
+    error.status = response.status
     error.detail = detail
     throw error
   }

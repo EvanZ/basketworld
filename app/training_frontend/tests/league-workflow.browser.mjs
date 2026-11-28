@@ -16,11 +16,43 @@ try {
  await form.getByLabel('League name',{exact:true}).fill(`Browser League ${suffix}`);
  await form.getByLabel('Teams',{exact:true}).fill('2');
  await form.getByLabel('Players per team').selectOption('3');
+ await form.getByText('Player generation settings',{exact:true}).click();
+ assert.equal(await form.getByLabel('Layup std',{exact:true}).inputValue(),'0.05');
+ assert.equal(await form.getByLabel('Dunk std',{exact:true}).inputValue(),'0.3');
+ assert.equal(await form.getByLabel('Three Point std',{exact:true}).inputValue(),'0.05');
+ await form.getByLabel('Layup std',{exact:true}).fill('0.08');
+ await form.getByLabel('Dunk std',{exact:true}).fill('0.3');
+ await form.getByLabel('Three Point std',{exact:true}).fill('0.05');
  await form.getByLabel('Skill rules').selectOption('3');
+ assert.equal(await form.getByLabel('Layup std',{exact:true}).inputValue(),'0.08');
+ assert.equal(await form.getByLabel('Dunk std',{exact:true}).inputValue(),'0.3');
+ assert.equal(await form.getByLabel('Three Point std',{exact:true}).inputValue(),'0.05');
+ await form.getByLabel('Contested Shooting std',{exact:true}).fill('0.7');
+ await form.getByLabel('Skill rules').selectOption('0');
+ await form.getByLabel('Skill rules').selectOption('3');
+ assert.equal(await form.getByLabel('Contested Shooting std',{exact:true}).inputValue(),'0.7');
+ const creationResponse = page.waitForResponse(r => r.url().endsWith('/api/v1/leagues') && r.request().method() === 'POST');
  await form.getByRole('button',{name:'Generate league',exact:true}).click();
+ const created = await (await creationResponse).json();
+ assert.equal(created.draft.sampling.layup.std,0.08);
+ assert.equal(created.draft.sampling.dunk.std,0.3);
+ assert.equal(created.draft.sampling.three_pt.std,0.05);
+ assert.equal(created.draft.sampling.contested_shooting.std,0.7);
  await page.locator('.league-content').waitFor();
  await page.getByRole('button',{name:'Publish version',exact:true}).click();
  await page.getByRole('status').filter({hasText:'Published v1'}).waitFor();
+ const savedConfig = page.getByRole('region',{name:'Saved league configuration'});
+ async function checkSavedConfig() {
+  await savedConfig.waitFor();
+  assert.equal(await savedConfig.locator('.league-config-skill').count(),11);
+  assert.equal(await savedConfig.locator('[data-skill="layup"] dl div').filter({hasText:'std'}).locator('dd').innerText(),'0.08');
+  assert.equal(await savedConfig.locator('[data-skill="dunk"] dl div').filter({hasText:'std'}).locator('dd').innerText(),'0.3');
+  assert.equal(await savedConfig.locator('[data-skill="contested_shooting"] dl div').filter({hasText:'std'}).locator('dd').innerText(),'0.7');
+  assert.equal(await savedConfig.locator('input, select').count(),0);
+ }
+ await checkSavedConfig();
+ await savedConfig.getByText('Rule compatibility settings',{exact:true}).click();
+ assert.equal(await savedConfig.locator('.league-config-rules > div').filter({hasText:'rim_protection_enabled'}).locator('dd').innerText(),'true');
  const firstPlayer = page.locator('.league-players tbody tr').first();
  const playerName = await firstPlayer.locator('td button').innerText();
  await firstPlayer.locator('td button').click();
@@ -32,6 +64,8 @@ try {
  await page.getByText('Published versions (2)',{exact:true}).click();
  await page.getByRole('button',{name:'Inspect v1',exact:true}).click();
  await page.getByRole('status').filter({hasText:'Published v1 · Read only'}).waitFor();
+ await checkSavedConfig();
+ await savedConfig.getByText('Published v1 · Saved settings, read only.',{exact:false}).waitFor();
  await page.getByRole('button',{name:playerName,exact:true}).click();
  assert.equal(await page.getByLabel('Player Layup',{exact:true}).isDisabled(),true);
  assert.notEqual(await page.getByLabel('Player Layup',{exact:true}).inputValue(),'0.73123456789');
@@ -54,6 +88,7 @@ try {
  await page.reload();
  await page.getByRole('button',{name:'Leagues',exact:true}).click();
  await page.locator('.league-list-item').filter({hasText:`Browser League ${suffix}`}).click();
+ await checkSavedConfig();
  await page.locator('.league-content').getByLabel('Roster',{exact:false}).first().selectOption('unassigned');
  await page.getByRole('button',{name:playerName,exact:true}).click();
  assert.equal(await page.getByLabel('Player Layup',{exact:true}).inputValue(),'0.73123456789');
@@ -70,6 +105,9 @@ try {
  await form.getByLabel('Skill rules').selectOption('0');
  await form.getByRole('button',{name:'Generate league',exact:true}).click();
  await page.locator('.league-content').getByText('64 teams · 4 players per team · Skill schema 1 · Seed 0',{exact:true}).waitFor();
+ await page.getByRole('button',{name:'Publish version',exact:true}).click();
+ await page.getByRole('status').filter({hasText:'Published v1'}).waitFor();
+ assert.equal(await savedConfig.locator('.league-config-skill').count(),9);
  await page.locator('.league-players tbody tr').first().locator('td button').click();
  assert.equal(await page.locator('.league-player-detail .league-fields input').count(),9);
  await page.getByLabel('Roster',{exact:true}).selectOption('all');
@@ -84,14 +122,25 @@ try {
  await page.locator('.league-list-item').filter({hasText:`Legacy Browser ${suffix}`}).waitFor({state:'hidden'});
  await page.getByRole('button',{name:'Restore league',exact:true}).click();
  await page.locator('.league-list-item').filter({hasText:`Legacy Browser ${suffix}`}).waitFor();
- // Version selector pins an exact artifact and disables launch.
+ // Version selector pins an exact artifact for league training.
  await page.locator('nav').getByRole('button',{name:'New run',exact:true}).click();
+ await page.locator('.config-browser summary').click();
+ await page.getByPlaceholder('Search names, help, type, or category…').fill('rim_protection_skill_block_reference');
+ const referenceField = page.locator('.config-field').filter({has:page.locator('strong', {hasText:/^rim_protection_skill_block_reference$/})});
+ await referenceField.locator('input.config-input').fill('0.03');
+ await page.getByLabel('Roster source',{exact:false}).selectOption('league');
+ assert.equal(await referenceField.locator('input.config-input').count(),0);
+ assert.equal(await referenceField.getByRole('button',{name:'Reset',exact:true}).count(),0);
+ await referenceField.getByText('league-controlled',{exact:true}).waitFor();
+ await page.getByLabel('Roster source',{exact:false}).selectOption('random');
+ assert.equal(await referenceField.locator('input.config-input').inputValue(),'0.03');
+ await page.getByLabel('Roster source',{exact:false}).selectOption('league');
  const selector = page.getByLabel('Published league version',{exact:true});
  await selector.locator('option').filter({hasText:`Browser League ${suffix} · v1`}).waitFor({state:'attached'});
  const selectedValue = await selector.locator('option').filter({hasText:`Browser League ${suffix} · v1`}).getAttribute('value');
  await selector.selectOption(selectedValue);
- assert.equal(await page.getByRole('button',{name:'Launch training',exact:true}).isDisabled(),true);
- await page.getByText('Launch disabled:',{exact:false}).waitFor();
+ assert.equal(await page.getByRole('button',{name:'Launch training',exact:true}).isDisabled(),false);
+ await page.getByText('Selected version 1 remains pinned',{exact:false}).waitFor();
  // Deletion requires an exact name; cancelling does not remove anything.
  await page.getByRole('button',{name:'Leagues',exact:true}).click();
  await page.locator('.league-list-item').filter({hasText:`Browser League ${suffix}`}).click();
@@ -106,11 +155,25 @@ try {
  await page.getByLabel('League name to delete',{exact:true}).fill(`Browser League ${suffix}`);
  await deleteButton.click();
  await page.locator('.league-list-item').filter({hasText:`Browser League ${suffix}`}).waitFor({state:'hidden'});
+ // A copied/new-run form may retain a reference after its league is deleted.
+ await page.locator('nav').getByRole('button',{name:'New run',exact:true}).click();
+ await page.getByRole('status').filter({hasText:'previously selected league or version is no longer available'}).waitFor();
+ assert.equal(await selector.inputValue(),'');
+ assert.equal(await page.getByRole('button',{name:'Launch training',exact:true}).isDisabled(),true);
+ const replacement = selector.locator('option').filter({hasText:`Legacy Browser ${suffix} · v1`});
+ await replacement.waitFor({state:'attached'});
+ await selector.selectOption(await replacement.getAttribute('value'));
+ await page.locator('.league-selection details').waitFor();
+ assert.equal(await page.locator('.league-selection [role="alert"]').count(),0);
+ assert.equal(await page.locator('.league-selection [role="status"]').count(),0);
+ await page.getByLabel('Roster source',{exact:false}).selectOption('random');
+ await page.locator('.config-browser summary').click();
+ assert.equal(await referenceField.locator('input.config-input').inputValue(),'0.03');
  await page.reload();
  await page.getByRole('button',{name:'Leagues',exact:true}).click();
  await page.locator('.league-list-item').filter({hasText:`Legacy Browser ${suffix}`}).waitFor();
  assert.equal(await page.locator('.league-list-item').filter({hasText:`Browser League ${suffix}`}).count(),0);
  assert.deepEqual(errors,[]);
 
- console.log('PASS: two independent leagues, 3v3/4v4, 11/9 skills, autosave/reload, reassignment, version immutability, archive/restore, pinned selection and launch gate.');
+ console.log('PASS: two independent leagues, 3v3/4v4, 11/9 skills, autosave/reload, reassignment, version immutability, archive/restore, pinned selection, league training controls, and confirmed deletion.');
 } catch (e) { console.error(e); for (const p of browser.contexts().flatMap(c => c.pages())) console.error((await p.locator('body').innerText()).slice(-5000)); throw e; } finally {await browser.close();}

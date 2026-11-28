@@ -1683,7 +1683,7 @@ def build_compiled_rollout_runner(
                 jnp=jnp,
             )
             reset_keys = jax.random.split(reset_key, initial_state.positions.shape[0])
-            reset_state = reset_batch_minimal(static, reset_keys, jax, jnp)
+            reset_state = reset_batch_minimal(static, reset_keys, jax, jnp, roster_state=env_out.state)
             reset_done = env_out.done & (~jnp.asarray(single_episode_rollout).astype(jnp.bool_))
             next_state = replace_done_states(env_out.state, reset_state, reset_done, jnp)
             aggregated_reward = build_aggregated_reward_batch(static, env_out.rewards, jnp)
@@ -2219,7 +2219,7 @@ def build_compiled_frozen_opponent_rollout_runner(
                 jnp=jnp,
             )
             reset_keys = jax.random.split(reset_key, initial_state.positions.shape[0])
-            reset_state = reset_batch_minimal(static, reset_keys, jax, jnp)
+            reset_state = reset_batch_minimal(static, reset_keys, jax, jnp, roster_state=env_out.state)
             reset_done = env_out.done & (~jnp.asarray(single_episode_rollout).astype(jnp.bool_))
             next_state = replace_done_states(env_out.state, reset_state, reset_done, jnp)
             next_opponent_deterministic_episode_sample = jax.random.bernoulli(
@@ -2810,7 +2810,7 @@ def build_compiled_grouped_opponent_rollout_runner(
                 jnp=jnp,
             )
             reset_keys = jax.random.split(reset_key, initial_state.positions.shape[0])
-            reset_state = reset_batch_minimal(static, reset_keys, jax, jnp)
+            reset_state = reset_batch_minimal(static, reset_keys, jax, jnp, roster_state=env_out.state)
             reset_done = env_out.done & (~jnp.asarray(single_episode_rollout).astype(jnp.bool_))
             next_state = replace_done_states(env_out.state, reset_state, reset_done, jnp)
             next_opponent_deterministic_episode_sample = jax.random.bernoulli(

@@ -97,6 +97,34 @@ def test_generation_matches_existing_sampler_and_roundtrips_all_skills(library, 
     assert load_league_snapshot(library._path(draft['league_id'], 1)) == published
 
 
+def test_league_shooting_defaults_match_training_recipe(library):
+    from app.training_backend.application_training import APPLICATION_PRESET_VALUES
+    expected = {
+        'layup': {'mean': .60, 'std': .05},
+        'three_pt': {'mean': .37, 'std': .05},
+        'dunk': {'mean': .60, 'std': .30},
+    }
+    for profile in league_options(APPLICATION_PRESET_VALUES)['profiles']:
+        registry = registry_for_environment(profile['rules'])
+        for skill in registry.descriptors:
+            if skill.key in expected:
+                fields = dict(skill.sampling_defaults)
+                assert expected[skill.key] == {
+                    'mean': APPLICATION_PRESET_VALUES.get(fields['mean_field'], fields['default_mean']),
+                    'std': APPLICATION_PRESET_VALUES[fields['std_field']],
+                }
+                assert profile['sampling'][skill.key] == expected[skill.key]
+            elif 'std' in profile['sampling'][skill.key]:
+                assert profile['sampling'][skill.key]['std'] == 1.
+    draft = create(library)['draft']
+    for key, values in expected.items():
+        assert draft['sampling'][key] == values
+    # Explicit historical values remain authoritative; fixes only affect defaults.
+    explicit = create(library, sampling={'layup': {'mean': .7, 'std': 1.}})
+    published = library.publish(explicit['draft']['league_id'], explicit['revision'])
+    assert library.load(reference(published))['sampling']['layup'] == {'mean': .7, 'std': 1.}
+
+
 def test_generated_names_are_reproducible_unique_and_independent_of_skills():
     for seed in (0, 1, 2, 42, 99):
         a = generate_league(name='A', seed=seed)
@@ -228,6 +256,39 @@ def test_missing_corrupt_and_incompatible_artifacts_fail_explicitly(library):
         library.load(ref)
 
 
+def test_copied_sampling_settings_do_not_override_league(library):
+    from app.training_backend.application_training import resolve_run_training_config
+    from app.training_backend.config import Settings
+    from app.training_backend.jobs import JobManager
+    from app.training_backend.models import TrainingRunConfig
+
+    rules = {'rim_protection_enabled': True, 'contested_shooting_enabled': True}
+    current = create(library, rules=rules, sampling={'layup': {'mean': .63, 'std': .12}})
+    published = library.publish(current['draft']['league_id'], current['revision'])
+    before = deepcopy(published)
+    overrides = {
+        **rules, 'layup_pct': .91, 'layup_std': .02,
+        'rim_protection_beta_alpha': 2., 'rim_protection_beta_beta': 5.,
+        'rim_protection_block_distribution_max': .15, 'rim_protection_skill_block_reference': .03,
+        'contested_shooting_skill_mean': 2., 'contested_shooting_skill_std': .3,
+        'shot_pressure_max': .75,
+    }
+    config = TrainingRunConfig(roster_source='league', league_reference=reference(published), overrides=overrides)
+    settings = Settings(Path(__file__).resolve().parents[3], library.data_dir,
+                        library.repository.database_path, (), 1)
+    preview = JobManager(settings, library.repository).preview(config)
+    environment = resolve_run_training_config(tuple(preview.argv))
+    assert environment['shot_pressure_max'] == .75
+    assert config.overrides == overrides
+    assert library.load(reference(published), environment=environment) == before
+    assert published == before
+    assert published['sampling']['layup'] == {'mean': .63, 'std': .12}
+    # Real gameplay differences still require an explicit compatible selection.
+    for key in ('rim_protection_block_base', 'rim_protection_contest_effect_weight', 'contested_shooting_effect_weight'):
+        with pytest.raises(ValueError, match='rules do not match'):
+            library.load(reference(published), environment={**environment, key: environment[key] + .01})
+
+
 def test_http_authoring_and_training_capability_gate(library, monkeypatch):
     from fastapi.testclient import TestClient
     from app.training_backend import main
@@ -240,7 +301,7 @@ def test_http_authoring_and_training_capability_gate(library, monkeypatch):
     monkeypatch.setattr(main, 'manager', JobManager(settings, library.repository))
     client = TestClient(main.app)
     opts = client.get('/api/v1/leagues/options').json()
-    assert opts['league_training_available'] is False
+    assert opts['league_training_available'] is True
     assert len(opts['profiles']) == 4
     assert client.post('/api/v1/leagues', json={'name':'Bad', 'team_size': True}).status_code == 422
     created = client.post('/api/v1/leagues', json={'name': 'API League', 'team_count': 2}).json()
@@ -249,7 +310,7 @@ def test_http_authoring_and_training_capability_gate(library, monkeypatch):
     assert published.status_code == 201
     ref = reference(published.json()).model_dump(mode='json')
     launch = client.post('/api/v1/runs', json={'config': {'league_reference': ref}, 'idempotency_key': 'unavailable-league'})
-    assert launch.status_code == 409 and 'slice 2' in launch.json()['detail']
+    assert launch.status_code == 422
     assert library.repository.list_runs() == []
     assert client.get(f'/api/v1/leagues/{lid}/versions/1').json() == published.json()
     assert client.post(f'/api/v1/leagues/{lid}/archive', json={'archived': True}).status_code == 200
@@ -258,8 +319,8 @@ def test_http_authoring_and_training_capability_gate(library, monkeypatch):
     assert client.put(f'/api/v1/leagues/{lid}/draft', json=edit_request(created)).status_code == 409
 
 
-# Use the real run lifecycle with a stubbed worker. The capability gate remains
-# disabled in production; this exercises the slice-2 contract without training.
+# Use the real run lifecycle with a stubbed worker to exercise the contract
+# without launching training.
 from app.training_backend.tests.test_jobs import paused_schedule_run
 
 
@@ -277,6 +338,52 @@ def test_delete_blocks_training_run_reference(paused_schedule_run):
     assert repository.get_run(run['id'])['config']['league_reference'] == config['league_reference']
 
 
+@pytest.mark.parametrize('status', ['stopped', 'completed', 'failed'])
+def test_delete_preserves_finished_run_snapshot(paused_schedule_run, status):
+    manager, repository, run, _ = paused_schedule_run
+    lib = LeagueLibrary(repository, manager.settings.data_dir)
+    current = create(lib)
+    lid = current['draft']['league_id']
+    snapshot = lib.publish(lid, current['revision'])
+    ref = reference(snapshot)
+    lib.pin_for_run(ref, run['id'], environment={'players': 5})
+    path = manager.settings.data_dir / 'runs' / run['id'] / 'league.json'
+    before = path.read_bytes()
+    config = {**run['config'], 'league_reference': ref.model_dump(mode='json')}
+    repository.update_run(run['id'], status=status, config_json=json.dumps(config))
+    saved_run = repository.get_run(run['id'])
+    assert lib.delete(lid, DeleteLeagueRequest(revision=1, name='Test league'))['deleted']
+    with pytest.raises(KeyError):
+        lib.get(lid)
+    assert path.read_bytes() == before
+    assert lib.restore_for_run(ref, run['id'], environment={'players': 5}) == snapshot
+    assert repository.get_run(run['id']) == saved_run
+    assert Path(run['checkpoint_path']).exists()
+
+
+@pytest.mark.parametrize('bad_snapshot', ['missing', 'corrupt', 'wrong_version'])
+def test_delete_requires_valid_finished_run_snapshot(paused_schedule_run, bad_snapshot):
+    manager, repository, run, _ = paused_schedule_run
+    lib = LeagueLibrary(repository, manager.settings.data_dir)
+    current = create(lib)
+    lid = current['draft']['league_id']
+    snapshot = lib.publish(lid, current['revision'])
+    ref = reference(snapshot)
+    lib.pin_for_run(ref, run['id'], environment={'players': 5})
+    path = manager.settings.data_dir / 'runs' / run['id'] / 'league.json'
+    if bad_snapshot == 'missing':
+        path.unlink()
+    elif bad_snapshot == 'corrupt':
+        path.write_text('{}')
+    else:
+        ref.version += 1
+    config = {**run['config'], 'league_reference': ref.model_dump(mode='json')}
+    repository.update_run(run['id'], status='stopped', config_json=json.dumps(config))
+    with pytest.raises(DraftConflict, match='lacks a valid saved league snapshot'):
+        lib.delete(lid, DeleteLeagueRequest(revision=1, name='Test league'))
+    assert lib.get(lid)['draft'] == current['draft']
+
+
 def test_run_copy_resume_and_extension_keep_pinned_snapshot(paused_schedule_run, monkeypatch):
     from app.training_backend import jobs
     from app.training_backend.models import TrainingRunConfig
@@ -290,9 +397,19 @@ def test_run_copy_resume_and_extension_keep_pinned_snapshot(paused_schedule_run,
     published = lib.publish(current['draft']['league_id'], current['revision'])
     ref = reference(published)
     lib.pin_for_run(ref, run['id'], environment=environment)
-    config = {**run['config'], 'league_reference': ref.model_dump(mode='json')}
+    config = {**run['config'], 'roster_source': 'league', 'league_reference': ref.model_dump(mode='json')}
     repository.update_run(run['id'], config_json=json.dumps(config))
+    metadata_path = Path(run['checkpoint_path']) / 'metadata.json'
+    metadata = json.loads(metadata_path.read_text())
+    metadata['trainer_config'].update(roster_source='league', league_team_probability=.75,
+                                      league_reference=ref.model_dump(mode='json'))
+    metadata_path.write_text(json.dumps(metadata))
     monkeypatch.setattr(jobs, 'LEAGUE_TRAINING_AVAILABLE', True)
+    repository.update_run(run['id'], config_json=json.dumps({**config, 'league_team_probability': .5}))
+    with pytest.raises(RuntimeError, match='roster configuration mismatch'):
+        manager.resume(run['id'], confirm_provenance_mismatch=True)
+    assert repository.get_run(run['id'])['status'] == 'paused'
+    repository.update_run(run['id'], config_json=json.dumps(config))
     resumed = manager.resume(run['id'], confirm_provenance_mismatch=True)
     assert resumed['config']['league_reference'] == config['league_reference']
     # Editing/publishing later does not change copied-run selection or snapshot.
@@ -320,3 +437,24 @@ def test_run_copy_resume_and_extension_keep_pinned_snapshot(paused_schedule_run,
 def test_invalid_rule_parameter_has_actionable_error(value):
     with pytest.raises(ValueError, match='rim_protection_beta_alpha must be a finite number'):
         generate_league(name='Bad rule', team_count=2, rules={'rim_protection_beta_alpha': value})
+
+
+@pytest.mark.parametrize('probability', [-.1, 1.1, float('nan'), float('inf')])
+def test_training_rejects_invalid_league_probability(probability):
+    from app.training_backend.models import TrainingRunConfig
+    with pytest.raises(ValueError, match='league_team_probability'):
+        TrainingRunConfig(league_team_probability=probability)
+
+
+def test_training_source_requires_explicit_selection(library):
+    from app.training_backend.models import TrainingRunConfig
+    current = create(library)
+    published = library.publish(current['draft']['league_id'], current['revision'])
+    ref = reference(published)
+    with pytest.raises(ValueError, match='published league'):
+        TrainingRunConfig(roster_source='league')
+    with pytest.raises(ValueError, match=r'League \+ fresh'):
+        TrainingRunConfig(league_reference=ref)
+    for probability in (0., .75, 1.):
+        config = TrainingRunConfig(roster_source='league', league_reference=ref, league_team_probability=probability)
+        assert TrainingRunConfig.model_validate(config.model_dump()).league_team_probability == probability

@@ -17,21 +17,32 @@ to be complete and every player assigned once, with unique jerseys per team.
 
 **Publish version** creates an immutable snapshot. Later edits affect the draft
 only; earlier snapshots remain unchanged. Inspect published versions read-only.
+**League configuration** keeps saved skill distributions and rule settings visible
+after generation and publication. Inspecting a version shows that version's exact
+settings; individual player edits do not change its generation distributions.
 Archive/restore controls hide items without deleting their historical artifacts.
 To remove a test league permanently, choose **Delete league…**, type its exact
 name, and confirm. This deletes its draft, players, rosters, and published
-versions. Leagues referenced by training runs or saved run snapshots cannot be
-deleted; archive them instead.
+versions. Active or paused training runs block deletion. Stopped, completed, and
+failed runs allow deletion when their own pinned league snapshots are valid;
+those snapshots and checkpoints remain available for run history and resume.
+Orphaned run snapshots also block deletion. A deleted league cannot be
+selected for a new run.
 
-**League-backed training is not enabled in this slice.** The new-run form can
-select an exact published version, but Launch remains disabled while a league
-is selected. The API enforces the same restriction. Clear the selection to use
-current random skill sampling. Training integration follows in #85 slice 2;
-season/tournament records follow in slices 3 and 5. This feature adds no training
-metrics or per-game training records.
+In **New run**, choose **Roster source → League + fresh teams**, select a
+published version, and set **League team probability** (75% by default).
+Each side independently selects a persistent team or fresh players at game
+start. Teams are uniformly sampled; same-team matchups are allowed. Saved
+roster order is retained. Fresh skills use the league's saved distributions.
+
+Resume and extensions preserve the source, probability, version, current
+assignments, and RNG state. Changing these requires a new run. Automatic
+evaluations use fresh teams from the same distributions; season/tournament
+records follow in slices 3 and 5. Training logs only the four approved aggregate
+source/coverage metrics, with no per-game competition records.
 
 Drafts and metadata use the configured trainer database. Published JSON files
-use `<trainer data directory>/leagues/<league-id>/v<version>.json`. Future runs
+use `<trainer data directory>/leagues/<league-id>/v<version>.json`. Runs
 pin `{league_id, version, sha256}` and an exact `runs/<run-id>/league.json` copy.
 Copies retain that reference; resume/extension load the pinned snapshot without
 regenerating. The shared `basketworld_jax.leagues.load_league_snapshot` validates

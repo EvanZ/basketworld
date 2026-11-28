@@ -212,12 +212,21 @@ class LeagueLibrary:
             current = self._get(connection, league_id)
             if request.revision != current['revision'] or request.name != current['draft']['name']:
                 raise DraftConflict('The league changed. Reload it and confirm its current name before deleting.')
-            for (raw,) in connection.execute('SELECT config_json FROM training_runs').fetchall():
+            preserved_run_ids = set()
+            for run_id, status, raw in connection.execute('SELECT id, status, config_json FROM training_runs').fetchall():
                 ref = json.loads(raw).get('league_reference') or {}
                 if ref.get('league_id') == league_id:
-                    raise DraftConflict('This league is referenced by a training run. Archive it instead.')
+                    if status not in {'stopped', 'completed', 'failed'}:
+                        raise DraftConflict('This league is referenced by a training run that is active or paused. Stop the run before deleting the league, or archive it.')
+                    try:
+                        load_league_snapshot(self.data_dir / 'runs' / str(run_id) / 'league.json', reference=ref)
+                    except ValueError as exc:
+                        raise DraftConflict(f'Cannot delete this league: run {run_id} lacks a valid saved league snapshot. Archive it instead.') from exc
+                    preserved_run_ids.add(str(run_id))
             # A run snapshot can also exist before its run record is created.
             for path in (self.data_dir / 'runs').glob('*/league.json'):
+                if path.parent.name in preserved_run_ids:
+                    continue
                 if json.loads(path.read_text()).get('league_id') == league_id:
                     raise DraftConflict('This league has a saved run snapshot. Archive it instead.')
             connection.execute('BEGIN TRANSACTION')
@@ -283,7 +292,9 @@ def league_options(preset):
             defaults = dict(d.sampling_defaults)
             if 'mean' in sampling[d.key]:
                 sampling[d.key]['mean'] = preset.get(defaults.get('mean_field'), sampling[d.key]['mean'])
+            if d.semantic_group == 'shooting':
+                sampling[d.key]['std'] = preset.get(defaults.get('std_field'), sampling[d.key]['std'])
         profiles.append({'label': label, 'rules': rules, 'skills': registry.schema_payload()['skills'],
                          'sampling': sampling, 'skill_schema_version': registry.schema_version})
     return {'profiles': profiles, 'team_sizes': [3, 4, 5], 'default_team_count': 64,
-            'league_training_available': False}
+            'league_training_available': True}

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { scoringMetricGroup, scoringMetricDefinition, metricPickerCatalog, RIM_CONTEST_FREQUENCY_METRICS, LAYUP_METRICS, isLegacyLayupMetric } from '../src/scoringMetrics.js'
+import { scoringMetricGroup, scoringMetricDefinition, metricPickerCatalog, RIM_CONTEST_FREQUENCY_METRICS, LAYUP_METRICS, ROSTER_METRICS, isLegacyLayupMetric } from '../src/scoringMetrics.js'
 
 test('primary scoring separates learner outcomes, self-play, rewards, and fairness', () => {
   assert.equal(scoringMetricGroup('jax/train/learner_points_scored_per_completed_game'), 'Learner scoring')
@@ -9,6 +9,14 @@ test('primary scoring separates learner outcomes, self-play, rewards, and fairne
   assert.equal(scoringMetricGroup('jax/train/learner_roster_assignment_b_completed_game_count'), 'Roster and opening-possession diagnostics')
   assert.equal(scoringMetricGroup('jax/train/opponent_started_with_possession_win_score'), 'Roster and opening-possession diagnostics')
   assert.equal(scoringMetricGroup('jax/train/game_reward_mean'), 'RL health and other diagnostics')
+})
+
+test('league sampling metrics belong to the normally visible chart group', () => {
+  assert.equal(ROSTER_METRICS.length, 4)
+  for (const name of ROSTER_METRICS) {
+    assert.equal(scoringMetricGroup(name), 'RL health and other diagnostics')
+    assert.ok(metricPickerCatalog([]).some(metric => metric.name === name))
+  }
 })
 test('old charts remain explicitly legacy and ratios describe their denominators', () => {
   for (const name of ['jax/train/offense_learner_points_total', 'jax/train/ppo_defense_opponent_points_per_step', 'jax/train/offense_learner_points_per_completed_episode', 'jax/eval_deploy/mean_offense_score', 'jax/eval_defense/mean_final_score_margin']) {
@@ -63,14 +71,14 @@ test('rim contest frequency uses finishes and completed games with per-team depl
 
 test('approved frequency and layup metrics are selectable before logging without fabricated values', () => {
   const pending = metricPickerCatalog([])
-  assert.equal(pending.length, 15)
-  assert.deepEqual(new Set(pending.map(metric => metric.name)), new Set([...RIM_CONTEST_FREQUENCY_METRICS, ...LAYUP_METRICS]))
+  assert.equal(pending.length, 19)
+  assert.deepEqual(new Set(pending.map(metric => metric.name)), new Set([...RIM_CONTEST_FREQUENCY_METRICS, ...LAYUP_METRICS, ...ROSTER_METRICS]))
   assert.ok(pending.every(metric => metric.latest === null && metric.logged === false))
   const name = 'jax/train/learner_rim_contested_shot_pct'
   const updated = metricPickerCatalog([{ name, latest: 0 }, { name: 'jax/train/entropy_coef', latest: .01 }])
-  assert.equal(updated.length, 16)
+  assert.equal(updated.length, 20)
   assert.deepEqual(updated.find(metric => metric.name === name), { name, latest: 0, logged: true })
-  assert.equal(updated.filter(metric => !metric.logged).length, 14)
+  assert.equal(updated.filter(metric => !metric.logged).length, 18)
 })
 
 

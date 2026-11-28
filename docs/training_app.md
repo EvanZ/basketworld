@@ -231,8 +231,11 @@ that effect; no new time-to-clearance metric is added.
 Open **Leagues → Create league**. Choose a name, 3v3/4v4/5v5 format, team
 count (64 by default, configurable from 2–512), generation seed, and skill rules.
 Expand **Player generation settings** to change each supported distribution.
-The initial defaults follow the trainer recipe where available, with the shared
-skill-registry defaults otherwise. Rim protection uses the existing scaled-beta
+Shooting distributions use the trainer recipe: layup mean 0.60/std 0.05,
+three-point mean 0.37/std 0.05, and dunk mean 0.60/std 0.30. Other normally
+sampled skills default to standard deviation 1. Means follow the trainer
+recipe where available, with shared skill-registry defaults otherwise. Changing
+skill rules preserves entered generation settings. Rim protection uses the existing scaled-beta
 logit sampler; other skills use the existing fixed-pool normal sampler, clipped
 to a skill's supported bounds. Rebounding uses that pool sampler's Gaussian
 mode; specialist roster construction is not part of this slice.
@@ -263,22 +266,70 @@ Neither draft edits nor a later publication changes an earlier version.
 
 Archive leagues or individual published versions to hide them from normal
 browsing and new-run selection. **Show archived leagues and versions** reveals
-restore controls. There is no permanent-delete or duplicate-league action.
+restore controls. **Delete league…** requires typing the exact league name and
+removes unused leagues and their published versions permanently. Leagues with
+active or paused run references cannot be deleted. Stopped, completed, and failed
+runs permit deletion if their pinned league snapshots are valid; their snapshots
+and checkpoints are preserved. Orphaned run snapshots block deletion.
+Duplication is deferred.
 Stable IDs and membership-scoped jersey numbers leave room for future trades
 and drafts without rewriting history.
 
 ### Training availability and lifecycle
 
-The new-run form can select a specific published league version. **League-backed
-training is unavailable until #85 slice 2 is implemented.** Selecting a version
-disables Launch, and the API rejects a launch with a league reference. Clear the
-selection to use current random skill sampling. Saving/publishing a league does
-not change the running worker or the skills it samples. No new metrics or
-per-training-game statistics are introduced by this feature.
+In **New run**, choose **Roster source → League + fresh teams**, select a
+published version, and set **League team probability (%)** (75% by default).
+**Random teams** retains existing training behavior. League mode independently
+chooses a source for each side at every game reset. Uniformly sampled league
+teams may face themselves. Saved roster membership order maps to player slots;
+player skills and identity stay with their stable side across possessions.
+
+Fresh teams use the league version's saved generation distributions, including
+its means/stds and rim-protection beta settings. Manual skill overrides affect
+only saved players. Trainer skill-distribution fields do not control fresh draws
+in league mode. At 0% both teams are fresh; at 100% both are persistent.
+
+Copying a run retains its other configuration, including gameplay effect weights.
+After selecting a league, that published version supplies saved player skills and
+fresh-player distributions; copied sampling values are inactive and marked
+**league-controlled**. Expand **Fresh-team skill distributions** to inspect the
+values that will be used. Team size and gameplay skill rules must still be compatible.
+
+Saved configuration uses `roster_source` (`random` or `league`),
+`league_team_probability` (0–1), and `league_reference`. The CLI equivalents are
+`--roster-source`, `--league-team-probability`, and `--league-snapshot-path` for
+the published JSON file. The trainer pins that file automatically. Source,
+probability, and league version cannot change on resume or extension. Use a new
+run to change them. Old checkpoints without roster state remain random-only.
+For CLI continuation, use `--continue-preserve-env-state`; league resumes reject
+`--resume-reset-env-state` because it would discard roster assignments and RNG.
+
+Deploy, historical/Elo, and enabled offense/defense evaluations use fresh teams
+from the same league distributions. Historical comparisons use matched seeded
+rosters across checkpoints and side assignments. These are not official league
+standings; no training-game box scores or W–L records are stored.
+
+Four chartable metrics use the interval since the previous log:
+
+- `jax/train/roster_persistent_persistent_pct`: newly assigned games with two
+  league teams divided by all newly assigned games, times 100.
+- `jax/train/roster_mixed_pct`: the same denominator, with exactly one league team.
+- `jax/train/roster_fresh_fresh_pct`: the same denominator, with two fresh teams.
+- `jax/train/roster_pool_coverage_pct`: distinct persistent teams selected on
+  either side divided by the league's team count, times 100.
+
+The first three are unavailable if no games were assigned; coverage is zero
+when no persistent team was selected. These describe assignments, not completed
+games, possessions, or cumulative run totals. The first three have expected
+values 56.25%, 37.5%, and 6.25% at the default probability. No per-team/per-player
+MLflow series are added.
 
 The integration contract stores `league_reference = {league_id, version,
 sha256}` in run configuration and the exact selected snapshot at
-`runs/<run-id>/league.json` before league-backed launch is enabled. Run copies
+`runs/<run-id>/league.json` before launch. Each training checkpoint also includes
+`league.json`; saved kernel state includes per-lane roster IDs, separate roster
+RNG keys, and pending interval counters/coverage. Roster IDs index the snapshot
+roster list; fresh sides use -1. Player IDs follow each roster's ordered members. Run copies
 retain the source's exact reference, not the library's latest version; users may
 explicitly select another compatible version before launching. Resume and
 extension load only the pinned run artifact and fail on missing, corrupt or
@@ -320,7 +371,7 @@ source provenance.
 Trainer endpoints are under `/api/v1/leagues`: GET collection/options/detail,
 POST collection (generate), PUT `/{id}/draft` (revision-checked update), POST
 `/{id}/versions` (publish at a given revision), GET `/{id}/versions/{version}`,
-and POST `/{id}/archive` or `/{id}/versions/{version}/archive` with an `archived`
+DELETE `/{id}` (revision and name confirmation), and POST `/{id}/archive` or `/{id}/versions/{version}/archive` with an `archived`
 boolean. No endpoint edits or overwrites a published artifact.
 
 For browser workflow verification, start a separate trainer API with temporary

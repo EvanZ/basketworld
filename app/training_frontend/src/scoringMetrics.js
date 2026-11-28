@@ -1,3 +1,5 @@
+export const ROSTER_METRICS = ['roster_persistent_persistent_pct', 'roster_mixed_pct', 'roster_fresh_fresh_pct', 'roster_pool_coverage_pct'].map(name => 'jax/train/' + name)
+
 const compactBlockMetric = /^(?:(?:learner|opponent)_)?(?:block_pct|blocks_per_defensive_possession|blocks_per_possession|blocks_per_episode)$/
 const legacyBlockMetric = /shot_defense_|^(blocks|learner_blocks|opponent_blocks|blocks_per_completed_possession)$/
 
@@ -16,13 +18,14 @@ export function isLegacyLayupMetric(name) {
 export function metricPickerCatalog(loggedMetrics) {
   // Approved metrics can be pinned before their first observation. Never fill
   // missing measurements with zero or mark them as logged.
-  const catalog = new Map([...RIM_CONTEST_FREQUENCY_METRICS, ...LAYUP_METRICS].map(name => [name, { name, latest: null, logged: false }]))
+  const catalog = new Map([...RIM_CONTEST_FREQUENCY_METRICS, ...LAYUP_METRICS, ...ROSTER_METRICS].map(name => [name, { name, latest: null, logged: false }]))
   for (const metric of loggedMetrics) catalog.set(metric.name, { ...metric, logged: true })
   return [...catalog.values()].sort((a, b) => a.name.localeCompare(b.name))
 }
 
 export function scoringMetricGroup(name) {
   const key = name.replace(/^jax\/[^/]+\//, '')
+  if (ROSTER_METRICS.includes(name)) return 'RL health and other diagnostics'
   if (compactBlockMetric.test(key) || legacyBlockMetric.test(key)) return 'RL health and other diagnostics'
   if (/_points_per_completed_episode$|^(?:offense|defense)_(?:learner|opponent)_offensive_efficiency$|^mean_(?:final_)?(?:offense_score|defense_score|score_margin)$/.test(key)) return 'Legacy scoring (schema 1)'
   if (/(?:^|_)(?:offense|defense|learner|opponent)_points_(?:total|per_step)$/.test(key)) return 'Legacy scoring (schema 1)'
@@ -36,6 +39,11 @@ export function scoringMetricGroup(name) {
 export function scoringMetricDefinition(name) {
   const group = scoringMetricGroup(name)
   const key = name.replace(/^jax\/[^/]+\//, '')
+  if (ROSTER_METRICS.includes(name)) {
+    if (key === 'roster_pool_coverage_pct') return 'Distinct league teams selected on either side since the previous log, divided by all teams in the selected league, times 100. Each team counts once; interval coverage, not cumulative.'
+    const kind = key.includes('persistent_persistent') ? 'two league teams' : key.includes('mixed') ? 'one league team and one fresh team' : 'two fresh teams'
+    return `Newly assigned games with ${kind}, divided by all newly assigned games since the previous log, times 100. Assignments, not completed games or possessions. No new assignments means unavailable.`
+  }
   if (LAYUP_METRICS.includes(name)) {
     const deploy = name.startsWith('jax/eval_deploy/')
     const definition = key.endsWith('fg_pct')

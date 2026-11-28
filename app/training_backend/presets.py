@@ -61,6 +61,9 @@ def build_halfcourt_multi_possession_preview(
     values = {
         **application_preset_values(repo_root),
         **config.overrides,
+        "roster_source": config.roster_source,
+        "league_team_probability": config.league_team_probability,
+        "league_snapshot_path": str(run_dir / "league.json") if config.roster_source == "league" else "",
         "policy_seed": config.policy_seed,
         "mlflow_run_name": config.name,
         "mlflow_experiment_name": config.mlflow_experiment_name,
